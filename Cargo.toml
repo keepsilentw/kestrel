@@ -1,0 +1,40 @@
+[package]
+name = "kestrel"
+version = "0.1.0"
+edition = "2024"
+description = "Minimal Rust harness kernel for a star-topology multi-agent coding harness"
+license = "MIT"
+
+[lib]
+name = "kestrel"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kestrel"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "process", "net", "io-util", "time", "signal", "fs"] }
+tokio-util = { version = "0.7", features = ["codec", "rt"] }
+futures = "0.3"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+eventsource-stream = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+clap = { version = "4", features = ["derive"] }
+thiserror = "2"
+anyhow = "1"
+async-trait = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+base64 = "0.22"
+bytes = "1"
+libc = "0.2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+
+[profile.dev]
+opt-level = 0

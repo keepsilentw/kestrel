@@ -1,0 +1,6 @@
+{"ev":{"type":"start"}}
+{"ev":{"type":"text_delta","text":"checking. "}}
+{"ev":{"type":"tool_call_begin","index":0,"call_id":"call-1","name":"noop"}}
+{"ev":{"type":"tool_call_args_delta","index":0,"delta":"{}"}}
+{"ev":{"type":"tool_call_end","index":0}}
+{"ev":{"type":"done","stop":{"type":"tool_use"}}}

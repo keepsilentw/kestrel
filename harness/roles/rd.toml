@@ -1,0 +1,22 @@
+# RD：唯一源码写者——只在 worktree 内写。
+role = "rd"
+peer_id = "harness-rd"
+bus_socket = "~/.kestrel/harness/bus.sock"
+
+[llm]
+provider = "deepseek-anthropic"  # 快执行者：轮数最多，速度/单价敏感
+model = "deepseek-v4-flash"
+
+[system]
+prompt_file = "../systems/rd.md"   # 相对 role 文件所在目录（harness/roles/）
+
+[permissions]
+policy_file = "writer.policy.json"
+write_roots = ["/tmp/kestrel-worktree"]     # demo 用；真实任务由 SA 派发时实例化
+read_only_islands = ["/tmp/kestrel-worktree/.git"]
+
+[permissions.sandbox]
+network = "none"
+
+[budget]
+max_usd = 2.0

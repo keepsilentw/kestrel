@@ -1,0 +1,22 @@
+# QA：验证者——review / test / build 三个 stage（带 check 参数派发）。
+role = "qa"
+peer_id = "harness-qa"
+bus_socket = "~/.kestrel/harness/bus.sock"
+
+[llm]
+provider = "zhipu-anthropic"     # 多模态：验收要看截图/视觉证据
+model = "glm-5.3-flash"
+
+[system]
+prompt_file = "../systems/qa.md"   # 相对 role 文件所在目录（harness/roles/）
+
+[permissions]
+policy_file = "verifier.policy.json"
+write_roots = []                            # QA 只读：写范围为零
+read_only_islands = []
+
+[permissions.sandbox]
+network = "none"
+
+[budget]
+max_usd = 1.5

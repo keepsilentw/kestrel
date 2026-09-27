@@ -1,0 +1,9 @@
+{
+  "default": "deny",
+  "rules": [
+    { "pattern": ["rg"], "decision": "allow" },
+    { "pattern": ["ls"], "decision": "allow" },
+    { "pattern": ["cat"], "decision": "allow" }
+  ],
+  "forbidden_prefixes": [["bash"], ["python"], ["sh"], ["rm"], ["git"]]
+}

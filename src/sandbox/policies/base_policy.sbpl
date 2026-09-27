@@ -1,0 +1,10 @@
+; base policy: deny default, exec/read exemptions, write grants are appended
+(version 1)
+(deny default)
+(allow process-fork)
+(allow process-exec*)
+(allow file-read*)
+(allow sysctl-read)
+(allow mach-lookup)
+(allow system-socket)
+(allow signal (target self))

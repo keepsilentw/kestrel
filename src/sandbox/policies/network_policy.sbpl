@@ -1,0 +1,4 @@
+; network: loopback proxy ports only (appended when NetMode::ProxyPorts)
+(allow system-socket)
+(allow network-outbound (remote unix-socket (literal "/private/var/run/syslog")))
+(allow network-outbound (remote unix-socket (literal "/var/run/syslog")))

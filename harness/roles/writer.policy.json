@@ -1,0 +1,10 @@
+{
+  "default": "ask",
+  "rules": [
+    { "pattern": ["rg"], "decision": "allow" },
+    { "pattern": ["ls"], "decision": "allow" },
+    { "pattern": ["cargo", ["test", "build", "check", "fmt"]], "decision": "allow" },
+    { "pattern": ["git", ["status", "diff", "add", "commit"]], "decision": "allow" }
+  ],
+  "forbidden_prefixes": [["bash"], ["python"], ["sh"], ["rm"], ["git", "push"]]
+}

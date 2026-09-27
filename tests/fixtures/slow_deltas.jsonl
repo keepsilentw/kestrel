@@ -1,0 +1,6 @@
+{"delay_ms":40,"ev":{"type":"start"}}
+{"delay_ms":40,"ev":{"type":"text_delta","text":"a"}}
+{"delay_ms":40,"ev":{"type":"text_delta","text":"b"}}
+{"delay_ms":40,"ev":{"type":"text_delta","text":"c"}}
+{"delay_ms":40,"ev":{"type":"text_delta","text":"d"}}
+{"delay_ms":40,"ev":{"type":"done","stop":{"type":"stop"}}}

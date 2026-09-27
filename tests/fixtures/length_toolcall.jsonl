@@ -1,0 +1,5 @@
+{"ev":{"type":"start"}}
+{"ev":{"type":"text_delta","text":"partial answer "}}
+{"ev":{"type":"tool_call_begin","index":0,"call_id":"call-len","name":"noop"}}
+{"ev":{"type":"tool_call_args_delta","index":0,"delta":"{\"x\":1"}}
+{"ev":{"type":"done","stop":{"type":"length"}}}

@@ -1,0 +1,136 @@
+# kestrel 真实端点测试报告
+
+> 日期：2026-09-09/10 首轮；2026-09-17 补 Qwen 一轮。对象：kestrel MVP（M0-M4）。
+> 范围：真实 LLM 端点 smoke（plan §4-M3 验收项 7 / §4-M0 验收项 6）。
+> 凭据来源：BigModel 与 DeepSeek 取自 `~/.claude/settings.json` / cc-switch DB（报告中脱敏）；
+> Qwen 取自 cc-switch 的百炼 Token Plan 条目（codex 与 claude 两侧凭据实测互通）。
+
+## 1. 自动化测试基线（cargo test）
+
+| 组 | 数量 | 覆盖 |
+|---|---|---|
+| 单测（lib） | 91 | wire 归一 / partial_json / retry / registry / 权限矩阵 / sbpl golden / session 树 / journal 对账 |
+| 集成（core_loop / m1_tools / sandbox_e2e / m2_session / m4_bus / wire_anthropic / discipline） | 30 | 引擎验收 / 工具并发 / 真实 Seatbelt / golden JSONL / 总线路由与崩溃对账 |
+| 合计 | **121**，全部通过；`fmt --check` 与 `clippy -D warnings` 干净 | |
+
+> 计数以 2026-09-17 实跑为准；此处原先记录的 101 项是早期修订，未随测试增补同步。
+
+## 2. 端点 smoke 结果
+
+### 2.1 BigModel（智谱）—— `https://open.bigmodel.cn/api/anthropic`
+
+| 场景 | 结果 | 关键证据 |
+|---|---|---|
+| 纯对话流式 | **通过** | thinking/text delta 流式 → `message_done("成功")` → `turn_complete(stop=stop)` |
+| bash 工具回合 | **通过** | 模型发起 bash 调用 → orchestrator 派发 → **Seatbelt 沙箱内执行** → 结果回灌 → 模型报告 `kestrel-ok` → 收敛 |
+
+### 2.2 DeepSeek —— `https://api.deepseek.com/anthropic`
+
+| 场景 | 结果 | 关键证据 |
+|---|---|---|
+| 纯对话流式 | **通过** | 文本流式 → `turn_complete`；**usage 完整**（input 565 / output 21） |
+| bash 工具回合 | **通过** | 沙箱内 `echo deepseek-ok` → 回灌 → 报告 → 收敛（input 98 / output 112） |
+
+### 2.3 Qwen（百炼 Token Plan）—— 2026-09-17
+
+端点两个表面（同一份 Token Plan，credential 互通）：
+
+| 表面 | base_url | wire |
+|---|---|---|
+| Anthropic 兼容 | `https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic` | `anthropic-messages` |
+| OpenAI 兼容 | `https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode` | `openai-completions` |
+
+| 场景 | wire | 结果 | 关键证据 |
+|---|---|---|---|
+| 纯对话流式 | anthropic | **通过** | `message_done("kestrel-ok")` → `turn_complete(stop=stop)`；usage 218/26 |
+| bash 工具回合 | anthropic | **通过** | `tool_begin` → 沙箱内 `echo qwen-anthropic-ok` → `tool_end` 回灌 → 报告 → 收敛；usage 466/72 |
+| 纯对话流式 | openai | **通过** | usage 1188/255（修复前恒为 0，见 §6） |
+| bash 工具回合 | openai | **通过** | 沙箱内 `echo qwen-ok` → 回灌 → 报告 → 收敛 |
+| Seatbelt 生效 | — | **通过** | 策略显式 Allow 的 `touch /tmp/...` 被拒（`Operation not permitted`）；升级分支返回 `sandbox denied (headless)`，文件未创建 |
+
+同轮顺带验证 `deepseek-anthropic`（usage 503/2）与 `zhipu-anthropic`（input 0 / output 3，即 §3-3 的 BigModel 低报复现）两个 provider 条目在 kestrel 内可用。
+
+## 3. compat 偏差发现（已落 design.md §9 台账）
+
+| # | 端点 | 偏差 | 处置 |
+|---|---|---|---|
+| 1 | BigModel | `[1m]` 模型名后缀报 1211 模型不存在（CC 侧标记） | kestrel 用裸 id；1M 上下文应走 beta header（二期） |
+| 2 | BigModel/DeepSeek | 认证方式差异（x-api-key vs Bearer） | 双头同发（x-api-key + Bearer），已实装，两端点均通过 |
+| 3 | BigModel 特有 | `message_start` 不回 input usage（`input_tokens=0`） | **已修**：ctx_tokens 记账在 reported input=0 时以 TurnContext 字符估算兜底（回归测试 `compaction_triggers_on_estimated_context`）；DeepSeek 上报完整、兜底自动不激活，按端点分工正确 |
+| 4 | 百炼（Qwen） | anthropic 表面挂在 `/apps/anthropic`；`/anthropic`、`/v1/messages`、`/compatible-mode/v1/messages` 全部 404 | provider 基址钉 `/apps/anthropic`（`~/.kestrel/providers.toml`） |
+| 5 | 百炼（Qwen）openai 表面 | 不发 `stream_options.include_usage` 时，每个 chunk 都是 `"usage": null`，全程无真实 usage | compat 位 `stream_include_usage = true` |
+| 6 | 百炼（Qwen）openai 表面 | 真实 usage 在 `finish_reason` **之后**的 `choices: []` chunk 才下发 | **已修**：wire 层改为在流终结符处才收敛 `Done`（见 §6），否则整个 usage 账目归零 |
+| 7 | 百炼 / BigModel | `[1m]`/`[1M]` 后缀复现 1211 模型不存在（`glm-5.3-flash[1m]` 实测 400） | 与 §3-1 同因；kestrel 一律用裸 id |
+
+## 4. 与自动化测试的交叉验证价值
+
+- 沙箱 e2e 在真实网关下复现通过：工具执行路径（wire → orchestrator → Seatbelt → 回灌）端到端成立
+- usage 低报问题只有真机才能暴露（faux fixture 天然上报准确值）——印证 plan §7.1「端点实测不可压缩」的判断
+- 权限分类器（同走 BigModel 端点）在测试中出现过一次超时，与 kestrel 无关，但提醒了无人值守场景的依赖单点
+
+## 5. 遗留
+
+1. DeepSeek/BigModel 的 `[1m]` 后缀可接受性未测（用裸 id 不阻塞）
+2. 多轮长会话下的压缩触发真机验证（依赖 input usage 上报准确性，BigModel 需观察估算兜底的实际表现）
+3. 三角色联跑**已跑通**（2026-09-17，见 §7）：hub + RD/QA worker + demo-sa 四进程，四个 stage（dev/review/test/build）全部 pass，journal 的 write-ahead 顺序与 `{session}-{stage}-iter{n}.json` 工件命名均验证成立。遗留：demo 任务下 RD/QA 常在 8 轮预算内收敛不到文字答复（工件 `stop` 显示 `round budget exhausted`），是任务/提示词层面的现象，不是通路缺陷
+4. Qwen anthropic 表面的 `thinking` 块 `signature` 恒为空串——回放语义未经多轮工具回合验证（§6 修复只覆盖 openai 表面）
+
+## 6. 2026-09-17 修复：openai 表面流式 usage 归零
+
+**症状**：`bailian-qwen`（openai-completions）下每个 `turn_complete` 的 usage 恒为 `input=0 / output=0`，而同一模型的 anthropic 表面上报正常。
+
+**根因**（非端点低报，是 wire 层终止时机）：百炼把真实 usage 放在 `finish_reason` 之后的独立 chunk 里——
+
+```
+data: {..."choices":[{"delta":{...},"finish_reason":"stop"}],"usage":null}
+data: {...  "choices":[],  "usage":{"prompt_tokens":63,...}}   <- 真实 usage
+data: [DONE]
+```
+
+原 `parse_stream` 一见 `finish_reason` 就 push `WireEvent::Done`，`turn.rs` 的消费循环在 `Done` 处 break 并丢弃流，尾部 usage 永远读不到。
+
+**修法**：`parse_stream` 改为 `unfold` 驱动，`finish_reason` 只记录进 `pending_stop`（顺带冲刷工具调用），唯一 `Done` 延迟到 `[DONE]` / 流尾才发。附带修正两处终止语义：`[DONE]` 但无 `finish_reason` 判 `Stop`（原为 `Aborted`，会让 turn 循环丢掉模型输出），无 `[DONE]` 的裸 EOF 仍判 `Aborted`（保留原契约）。
+
+**影响面**：所有把 usage 放在 `finish_reason` 之后的 OpenAI 兼容网关，此前从未被真实端点跑过（DeepSeek/BigModel 的 smoke 走的是 anthropic wire）。
+
+**回归测试**：`usage_after_finish_reason_is_kept`、`eof_without_done_marker_keeps_finish_reason`、`done_marker_without_finish_reason_is_stop`、`truncated_stream_without_markers_is_aborted`（`src/provider/openai_chat.rs`）。
+
+**同时修掉**：`turn.rs` 在 thinking-only 回合会发一个 `text:""` 的 `message_done`（无可见文本时不再发该事件）。
+
+## 7. 2026-09-17 三角色联跑与并行工具批次修复
+
+### 7.1 联跑结果
+
+`harness/run-demo.sh`：hub + `serve`(harness-rd) + `serve`(harness-qa) + `demo-sa` 四进程。
+
+```
+[hub] listening on ~/.kestrel/harness/bus.sock
+[sa] dev iter1: pass / review iter1: pass / test iter1: pass / build iter1: pass
+[sa] pipeline complete
+```
+
+- journal 顺序成立：`stage_written` → `bell_sent` → `budget_spent` → `bell_received` → `result_committed`（write-ahead 不变式 5）
+- 工件按 `{session}-{stage}-iter{n}.json` 落盘，SA 的读盘巡检能命中（此前两端命名不一致，巡检永不命中）
+- 四个 stage 的 worker 都真实调用了 LLM；工件新增 `stop` 字段，空结果可自解释
+
+### 7.2 暴露的 wire 缺陷：并行工具批次的历史形状
+
+**症状**：RD/QA worker 在第二个回合收到 `400 invalid_request_error: The content[].thinking in the thinking mode must be passed back to the API`。
+
+**根因**：`outcomes_to_history` 按「每个调用一对 assistant/user」交替提交，两个工具调用产生
+
+```
+assistant: [thinking, tool_use(c1)]   user: [tool_result(c1)]
+assistant: [tool_use(c2)]             user: [tool_result(c2)]
+```
+
+第二条 assistant 消息带着 `tool_use` 却没有 thinking 块。DeepSeek 在 thinking 模式下对此直接 400。最小复现（同一份真实 thinking/工具调用，只改形状）：
+
+| 请求形状 | 结果 |
+|---|---|
+| 「每调用一对」交替 | **400** |
+| 一个 assistant 装全部 `tool_use`、一个 user 装全部 `tool_result` | 200 |
+
+**为什么三端点 smoke 没抓到**：smoke 的每次工具回合都只有一个工具调用，交替与成组是同一个形状。
+
+**修法**：历史改为批量提交（`outcomes_to_history`：全部 `tool_use` 在前，全部 `tool_result` 在后）；openai wire 相应把同批 `tool_calls` 合并进一条 assistant 消息，避免连续两条 assistant 消息。回归测试 2 项（`anthropic::parallel_tool_batch_renders_grouped`、`openai_chat::render_messages_merges_parallel_tool_calls`）。

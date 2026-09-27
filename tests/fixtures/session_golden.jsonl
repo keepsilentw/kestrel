@@ -1,0 +1,3 @@
+{"type":"header","session":"id-1","cwd":"/ws","created_ms":1000,"role":"rd","provider":"faux","model":"tiny"}
+{"type":"message","id":"id-2","parent":null,"item":{"type":"user_text","text":"go"},"usage":null,"ms":1000}
+{"type":"message","id":"id-3","parent":"id-2","item":{"type":"assistant_text","text":"hello"},"usage":null,"ms":1000}

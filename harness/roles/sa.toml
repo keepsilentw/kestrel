@@ -1,0 +1,22 @@
+# SA（系统架构师）：唯一协调者——状态机、派发、预算账本、人工关卡对接。
+role = "sa"
+peer_id = "harness-sa"
+bus_socket = "~/.kestrel/harness/bus.sock"
+
+[llm]
+provider = "qwen-anthropic"      # 旗舰：编排/拆解/收敛判定（providers.toml 引用）
+model = "qwen3.8-max"
+
+[system]
+prompt_file = "../systems/sa.md"   # 相对 role 文件所在目录（harness/roles/）
+
+[permissions]
+policy_file = "sa.policy.json"   # SA 无写权限：只动 harness/ 元数据
+write_roots = []
+read_only_islands = []
+
+[permissions.sandbox]
+network = "none"
+
+[budget]
+max_usd = 5.0
