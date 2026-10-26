@@ -29,10 +29,8 @@ pub fn split_segments(cmd: &str) -> Option<Vec<Vec<String>>> {
                 if in_single {
                     cur.push('\\');
                 } else {
-                    match chars.next() {
-                        Some(n) => cur.push(n),
-                        None => return None, // dangling escape
-                    }
+                    // dangling escape -> unparseable, fail closed
+                    cur.push(chars.next()?);
                 }
             }
             '|' if !in_single && !in_double => {
