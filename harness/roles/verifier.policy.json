@@ -5,6 +5,7 @@
     { "pattern": ["ls"], "decision": "allow" },
     { "pattern": ["cat"], "decision": "allow" },
     { "pattern": ["cargo", ["test", "build", "check"]], "decision": "allow" },
+    { "pattern": ["python3", ["-m"]], "decision": "allow" },
     { "pattern": ["git", ["status", "diff", "log"]], "decision": "allow" }
   ],
   "forbidden_prefixes": [["bash"], ["python"], ["sh"], ["rm"], ["git", "push"]]

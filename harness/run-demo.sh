@@ -70,7 +70,11 @@ PIDS+=($!)
 # 这里给一拍等注册完成，否则首批铃会被 hub 判为 unknown session 丢弃。
 sleep 1
 
-# --- 2. SA：脚本化状态机，验证 write-ahead 顺序、崩溃对账、fail 回环与预算停损
+# --- 2. SA：脚本化状态机，验证 write-ahead 顺序、崩溃对账、fail 回环与预算停损。
+#     --worktree 把 RD 的写入目录广播进每颗门铃的 ref，QA 才是在验同一棵树；
+#     fail 回环是真的（空结果/FAIL 结论都会回派），所以预算给到 8 次派发。
 KESTREL_TEST_KILL_AFTER="${KESTREL_TEST_KILL_AFTER:-}" \
   "$BIN" demo-sa --bus-socket "$SOCKET" --task "${KESTREL_DEMO_TASK:-demo: 实现一个 LRU cache}" \
-  --journal "$HERE/journal.jsonl" --artifacts-dir "$ARTIFACTS"
+  --journal "$HERE/journal.jsonl" --artifacts-dir "$ARTIFACTS" \
+  --worktree "${KESTREL_WORKTREE:-/tmp/kestrel-worktree}" \
+  --bell-timeout-secs "${KESTREL_DEMO_BELL_TIMEOUT:-300}" --max-usd "${KESTREL_DEMO_MAX_USD:-6.0}"
