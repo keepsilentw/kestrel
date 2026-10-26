@@ -134,3 +134,41 @@ assistant: [tool_use(c2)]             user: [tool_result(c2)]
 **为什么三端点 smoke 没抓到**：smoke 的每次工具回合都只有一个工具调用，交替与成组是同一个形状。
 
 **修法**：历史改为批量提交（`outcomes_to_history`：全部 `tool_use` 在前，全部 `tool_result` 在后）；openai wire 相应把同批 `tool_calls` 合并进一条 assistant 消息，避免连续两条 assistant 消息。回归测试 2 项（`anthropic::parallel_tool_batch_renders_grouped`、`openai_chat::render_messages_merges_parallel_tool_calls`）。
+
+## 8. 2026-10-26 全量冒烟与修复回归
+
+对象：一期 M0-M4 全部已实现功能。工装：`cargo` 闸门 + 本地零成本假端点（Anthropic 形流式，可切 text/loop/flaky/slow 模式）+ 一份**独立实现的 Node 总线客户端**（反证帧协议互操作）+ 真实三端点。假端点层覆盖工具编排 / Seatbelt / 审批 / 超时 / retry / 会话；真端点层只用于 wire 归一、usage 记账与四进程联跑。
+
+### 8.1 修复前基线
+
+121/121 通过、`fmt --check` 干净；`clippy --all-targets -- -D warnings` **失败**（rust/clippy 1.98 新增 `question_mark`）。真实端点：Qwen anthropic usage 218/22、Qwen openai usage 564/24、DeepSeek 两个 bash 调用成组回合收敛；Seatbelt 三态（root 内允许 / root 外拒绝 / 审批后脱沙箱）；总线路由、未知 session 报错、伪造 sender 断连；四进程联跑 4 stage 全 pass。
+
+### 8.2 发现的问题与处置
+
+| # | 问题 | 处置 |
+|---|---|---|
+| A | clippy 1.98 新 lint 破闸门（tokenizer 悬空转义分支） | 改 `chars.next()?`，闸门恢复干净 |
+| B | `serve` 每颗门铃新建引擎且 `session: None`——worker 跨铃无历史，`sessions/` 里连一个 worker 会话文件都没有 | 一个 worker 一个常驻引擎 + 一棵会话树；`Fatal` 只终止回合，不终止 worker |
+| C | 会话树/无损压缩在 CLI 上不可达（`open`/`prompt_items` 只被测试调用，`-p` 无续接口，压缩只在回合起点检查） | 新增 `--resume last\|<id>\|<path>` + `SessionStore::list/resolve`；spawn 时重建 history/history_ids 与 read 台账，并把 `ctx_tokens` 预置为恢复上下文的估算值 |
+| D | `--tools` 默认开且关不掉（`--tools false` 报 unrecognized subcommand），文档写成 opt-in | 默认关 + `--tools[=BOOL]`（`num_args=0..=1` + `default_missing_value`） |
+| E | `serve` 硬编码 `HeadlessDeny`，worker 走不到「拒绝 → 审批 → 脱沙箱重试」 | role 键 `[permissions].approve`（非法值回落拒绝）+ `--approve` 覆盖，runtime > role > 拒绝 |
+| F | `demo-sa` 判 pass 只看工件存在：`result:""` + `stop:"round budget exhausted"` 也能四绿 | `verdict_from_artifact` + `parse_verdict`：通路层（空结果 / abort / stop=error）与语义层（worker 自述 PASS/DONE vs FAIL/BLOCKED，允许前置铺垫、否定判定优先）都要过；fail 走真实回派，journal 落 `pass:false` |
+| G | design/README 规模数字过期（写 45 文件 ~7,800 行） | 按实测修正 src/tests 文件与行数，状态行测试数同步 |
+| H | 配置错误只吐 `No such file or directory (os error 2)`，不说是哪个文件 | role config 读/解析、policy 表、system prompt、provider registry 全部带上路径 |
+| I | （修 F 后暴露）`serve` 只把铃 payload 的 `task` 给 worker，`check`/`ref` 被丢——QA 拿不到验证对象，连判三轮「证据不足」 | `bell_prompt()` 把 task/check/iteration/ref 一并交出去；demo-sa 新增 `--worktree` 把 RD 的写入目录广播进 `ref` |
+| J | （修 F 后暴露）SA 硬编码 180s 等铃 / 2.0 USD 预算，是「一次派发 = 一次冷引擎」时代的数字：常驻引擎 + 8 轮工具 + BigModel 单轮实测 48-77s 必然误判；一次诚实回派即触顶 | `--bell-timeout-secs`（默认 300）、`--max-usd`（默认 6.0 = 4 stage × 3 iter × 0.5，覆盖声明的重试策略）；`run-demo.sh` 可用 `KESTREL_DEMO_BELL_TIMEOUT` / `KESTREL_DEMO_MAX_USD` 覆盖 |
+| K | （修 F 后暴露）角色 prompt 与权限互相矛盾：要求 RD/QA「把结果写进 artifacts」，但二者写范围各只有 worktree / 空；QA 的允许命令里没有测试运行器，`review` 永远缺 test 证据 | 结论改为「文字回答，由 `serve` 落成工件」；两侧策略允许 `python3 -m`（跑被测代码），`bash`/`sh`/`python`/`rm` 仍禁止 |
+
+### 8.3 修复后回归
+
+- 自动化：137/137 通过（lib 102 + 集成 35；新增 resume/压缩可达、铃文本、判定解析、CLI flag 形状等回归）；`fmt --check` 与 `clippy -D warnings` 干净。
+- 假端点：`--tools` 三态（缺省请求无 tools 字段 / `--tools` 带 / `--tools false` 不带）；`--resume last` 后请求历史从 1 条变 3 条；role 声明 `approve="all"` 时无需 CLI 即可走审批重试；缺文件错误带出文件名。
+- 常驻 worker：一次运行两个回合写进**同一个**会话文件，`compaction` 检查点落盘（`tokens_before` 658 → 1258，第二次带 `seed` 合并）。
+- 真端点：Qwen anthropic / Qwen openai 的 usage 记账不变；DeepSeek 两个并行 bash 调用仍成组收敛。
+- 联跑：判定改读工件后，`dev iter1` 如实报 `fail (no verdict / round budget exhausted)` 并回派，后续 iter 靠常驻历史收敛——「pipeline complete」不再可能由空答案支撑。
+
+### 8.4 遗留
+
+1. 联跑是否绿取决于 worker 当次能否收敛；判定严格之后，失败路径（回派 → iter 上限 → 非零退出）是真实行为，不是回归缺陷。任务/提示词层面的收敛调优仍属 demo 打磨。
+2. `ApproveMode::Bus`（worker 把审批反向请求发给 SA/真人）未接线，worker 只能靠 role 预先声明 none/all 二值。
+3. SA 判定目前只吃 `result` 文字与 `aborted`/`stop`，还没核对工件里引用的证据文件是否真实存在。
