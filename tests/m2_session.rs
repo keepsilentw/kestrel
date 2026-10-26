@@ -285,3 +285,105 @@ async fn model_switch_persists_and_routes() {
     );
     handle.shutdown().await;
 }
+
+fn reopen(store: &SessionStore, ms: i64) -> Arc<SessionStore> {
+    Arc::new(
+        SessionStore::open(
+            store.path(),
+            Arc::new(SeqGen::new()),
+            Arc::new(FakeClock(AtomicI64::new(ms))),
+        )
+        .unwrap(),
+    )
+}
+
+/// Regression (smoke 2026-10-26): a resumed tree must actually carry context.
+/// This is what `serve` does per bell and what `-p --resume` does.
+#[tokio::test]
+async fn resumed_store_carries_history_into_the_next_turn() {
+    let store = new_store("resume-carry");
+    let wire = Arc::new(FauxWire::new());
+    wire.push_turn_script(kestrel::provider::faux::stop_script("first answer"));
+    let (handle, mut rx) = spawn(Arc::clone(&wire), tiny_model(), Arc::clone(&store), 8);
+    handle.turn(vec![kestrel::core::events::MessageItem::user_text(
+        "question one",
+    )]);
+    common::collect_until_complete(&mut rx).await;
+    handle.shutdown().await;
+    let before = std::fs::read_to_string(store.path()).unwrap();
+
+    let reopened = reopen(&store, 2000);
+    let wire2 = Arc::new(FauxWire::new());
+    wire2.push_turn_script(kestrel::provider::faux::stop_script("second answer"));
+    let (h2, mut rx2) = spawn(Arc::clone(&wire2), tiny_model(), Arc::clone(&reopened), 8);
+    h2.turn(vec![kestrel::core::events::MessageItem::user_text(
+        "question two",
+    )]);
+    common::collect_until_complete(&mut rx2).await;
+    h2.shutdown().await;
+
+    let rendered = serde_json::to_string(&wire2.recorded_requests()).unwrap();
+    assert!(
+        rendered.contains("first answer"),
+        "resumed engine lost the earlier assistant turn: {rendered}"
+    );
+    assert!(
+        rendered.contains("question one"),
+        "resumed engine lost the earlier user turn: {rendered}"
+    );
+    // Append-only: the previously written lines are untouched.
+    let after = std::fs::read_to_string(store.path()).unwrap();
+    assert!(after.starts_with(before.as_str()), "session was truncated");
+    assert!(after.len() > before.len(), "second turn wrote nothing");
+}
+
+/// Resume also restores the context *meter*: an oversized tree must compact
+/// before the first sample, not after it (compaction was otherwise unreachable
+/// from any CLI path).
+#[tokio::test]
+async fn resume_compacts_before_the_first_sample() {
+    let store = new_store("resume-compact");
+    for i in 0..8 {
+        store.append_item(
+            kestrel::core::events::MessageItem::user_text(format!("chunk{i}: {}", "y".repeat(400))),
+            None,
+        );
+    }
+    let before = std::fs::read_to_string(store.path()).unwrap();
+    let reopened = reopen(&store, 2000);
+
+    let wire = Arc::new(FauxWire::new());
+    // request 1: the compaction summary; request 2: the real turn.
+    wire.push_turn_script(kestrel::provider::faux::stop_script("resumed summary"));
+    wire.push_turn_script(kestrel::provider::faux::stop_script("answer after resume"));
+
+    let (handle, mut rx) = spawn(Arc::clone(&wire), tiny_model(), Arc::clone(&reopened), 8);
+    handle.turn(vec![kestrel::core::events::MessageItem::user_text(
+        "next bell",
+    )]);
+    let (events, _stop) = common::collect_until_complete(&mut rx).await;
+    handle.shutdown().await;
+
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e.msg, EventMsg::Compacted { .. })),
+        "a resumed oversized session must compact before sampling"
+    );
+    let recorded = wire.recorded_requests();
+    assert_eq!(recorded.len(), 2, "{:?}", recorded.len());
+    let first_item = recorded[1]["items"][0]["text"].as_str().unwrap_or_default();
+    assert!(
+        first_item.starts_with("[context summary]"),
+        "post-compaction prompt must lead with the summary: {first_item}"
+    );
+    assert!(
+        reopened
+            .load()
+            .iter()
+            .any(|e| matches!(e, kestrel::session::Entry::Compaction { .. })),
+        "checkpoint missing from the tree"
+    );
+    let after = std::fs::read_to_string(store.path()).unwrap();
+    assert!(after.starts_with(before.as_str()), "session was truncated");
+}

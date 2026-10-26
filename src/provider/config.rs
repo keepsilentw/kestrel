@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Mutex;
 
+use anyhow::Context;
 use serde::Deserialize;
 
 use super::wire::{CompatFlags, CostPerMTok, ModelMeta, WireId};
@@ -46,9 +47,13 @@ pub struct ConfigModel {
 
 impl Registry {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
-        let text = std::fs::read_to_string(path)?;
-        let r: Registry = toml::from_str(&text)?;
-        Ok(r)
+        let text = std::fs::read_to_string(path).with_context(|| {
+            format!(
+                "read provider registry {} — providers/keys live only in the user layer file",
+                path.display()
+            )
+        })?;
+        toml::from_str(&text).with_context(|| format!("parse provider registry {}", path.display()))
     }
 
     /// Resolve (provider, model) -> full ModelMeta. Unknown model ids get
@@ -287,5 +292,18 @@ stream_include_usage = true
     fn project_layer_providers_banned() {
         assert!(assert_no_provider_definitions("[providers.x]\nbase_url = \"x\"\n").is_err());
         assert!(assert_no_provider_definitions("[llm]\nprovider = \"x\"\n").is_ok());
+    }
+
+    /// A missing/misplaced registry file must say which file it tried to read
+    /// and where providers are actually allowed (smoke 2026-10-26 finding H).
+    #[test]
+    fn registry_error_names_the_file() {
+        let err = Registry::load(std::path::Path::new("/tmp/kestrel-missing-providers.toml"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("read provider registry") && err.contains("user layer"),
+            "{err}"
+        );
     }
 }

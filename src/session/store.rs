@@ -226,18 +226,26 @@ impl SessionStore {
     /// region — [first_kept..compaction) messages + everything after the
     /// compaction, with the summary sitting at the bottom.
     pub fn prompt_items(&self) -> Vec<MessageItem> {
+        self.prompt_snapshot()
+            .into_iter()
+            .map(|(_, item)| item)
+            .collect()
+    }
+
+    /// Same projection as `prompt_items` but carrying each item's session
+    /// entry id (None for the synthesized summary line), so a resumed engine
+    /// can keep `history` and `history_ids` aligned with the tree on disk.
+    pub fn prompt_snapshot(&self) -> Vec<(Option<EntryId>, MessageItem)> {
         let path_entries = self.head_path_entries();
+        let msg = |e: &Entry| match e {
+            Entry::Message { id, item, .. } => Some((Some(id.clone()), item.clone())),
+            _ => None,
+        };
         let Some(cut) = path_entries
             .iter()
             .rposition(|e| matches!(e, Entry::Compaction { .. }))
         else {
-            return path_entries
-                .iter()
-                .filter_map(|e| match e {
-                    Entry::Message { item, .. } => Some(item.clone()),
-                    _ => None,
-                })
-                .collect();
+            return path_entries.iter().filter_map(msg).collect();
         };
         let (summary, first_kept) = match &path_entries[cut] {
             Entry::Compaction {
@@ -253,19 +261,78 @@ impl SessionStore {
             .iter()
             .position(|e| e.id() == Some(&first_kept))
             .unwrap_or(cut);
-        let kept: Vec<MessageItem> = path_entries[start..cut]
+        let kept: Vec<(Option<EntryId>, MessageItem)> = path_entries[start..cut]
             .iter()
             .chain(&path_entries[cut + 1..])
-            .filter_map(|e| match e {
-                Entry::Message { item, .. } => Some(item.clone()),
-                _ => None,
-            })
+            .filter_map(msg)
             .collect();
-        let mut out = vec![MessageItem::UserText {
-            text: format!("{SUMMARY_PREFIX}{summary}"),
-        }];
+        let mut out = vec![(
+            None,
+            MessageItem::UserText {
+                text: format!("{SUMMARY_PREFIX}{summary}"),
+            },
+        )];
         out.extend(kept);
         out
+    }
+
+    /// Session files recorded for `cwd`, oldest first (the `<created_ms>_<id>`
+    /// name makes lexical order chronological).
+    pub fn list(home: &Path, cwd: &Path) -> Vec<PathBuf> {
+        let dir = sessions_dir(home, cwd);
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return vec![];
+        };
+        let mut files: Vec<PathBuf> = rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
+            .collect();
+        files.sort();
+        files
+    }
+
+    /// Resolve a `--resume` selector into a session file: an explicit path,
+    /// `last` (newest under this cwd), or a session id / unique id prefix.
+    pub fn resolve(home: &Path, cwd: &Path, selector: &str) -> anyhow::Result<PathBuf> {
+        let p = Path::new(selector);
+        if p.extension().and_then(|x| x.to_str()) == Some("jsonl") {
+            let abs = if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                std::env::current_dir()?.join(p)
+            };
+            if abs.exists() {
+                return Ok(abs);
+            }
+            anyhow::bail!("no session file at {}", abs.display());
+        }
+        let files = Self::list(home, cwd);
+        if selector == "last" || selector.is_empty() {
+            return files.last().cloned().ok_or_else(|| {
+                anyhow::anyhow!("no sessions recorded under cwd {}", cwd.display())
+            });
+        }
+        let hits: Vec<PathBuf> = files
+            .into_iter()
+            .filter(|f| {
+                f.file_stem()
+                    .and_then(|s| s.to_str())
+                    .and_then(|s| s.rsplit_once('_'))
+                    .is_some_and(|(_, id)| id.starts_with(selector))
+            })
+            .collect();
+        match hits.len() {
+            1 => Ok(hits[0].clone()),
+            0 => anyhow::bail!(
+                "no session matching {selector:?} under cwd {} (try `--resume last`)",
+                cwd.display()
+            ),
+            n => anyhow::bail!(
+                "{n} sessions match {selector:?} under cwd {}; pass a longer id prefix",
+                cwd.display()
+            ),
+        }
     }
 }
 
@@ -428,5 +495,58 @@ mod tests {
             crate::provider::wire::ContextItem::UserText { text: "q".into() }
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn list_and_resume_selectors() {
+        let home = std::env::temp_dir().join(format!("kestrel-list-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let cwd = Path::new("/ws-list");
+        let first = SessionStore::create(
+            &home,
+            cwd,
+            "rd",
+            "prov",
+            "m",
+            Arc::new(SeqGen::new()),
+            Arc::new(FakeClock(AtomicI64::new(1_000))),
+        )
+        .unwrap();
+        let second = SessionStore::create(
+            &home,
+            cwd,
+            "rd",
+            "prov",
+            "m",
+            Arc::new(SeqGen::new()),
+            Arc::new(FakeClock(AtomicI64::new(2_000))),
+        )
+        .unwrap();
+
+        let files = SessionStore::list(&home, cwd);
+        assert_eq!(files.len(), 2, "both sessions listed for the cwd");
+        assert_eq!(files[0], first.path(), "oldest first");
+        assert_eq!(
+            SessionStore::resolve(&home, cwd, "last").unwrap(),
+            second.path()
+        );
+        // An explicit path selector works even outside the cwd bucket.
+        assert_eq!(
+            SessionStore::resolve(&home, cwd, first.path().to_str().unwrap()).unwrap(),
+            first.path()
+        );
+        // Both files carry the same id part (each create restarts SeqGen), so a
+        // shared prefix is ambiguous: say so instead of guessing a winner.
+        let err = SessionStore::resolve(&home, cwd, "id")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("2 sessions match"), "{err}");
+        assert!(
+            SessionStore::resolve(&home, Path::new("/nowhere-cwd"), "last")
+                .unwrap_err()
+                .to_string()
+                .contains("no sessions recorded")
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 }

@@ -36,6 +36,10 @@ pub struct RunArgs {
     pub role_file: Option<PathBuf>,
     pub approve: ApproveMode,
     pub tools_enabled: bool,
+    /// `--resume <last|session-id|path>`: continue an existing session tree
+    /// instead of starting a new one. An explicit selector must resolve — a
+    /// failed resume is an error, never a silent new session.
+    pub resume: Option<String>,
 }
 
 /// Run a single turn against a real endpoint, printing normalized events as
@@ -91,17 +95,28 @@ pub async fn run_once(args: RunArgs) -> anyhow::Result<i32> {
     };
 
     // Session persistence: ~/.kestrel/sessions/... (KESTREL_HOME overrides).
-    let session = SessionStore::create(
-        &crate::config::kestrel_home(),
-        &std::env::current_dir()?,
-        &role_name,
-        model.wire_id_str(),
-        &model.id,
-        Arc::new(UuidGen),
-        Arc::new(SystemClock),
-    )
-    .ok()
-    .map(Arc::new);
+    let home = crate::config::kestrel_home();
+    let cwd = std::env::current_dir()?;
+    let session = match args.resume.as_deref() {
+        Some(selector) => Some(Arc::new(SessionStore::open(
+            &SessionStore::resolve(&home, &cwd, selector)
+                .with_context(|| format!("resume session {selector:?}"))?,
+            Arc::new(UuidGen),
+            Arc::new(SystemClock),
+        )?)),
+        // Fresh session is best-effort: a read-only home must not sink the run.
+        None => SessionStore::create(
+            &home,
+            &cwd,
+            &role_name,
+            model.wire_id_str(),
+            &model.id,
+            Arc::new(UuidGen),
+            Arc::new(SystemClock),
+        )
+        .ok()
+        .map(Arc::new),
+    };
 
     let handle = AgentHandle::spawn(EngineConfig {
         provider: wire,

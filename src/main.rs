@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgAction, Args, Parser, Subcommand};
 use kestrel::cli::run::{RunArgs, run_once};
 use kestrel::config::RoleConfig;
 use kestrel::provider::config::{KeyResolver, Registry};
@@ -31,12 +31,24 @@ struct Cli {
     role: Option<PathBuf>,
 
     /// Headless approval policy: none (deny Ask) | all (allow Ask).
-    #[arg(long, default_value = "none")]
-    approve: String,
+    #[arg(long, value_name = "POLICY")]
+    approve: Option<String>,
 
-    /// Enable built-in tools (bash/read/write/edit).
-    #[arg(long, default_value_t = true)]
+    /// Built-in tools (bash/read/write/edit): opt-in — `--tools` on, `--tools false` off.
+    #[arg(
+        long,
+        num_args = 0..=1,
+        value_name = "BOOL",
+        default_value_t = false,
+        default_missing_value = "true",
+        action = ArgAction::Set
+    )]
     tools: bool,
+
+    /// Continue an existing session tree instead of starting one: `last`, a
+    /// session id or unique id prefix, or a path to a session `.jsonl`.
+    #[arg(long, value_name = "SELECTOR")]
+    resume: Option<String>,
 
     /// Overall timeout in seconds.
     #[arg(long, default_value_t = 300)]
@@ -115,6 +127,24 @@ struct DemoSaCmd {
     /// Result artifacts dir (SA 巡检读盘为准).
     #[arg(long, default_value = "artifacts")]
     artifacts_dir: PathBuf,
+
+    /// Budget ceiling for the whole pipeline, in the fixture USD accounting.
+    /// It has to cover the declared retry policy, not just the happy path:
+    /// 4 stages x 3 iterations x 0.5 = 6.0 (a fail 回环 is real now — an empty
+    /// answer or a FAIL verdict re-dispatches instead of passing).
+    #[arg(long, default_value_t = 6.0)]
+    max_usd: f64,
+
+    /// How long to wait for a worker's result bell before falling back to disk
+    /// inspection. A resident worker can spend its whole round budget (8 tool
+    /// rounds) on one bell, so this is not a 30s knob.
+    #[arg(long, default_value_t = 300)]
+    bell_timeout_secs: u64,
+
+    /// The dispatch worktree RD writes into; published to every bell `ref` so
+    /// QA verifies the same tree.
+    #[arg(long)]
+    worktree: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -127,11 +157,7 @@ struct HubCmd {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let approve = match cli.approve.as_str() {
-        "none" => kestrel::tools::ApproveMode::HeadlessDeny,
-        "all" => kestrel::tools::ApproveMode::HeadlessAllow,
-        other => anyhow::bail!("--approve must be none|all, got {other:?}"),
-    };
+    let approve = cli.approve.as_deref().map(parse_approve).transpose()?;
 
     // Project-layer discipline: providers may never be defined there (codex 纪律 1).
     let project_cfg = std::path::Path::new(".kestrel/kestrel.toml");
@@ -163,6 +189,7 @@ async fn main() -> anyhow::Result<()> {
                 model,
                 api_key,
                 artifacts_dir: s.artifacts_dir,
+                approve,
             })
             .await;
         }
@@ -173,8 +200,10 @@ async fn main() -> anyhow::Result<()> {
                 journal: d.journal,
                 artifacts: d.artifacts_dir,
                 per_dispatch_usd: 0.5,
-                max_usd: 2.0,
+                max_usd: d.max_usd,
                 max_iterations: 3,
+                bell_timeout: Duration::from_secs(d.bell_timeout_secs),
+                worktree: d.worktree,
             })
             .await;
         }
@@ -192,6 +221,12 @@ async fn main() -> anyhow::Result<()> {
         None => None,
     };
     let (model_meta, api_key) = resolve_backend(&cli.backend, role.as_ref())?;
+    // Approval precedence: runtime flag > role file > deny (fail closed).
+    let approve = match (approve, role.as_ref()) {
+        (Some(mode), _) => mode,
+        (None, Some(r)) => r.approve_mode(),
+        (None, None) => kestrel::tools::ApproveMode::HeadlessDeny,
+    };
     let code = run_once(RunArgs {
         prompt,
         model: model_meta,
@@ -201,9 +236,19 @@ async fn main() -> anyhow::Result<()> {
         role_file: cli.role,
         approve,
         tools_enabled: cli.tools,
+        resume: cli.resume,
     })
     .await?;
     std::process::exit(code);
+}
+
+/// `--approve none|all` — the headless answer to an Ask-class tool call.
+fn parse_approve(value: &str) -> anyhow::Result<kestrel::tools::ApproveMode> {
+    match value {
+        "none" => Ok(kestrel::tools::ApproveMode::HeadlessDeny),
+        "all" => Ok(kestrel::tools::ApproveMode::HeadlessAllow),
+        other => anyhow::bail!("--approve must be none|all, got {other:?}"),
+    }
 }
 
 /// Resolve (model meta, api key) from CLI flags, falling back to the role's
@@ -279,5 +324,46 @@ fn resolve_key(spec: &str) -> anyhow::Result<String> {
         }
     } else {
         Ok(spec.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, parse_approve};
+    use clap::Parser;
+    use kestrel::tools::ApproveMode;
+
+    #[test]
+    fn tools_flag_is_opt_in_and_still_switchable_off() {
+        let plain = Cli::try_parse_from(["kestrel", "-p", "hi"]).unwrap();
+        assert!(!plain.tools, "tools default to off, as documented");
+        assert!(
+            Cli::try_parse_from(["kestrel", "-p", "hi", "--tools"])
+                .unwrap()
+                .tools
+        );
+        assert!(
+            !Cli::try_parse_from(["kestrel", "-p", "hi", "--tools", "false"])
+                .unwrap()
+                .tools,
+            "--tools false must be accepted (wrappers need to switch tools off)"
+        );
+    }
+
+    #[test]
+    fn approve_defaults_to_unset_so_the_role_can_decide() {
+        let plain = Cli::try_parse_from(["kestrel", "-p", "hi"]).unwrap();
+        assert!(plain.approve.is_none(), "no flag means the role decides");
+        assert_eq!(parse_approve("none").unwrap(), ApproveMode::HeadlessDeny);
+        assert_eq!(parse_approve("all").unwrap(), ApproveMode::HeadlessAllow);
+        assert!(parse_approve("sometimes").is_err());
+    }
+
+    #[test]
+    fn resume_selector_is_captured() {
+        let c = Cli::try_parse_from(["kestrel", "-p", "hi", "--resume", "last"]).unwrap();
+        assert_eq!(c.resume.as_deref(), Some("last"));
+        let plain = Cli::try_parse_from(["kestrel", "-p", "hi"]).unwrap();
+        assert!(plain.resume.is_none());
     }
 }

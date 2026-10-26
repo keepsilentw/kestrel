@@ -141,6 +141,30 @@ impl AgentHandle {
         if let Some(store) = config.session {
             let _ = shared.session.set(store);
         }
+        // A store that already holds entries means this is a resume (worker
+        // turn #N, or `-p --resume`): rebuild history — and with it the
+        // read-before-edit ledger — from the tree, so context carries across
+        // turns instead of every turn starting cold.
+        if let Some(store) = shared.session.get() {
+            let snapshot = store.prompt_snapshot();
+            if !snapshot.is_empty() {
+                let items: Vec<MessageItem> = snapshot.iter().map(|(_, i)| i.clone()).collect();
+                let ids: Vec<Option<crate::session::EntryId>> =
+                    snapshot.iter().map(|(id, _)| id.clone()).collect();
+                shared.history.lock().unwrap().extend(items.iter().cloned());
+                shared.history_ids.lock().unwrap().extend(ids);
+                shared.reads.rebuild_from_items(&shared.cwd, &items);
+                // Seed the context meter with the restored size, otherwise a
+                // resumed session samples once before the compaction check has
+                // anything to go on (ctx_tokens only learns during a round).
+                let est = crate::session::compact::est_tokens(
+                    &serde_json::to_string(&items).unwrap_or_default(),
+                );
+                shared
+                    .ctx_tokens
+                    .store(est, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         // managed: joined in AgentHandle::shutdown
         let join = tokio::spawn(op_loop(rx, Arc::clone(&shared)));
         Self {

@@ -9,6 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
+use anyhow::Context;
 use serde::Deserialize;
 
 use crate::permissions::PolicyTable;
@@ -42,6 +43,11 @@ pub struct RoleConfig {
 pub struct PermissionsSection {
     #[serde(default)]
     pub policy_file: Option<PathBuf>,
+    /// Headless approval policy for Ask-class tool calls: `"none"` (default:
+    /// deny) | `"all"` (approve, then the unsandboxed retry). A worker runs
+    /// headless, so this is where a role opts into the escalation loop.
+    #[serde(default)]
+    pub approve: Option<String>,
     #[serde(default)]
     pub write_roots: Vec<PathBuf>,
     #[serde(default)]
@@ -64,10 +70,19 @@ pub struct SystemSection {
 }
 
 impl RoleConfig {
+    /// Approval mode for a headless run. Absent/unknown values fall back to
+    /// deny — fail closed, and never silently wider than the role intended.
+    pub fn approve_mode(&self) -> crate::tools::ApproveMode {
+        match self.permissions.approve.as_deref() {
+            Some("all") => crate::tools::ApproveMode::HeadlessAllow,
+            _ => crate::tools::ApproveMode::HeadlessDeny,
+        }
+    }
+
     pub fn load(path: &Path) -> anyhow::Result<Self> {
-        let text = std::fs::read_to_string(path)?;
-        let cfg: RoleConfig = toml::from_str(&text)?;
-        Ok(cfg)
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("read role config {}", path.display()))?;
+        toml::from_str(&text).with_context(|| format!("parse role config {}", path.display()))
     }
 
     /// Writable roots / islands are canonicalized against the role file's dir
@@ -107,7 +122,9 @@ impl RoleConfig {
         match &self.permissions.policy_file {
             Some(f) => {
                 let engine_path = canon(base, f)?;
-                Ok(crate::permissions::PermissionEngine::from_json_file(&engine_path)?.table)
+                crate::permissions::PermissionEngine::from_json_file(&engine_path)
+                    .with_context(|| format!("load policy table {}", engine_path.display()))
+                    .map(|e| e.table)
             }
             None => Ok(PolicyTable::default()),
         }
@@ -115,7 +132,11 @@ impl RoleConfig {
 
     pub fn system_prompt(&self, base: &Path) -> anyhow::Result<String> {
         match &self.system.prompt_file {
-            Some(f) => Ok(std::fs::read_to_string(canon(base, f)?)?),
+            Some(f) => {
+                let p = canon(base, f)?;
+                std::fs::read_to_string(&p)
+                    .with_context(|| format!("read system prompt {}", p.display()))
+            }
             None => Ok(String::new()),
         }
     }
@@ -143,6 +164,35 @@ fn canon(base: &Path, p: &Path) -> anyhow::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Diagnostics must name the file that failed — a bare
+    /// "No such file or directory (os error 2)" sent people hunting the wrong
+    /// config layer (smoke 2026-10-26 finding H).
+    #[test]
+    fn load_error_names_the_file() {
+        let path = std::path::Path::new("/tmp/kestrel-definitely-missing-role.toml");
+        let err = RoleConfig::load(path).unwrap_err().to_string();
+        assert!(
+            err.contains("read role config")
+                && err.contains("kestrel-definitely-missing-role.toml"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn approve_mode_is_fail_closed() {
+        let bare: RoleConfig = toml::from_str("role = \"rd\"").unwrap();
+        assert_eq!(bare.approve_mode(), crate::tools::ApproveMode::HeadlessDeny);
+        let allow: RoleConfig =
+            toml::from_str("role = \"rd\"\n[permissions]\napprove = \"all\"").unwrap();
+        assert_eq!(
+            allow.approve_mode(),
+            crate::tools::ApproveMode::HeadlessAllow
+        );
+        let junk: RoleConfig =
+            toml::from_str("role = \"rd\"\n[permissions]\napprove = \"yolo\"").unwrap();
+        assert_eq!(junk.approve_mode(), crate::tools::ApproveMode::HeadlessDeny);
+    }
 
     #[test]
     fn parse_role_toml() {
