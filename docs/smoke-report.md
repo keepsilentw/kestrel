@@ -9,10 +9,10 @@
 
 | 组 | 数量 | 覆盖 |
 |---|---|---|
-| 单测（lib） | 138 | wire 归一（含 openai-responses）/ partial_json / retry / registry / 权限矩阵 / sbpl golden / session 树 / journal 对账、轮转与在线投影 / 证据契约 / 审批授权表 / task 命名空间 |
+| 单测（lib） | 141 | wire 归一（含 openai-responses）/ partial_json / retry / registry / 权限矩阵 / sbpl golden / session 树 / journal 对账、轮转与在线投影 / 证据契约 / 审批授权表 / task 命名空间 / worker 池路由表 |
 | 单测（bin：CLI 形状） | 4 | `--tools` 三态、`--approve` 三值（none / all / bus）、`--resume` 选择子、bus 模式保留 role 期限 |
-| 集成（core_loop 5 / m1_tools 8 / sandbox_e2e 4 / m2_session 6 / m4_bus 13 / wire_anthropic 2 / discipline 1） | 39 | 引擎验收 / 工具并发与审批超时 / 真实 Seatbelt / golden JSONL / 总线路由、审批往返、停车补投、重连重放、多 pipeline 并存、截断后巡检与崩溃对账 |
-| 合计 | **181**，全部通过；`fmt --check` 与 `clippy -D warnings` 干净（本机实跑；本仓库不挂 CI，闸门靠人工每次执行） | |
+| 集成（core_loop 5 / m1_tools 8 / sandbox_e2e 4 / m2_session 6 / m4_bus 14 / m5_pool 3 / wire_anthropic 2 / discipline 1） | 43 | 引擎验收 / 工具并发与审批超时 / 真实 Seatbelt / golden JSONL / 总线路由、审批往返、停车补投、重连重放、多 pipeline 并存、取消安全、截断后巡检与崩溃对账 / worker 池真并发与历史隔离 |
+| 合计 | **188**，全部通过；`fmt --check` 与 `clippy -D warnings` 干净（本机实跑；本仓库不挂 CI，闸门靠人工每次执行） | |
 
 > 计数以 2026-10-28 实跑为准。历史上这张表漂移过三次（101 → 121 → 137，实跑 130），
 > §8.3 里那句「137/137」也是其中之一——数字一旦需要人肉同步就会失真，而没有 CI 兜底，
@@ -245,3 +245,21 @@ reasoning 项的回显要求，都要等真端点定案（§9.9 的 Qwen 教训�
 
 轮转阈值本身仍由调用方给（`--rotate-after-records` / `--rotate-max-bytes`，默认 0 = 不截断）：
 库不猜派发节奏，这条策略留在 §10。
+
+## 12. 2026-10-28 worker 池与两个「取消安全」缺陷
+
+`serve` 改成按 task 路由的池（一 task 一引擎一树），faux 引擎 + 真总线验证：
+
+| 项 | 用例 | 结果 |
+|---|---|---|
+| 两个 task 真并发、各自落工件 | `m5_pool::two_tasks_run_side_by_side_in_one_worker` | 通过；两份工件、两颗结果铃各带自己的 task id |
+| 历史隔离 | 同上（反向断言 `recorded_requests()`） | t1 的请求里只有 t1 的铃，反之亦然 |
+| 超上限显式拒绝 | `m5_pool::over_the_task_cap_a_bell_is_refused_out_loud` | 回一颗 error 铃且不带 `result_ref`，不静默排队 |
+| 无 task id 的旧门铃 | `m5_pool::a_bell_without_a_task_id_uses_the_default_namespace` | 落进 `default` 命名空间，单管线行为不变 |
+| 路由与审批归属（纯表） | `pool::tests` 3 项 | 上限拒绝、批复按 req 定向不广播、请求表随回合关闭回收 |
+| **回归：select! 取消破坏连接** | `m4_bus::a_cancelled_inbound_poll_leaves_the_connection_usable` | 修复后通过；**变异验证**：摘掉 RAII 归还 → 该测试转红 |
+
+修掉的两个缺陷都属于「被 `tokio::select!` 取消的 future 留下坏状态」这一类：
+其一，`take_inbox` 取出接收器后被 drop，连接从此每次读都以 `inbox already polled`
+失败（上一版 `serve` 的审批循环是同一种形状，同样中招）；其二，竞争同时就绪时被丢弃的
+分支会连带丢掉那一帧——取消安全不等于不丢帧，所以泵改用专职 reader 任务读总线。

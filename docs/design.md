@@ -1,11 +1,11 @@
 # kestrel 设计文档：Rust harness kernel
 
-> 状态：M0-M4 已实现并通过测试（181/181）；§10 二期已落地七项——`ApproveMode::Bus`、
+> 状态：M0-M4 已实现并通过测试（188/188）；§10 二期已落地八项——`ApproveMode::Bus`、
 > 「判定 = 工件 + 证据文件」、bus 重连重放（停车补投 + 客户端重连）、journal 快照/截断语义、
 > 多任务并行（task 命名空间 + 前缀寻址）、openai-responses wire（**真端点未实测**，§9.24）、
-> journal 投影增量化与轮转触发（§9.25）。
+> journal 投影增量化与轮转触发（§9.25）、worker 池（一 task 一引擎一树，§9.26）。
 > 质量闸门保持人工执行（本仓库不挂 CI，见 §9.19⑥）。
-> 实现规模：src 50 文件 12,139 行 + tests 8 文件 2,284 行（plan 预算 ~10-13k 行内）。
+> 实现规模：src 51 文件 12,869 行 + tests 9 文件 2,560 行——已到 plan 预算（10-13k）上沿。
 > 输入：实现规划（plan.md）与调研语料（codex / pi study notes、三方资料库 references.md）——均为开发过程资料，未随本仓库发布。
 > 本文沉淀实现后的最终设计；与 plan 的偏差在 §9 逐条记录。
 
@@ -64,7 +64,7 @@ flowchart TD
 
 实现强制的不变式（都有测试背书）：
 
-1. **取消三件套**：每个 await 过 `or_cancel`；`tokio::spawn` 必须包 `AbortOnDropHandle`（`tests/discipline.rs` 静态闸门，fire-and-forget/managed 两类豁免标记）；`ResponseStream` drop 通知上游。
+1. **取消三件套**：每个 await 过 `or_cancel`；`tokio::spawn` 必须包 `AbortOnDropHandle`（`tests/discipline.rs` 静态闸门，fire-and-forget/managed 两类豁免标记）；`ResponseStream` drop 通知上游。由它延伸出第四条纪律：**被 `tokio::select!` 取消的 future 不许留下坏状态**——落败分支会在半路被 drop，任何「取出共享资源、用完再放回」的写法都必须用 RAII 归还（`bus::rpc::Taken`），否则那条连接会被永久破坏；而「一帧都不能丢」的读取要放进取消不了的专职 reader 任务（`cli::pool` 的泵）。
 2. **fail-closed**：tokenizer 解析不了 → Ask；未设角色/无策略 → Ask 或 Deny；QA 写范围为零；审批者沉默、回复不可解析、或 SA 没有授权表 → Deny（`approve_timeout_secs`，默认 120s）。
 3. **只追加**：session 永不截断；journal 的**活文件**可以变短，但只允许在旧前缀已被折成 `snapshot` 检查点并归档成段之后——历史不消失，只是搬出活文件（§9.22）。回滚/恢复 = 重放；半写容忍（残行 skip）。
 4. **sender identity**：Hello 声明 + 帧内 sender 强一致；伪装者断连；bus 来源 item 渲染带 `<bell from>` 标注。
@@ -100,7 +100,7 @@ role 文件的路径字段（`write_roots`/`read_only_islands`/`policy_file`/`pr
 
 预算不写进 role：`[budget].max_usd` 曾在三份 role 里各有一份，而代码中没有任何读者——花钱的上限由 SA 的 journal 账本执行（`demo-sa --max-usd`），单点权威，与「provider 归属唯一」是同一条理由。
 
-会话归属：`-p` 一次调用一个 append-only 树，默认新建，`--resume last|<id>|<path>` 续接；`serve` 一个 worker 一棵树 + 一个常驻引擎——每颗门铃是同一棵树上的下一个回合，因此历史、read-before-edit 台账与压缩检查点跨派发存活（`AgentHandle::spawn` 从树上重建 history/history_ids，并把 ctx_tokens 预置为重建上下文的估算值，否则恢复出的大会话要先采样一次才可能触发压缩）。
+会话归属：`-p` 一次调用一个 append-only 树，默认新建，`--resume last|<id>|<path>` 续接。`serve` 的归属单位是 **task**：一个进程为每个 task 各起一台常驻引擎、各开一棵树（`--max-tasks`，缺省 4；超限的门铃被显式拒绝），每颗门铃是那台引擎上的下一个回合，因此历史、read-before-edit 台账与压缩检查点跨派发存活，但**不跨 task 串台**（`AgentHandle::spawn` 从树上重建 history/history_ids，并把 ctx_tokens 预置为重建上下文的估算值，否则恢复出的大会话要先采样一次才可能触发压缩）。
 
 ## 7 里程碑与验收（已全部达成）
 
@@ -118,7 +118,7 @@ role 文件的路径字段（`write_roots`/`read_only_islands`/`policy_file`/`pr
 
 faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_request` 纯函数）→ 零真 key 覆盖全部验收；三层测试（单元/组件 golden/e2e）；determinism 经 `IdGen`/`Clock` 注入；沙箱 e2e 仅 macOS（`#[cfg(target_os="macos")]`）；闸门 = `cargo fmt --check` + `clippy -D warnings` + 全测试，**人工执行、每次改动都跑**：本仓库不挂 CI（2026-10-28 试过 `ci.yml`，同日按决定移除，见 §9.19⑥），所以这道闸门没有兜底机制——rust/clippy 1.98 那次破功就是因为只靠人记得跑。
 
-181 项 = lib 单测 138 + bin 单测（CLI 形状）4 + 集成 39（core_loop 5 / m1_tools 8 / m2_session 6 / m4_bus 13 / sandbox_e2e 4 / wire_anthropic 2 / discipline 1）。计数以实跑为准，改测试时同步这一行：此前 README / design / 报告三处各写一个数（137 / 137 / 121），实跑只有 130，漂移本身记在 §9.19。总线测试需要真 UDS `bind`，在严格沙箱或容器里以 `EPERM` 失败，属环境限制而非回归。
+188 项 = lib 单测 141 + bin 单测（CLI 形状）4 + 集成 43（core_loop 5 / m1_tools 8 / m2_session 6 / m4_bus 14 / m5_pool 3 / sandbox_e2e 4 / wire_anthropic 2 / discipline 1）。计数以实跑为准，改测试时同步这一行：此前 README / design / 报告三处各写一个数（137 / 137 / 121），实跑只有 130，漂移本身记在 §9.19。总线测试需要真 UDS `bind`，在严格沙箱或容器里以 `EPERM` 失败，属环境限制而非回归。
 
 ## 9 与 plan 的偏差（诚实台账）
 
@@ -182,10 +182,19 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
     ④ 顺带修掉一个既有缺陷：`Journal::create` 开的是追加模式，却把投影当空的。配合 `KESTREL_DEMO_KEEP_JOURNAL=1`（跨运行续账本）时，**昨天花掉的钱与没结算的铃在重启后被忘掉**，停损形同虚设。现在 `create`/`open` 都从盘上播种（`create_seeds_the_projection_of_an_existing_journal`）。
     仍不做的事：库自己决定阈值。`--rotate-after-records` / `--rotate-max-bytes` 默认 0（不截断），策略归派发节奏的主人（SA/人），这条留在 §10。
 
+26. **worker 池：一 task 一引擎一树（2026-10-28）**：§9.23 解决了「并存不串台」，但同一 worker 收到多颗铃仍是一回合一回合地跑。这一项把它变成真并发，做法是**加一层归属，而不是放宽不变式**：单活跃槽（§4）是取消、steering、压缩时序的地基，动它等于把整套时序重推一遍；真正的并行单位是 task。
+    ① `cli::pool`：pump 持有唯一的总线读写，按 `task_id` 路由到该 task 的 worker；每台引擎一个 `AgentHandle` + 一棵 `SessionStore` 树 + 一条自己的 8 轮预算。task 之间不共享历史，read-before-edit 台账与压缩检查点因此不会互相污染。
+    ② 审批归属收在 pump 一处：worker 只递交 `ApprovalOpened` / `Notify` / `ApprovalClosed`，pump 学一次 `req → task`，批复**按 req 定向**投递、绝不广播——一次 `allow` 落到别的 task 就是权限绕过（§5）。回合结束 worker 关闭在途请求，路由表因此有界。
+    ③ `--max-tasks`（缺省 4）超限时**显式拒绝**并发一颗 error 铃，而不是把活排进看不见的队列：静默排队在 SA 眼里就是「铃丢了」，会白烧它的重试预算。
+    ④ 顺手抓住两个真缺陷，都在「取消」这条纪律上：
+       - `BusClient::take_inbox` 是「取出接收器、用完放回」，而 `tokio::select!` 会 drop 落败分支——接收器从此不回来，那条连接之后每次读都以 `inbox already polled` 失败，泵静默变哑。上一版 `serve` 的审批循环是同一种形状，同样中招。修法是把归还做成 RAII（`Taken::drop`），并做**变异验证**：摘掉归还 → 回归测试转红。
+       - 同一处 select 竞争里，已经就绪的门铃会随被丢弃的 future 一起消失——「取消安全」不等于「不丢帧」。泵因此改用专职 reader 任务把帧转进普通 mpsc，读取本身不再被取消。
+    验证：`tests/m5_pool.rs` 用 faux 引擎跑真总线——两个 task 各自落工件、各自只在自己的请求里看见自己的铃（历史隔离用 `recorded_requests()` 做反向断言）、超限的拒绝不带 `result_ref`。
+
 ## 10 二期清单
 
-已落地（2026-10-28）：~~`ApproveMode::Bus`~~（授权表 + 超时 fail-closed + journal 审计，§9.20）、~~SA 判定升级到「工件 + 证据文件」~~（绝对路径存在性/非空核对，§9.20）、~~bus 重连重放~~（离线 session 停车补投 + 客户端自动重连；RPC 与「写入即死」的帧不重放，§9.21）、~~journal 快照/截断语义~~（检查点 + 归档段 + 崩溃安全轮转，§9.22）、~~多任务并行~~（task 命名空间三处同源 + 前缀寻址，§9.23）、~~openai-responses wire~~（第三条 v1 wire，金身 + fixture 验证，**真端点未实测**，§9.24）、~~journal 投影增量化与轮转触发~~（在线投影 = 全量重放 + 条数/字节双上限，§9.25）。
+已落地（2026-10-28）：~~`ApproveMode::Bus`~~（授权表 + 超时 fail-closed + journal 审计，§9.20）、~~SA 判定升级到「工件 + 证据文件」~~（绝对路径存在性/非空核对，§9.20）、~~bus 重连重放~~（离线 session 停车补投 + 客户端自动重连；RPC 与「写入即死」的帧不重放，§9.21）、~~journal 快照/截断语义~~（检查点 + 归档段 + 崩溃安全轮转，§9.22）、~~多任务并行~~（task 命名空间三处同源 + 前缀寻址，§9.23）、~~openai-responses wire~~（第三条 v1 wire，金身 + fixture 验证，**真端点未实测**，§9.24）、~~journal 投影增量化与轮转触发~~（在线投影 = 全量重放 + 条数/字节双上限，§9.25）、~~一个引擎内真正并发地服务多个 task~~（改为「一 task 一引擎」的 worker 池，单活跃槽不动，§9.26）。
 
-仍在清单上：tree-sitter-bash 命令解析、execpolicy DSL（Starlark）、landlock/bwrap（Linux 沙箱）、TUI（行级 diff 形制，pi-tui 蓝本）、MCP 客户端、model-in-the-loop evals（含 openai-responses 的真端点实测，§9.24）、审批批复的可靠投递（请求与批复都是 Notify：§9.21 的停车补投已覆盖「审批者当时不在线」，剩下的缺口是批复迟到——回合结束即丢弃，语义停在超时 deny）、journal 轮转的**默认策略**（机制已齐：`rotate` + 条数/字节双上限 + O(1) 触发，§9.25；阈值仍由调用方给，库不猜派发节奏）、一个引擎内真正并发地服务多个 task（单活跃槽是刻意的不变式：今天多 task 在同一 worker 上串行，真并行靠各自的 worker 实例）。
+仍在清单上：tree-sitter-bash 命令解析、execpolicy DSL（Starlark）、landlock/bwrap（Linux 沙箱）、TUI（行级 diff 形制，pi-tui 蓝本）、MCP 客户端、model-in-the-loop evals（含 openai-responses 的真端点实测，§9.24）、审批批复的可靠投递（请求与批复都是 Notify：§9.21 的停车补投已覆盖「审批者当时不在线」，剩下的缺口是批复迟到——回合结束即丢弃，语义停在超时 deny；跨进程重启的可靠投递要等 ack 语义）、journal 轮转的**默认策略**（机制已齐：`rotate` + 条数/字节双上限 + O(1) 触发，§9.25；阈值仍由调用方给，库不猜派发节奏）、worker 池的资源护栏（`--max-tasks` 只挡 task 数，不挡每 task 的内存与并发 HTTP；真·多进程编排属于 harness 上层）。
 
 新划出的两条边界：`BudgetSpent` 的价格表（有单价表之后 usd 才能真正按 token 结算，而不是 per-dispatch 名义值）；证据的类型化（`evidence` 从「路径存在」升级到「测试产物/截图按 stage 要求齐全」）。

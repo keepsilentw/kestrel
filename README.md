@@ -2,7 +2,7 @@
 
 为星型多 Agent harness 写的 Rust harness kernel：引擎 1.1k 行 + wire 层 2.6k + 工具/权限/沙箱 2.3k + 会话 0.9k + 总线/journal 1.9k + CLI/配置 2.7k（`src` 49 文件 11.4k 行，`tests` 8 文件 2.3k 行）。设计文档（中文）见本仓库 `docs/design.md`。
 
-Status: M0-M4 complete + 二期开工（`ApproveMode::Bus`、SA 判定含证据核对、bus 停车补投与自动重连、journal 快照/截断与在线投影、多任务 task 命名空间、openai-responses wire）——181 tests，fmt / clippy `-D warnings` / test 三闸门全绿（人工执行：本仓库不挂 CI）
+Status: M0-M4 complete + 二期开工（`ApproveMode::Bus`、SA 判定含证据核对、bus 停车补投与自动重连、journal 快照/截断与在线投影、多任务 task 命名空间、openai-responses wire、worker 池）——188 tests，fmt / clippy `-D warnings` / test 三闸门全绿（人工执行：本仓库不挂 CI）
 
 ## Quick start
 
@@ -30,7 +30,7 @@ cargo run -p kestrel -- -p "continue the previous task" \
 ## Build & test
 
 ```bash
-cargo test          # 181 项；沙箱 e2e 需 macOS（真实 /usr/bin/sandbox-exec）
+cargo test          # 188 项；沙箱 e2e 需 macOS（真实 /usr/bin/sandbox-exec）
 cargo fmt --check && cargo clippy --all-targets -- -D warnings   # 质量闸门
 ```
 
@@ -71,9 +71,9 @@ SA 的判定只读盘，且分三层：通路（有答案、未 abort、worker �
 ## Sessions
 
 每次运行落一个 append-only JSONL 树（`~/.kestrel/sessions/<cwd-slug>/`）。`-p`
-默认新建，`--resume last|<session-id>|<path>` 续接；`serve` 一个 worker 一棵树、
-一个常驻引擎——门铃是一个接一个的回合，历史、read-before-edit 台账与压缩检查点
-跨派发存活。
+默认新建，`--resume last|<session-id>|<path>` 续接。`serve` 的归属单位是 task：一个
+进程为每个 task 各起一台常驻引擎、各开一棵树，门铃是那台引擎上一个接一个的回合——
+历史、read-before-edit 台账与压缩检查点跨派发存活，但**不跨 task 串台**。
 
 ## Bus
 
@@ -88,7 +88,10 @@ socket」的帧**不重放**——重复铃由 SA 侧的 write-ahead 对账（jo
 （`serve --session t2:harness-rd`），再用 `demo-sa --task-id t2 --rd-peer
 t2:harness-rd --journal t2.jsonl` 告诉 SA 打哪一对 worker；task id 会盖进 journal
 记录、门铃、工件名与结果铃四处，命名契约由 `cli/task.rs` 一处算出，两端不会各拼一遍。
-注意单活跃槽仍在：同一 worker 收到多颗铃是一回合一个地跑，真并发需要 worker 池。
+`serve` 的并行单位是 task：`--max-tasks`（缺省 4）之内，每个 task 一台常驻引擎、一棵
+会话树，task 之间真并发。超过上限的门铃被**显式拒绝**（回一颗 error 铃），不排在看不
+见的队列里——静默排队在 SA 眼里就是「铃丢了」。单活跃槽没动：它是取消、steering 与
+压缩时序的地基，并行靠加引擎而不是放宽槽位。
 
 ## Journal 截断
 
@@ -122,6 +125,7 @@ src/
   journal/    write-ahead 真相源 + 崩溃对账 + 在线投影 + 预算/用量/审批账本
               + snapshot 检查点与归档段轮转（截断不丢未结算的铃）
   cli/        -p 单发 / serve 常驻 worker / demo-sa 脚本化 SA / hub 总线进程
+              + pool.rs（worker 池：按 task 路由，一 task 一引擎一树）
               + evidence.rs（证据契约：从结论提路径 + 盘上核对）
               + task.rs（task 命名空间：工件名契约 + slug 防路径穿越）
   config/     角色加载（含 $VAR 路径展开）+ KESTREL_HOME
