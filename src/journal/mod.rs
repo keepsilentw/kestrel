@@ -11,7 +11,9 @@
 pub mod records;
 
 use records::reconcile;
-pub use records::{Checkpoint, JournalRecord, ReconcileReport, StateSnapshot, ThinBell, Verdict};
+pub use records::{
+    Checkpoint, Folder, JournalRecord, ReconcileReport, StateSnapshot, ThinBell, Verdict,
+};
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -22,6 +24,11 @@ use anyhow::Context;
 pub struct Journal {
     file: Mutex<File>,
     path: std::path::PathBuf,
+    /// Online projection: the same fold `reconcile` performs, advanced on every
+    /// append so the SA's budget stop-loss and the 巡检 stay O(1) per dispatch
+    /// instead of re-reading the whole journal (design §5 不变式 5: state is
+    /// DEFINED by the replay, so both must come out of ONE fold).
+    projection: Mutex<Folder>,
 }
 
 /// Result of one successful rotation.
@@ -41,18 +48,28 @@ impl Journal {
             std::fs::create_dir_all(dir)?;
         }
         let file = OpenOptions::new().create(true).append(true).open(path)?;
-        Ok(Self {
+        let journal = Self {
             file: Mutex::new(file),
             path: path.to_path_buf(),
-        })
+            projection: Mutex::new(Folder::default()),
+        };
+        // A "created" journal may already hold yesterday's records (`create`
+        // opens in append mode and `KESTREL_DEMO_KEEP_JOURNAL=1` relies on it):
+        // seeding the projection from disk is what keeps the budget stop-loss
+        // honest across runs instead of forgetting what was already spent.
+        journal.reseed()?;
+        Ok(journal)
     }
 
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         let file = OpenOptions::new().append(true).open(path)?;
-        Ok(Self {
+        let journal = Self {
             file: Mutex::new(file),
             path: path.to_path_buf(),
-        })
+            projection: Mutex::new(Folder::default()),
+        };
+        journal.reseed()?;
+        Ok(journal)
     }
 
     /// Append one record and fsync — the ONLY way records enter the journal.
@@ -61,7 +78,30 @@ impl Journal {
         writeln!(file, "{}", serde_json::to_string(record)?)?;
         file.flush()?;
         file.sync_all()?;
+        // same lock order as `rotate` (file -> projection)
+        self.projection.lock().unwrap().apply(record);
         Ok(())
+    }
+
+    /// Rebuild the online projection by replaying the live file. Called at open
+    /// (history may pre-exist) and after a rotation swapped the file.
+    pub fn reseed(&self) -> anyhow::Result<()> {
+        let mut folder = Folder::default();
+        for record in self.replay() {
+            folder.apply(&record);
+        }
+        *self.projection.lock().unwrap() = folder;
+        Ok(())
+    }
+
+    /// Current projection: stage / iteration / spend per peer + unsettled bells.
+    pub fn projection(&self) -> ReconcileReport {
+        self.projection.lock().unwrap().report()
+    }
+
+    /// Bytes the live file occupies (metadata only — no read, no parse).
+    pub fn file_bytes(&self) -> u64 {
+        std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0)
     }
 
     /// Replay all records; a torn tail (crash mid-write) is skipped.
@@ -88,7 +128,13 @@ impl Journal {
 
     /// Records currently in the live file (torn tail excluded).
     pub fn len(&self) -> usize {
-        self.replay().len()
+        self.projection.lock().unwrap().live_records()
+    }
+
+    /// Same as `len()`, named for the rotation trigger (records the live file
+    /// physically holds, read without parsing it).
+    pub fn live_records(&self) -> usize {
+        self.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -176,7 +222,11 @@ impl Journal {
             .iter()
             .filter(|r| !matches!(r, JournalRecord::Snapshot { .. }))
             .count() as u64;
-        if raw_in_prefix == 0 {
+        if raw_in_prefix < 2 {
+            // Folding one record into a checkpoint grows the live file (the
+            // checkpoint line costs more than the record it replaces), so the
+            // library refuses the degenerate case instead of trusting the
+            // caller's threshold.
             return Ok(None);
         }
         let covers = archived_before + raw_in_prefix;
@@ -214,6 +264,10 @@ impl Journal {
         // swap the held handle through the guard we already own: releasing the
         // lock first would let an append land on the old inode and be lost
         *file = reopened;
+        // the live file was swapped under us: re-derive the projection from it.
+        // Dropping the file guard first keeps the lock order (file -> projection).
+        drop(file);
+        self.reseed()?;
         Ok(Some(Rotation {
             archived_to: archive,
             covered: raw_in_prefix as usize,
@@ -509,6 +563,26 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// 一条记录不值得检查点：折它会让活文件变长（检查点那一行比被它替换的记录更贵）。
+    /// 守卫放在库里，不指望调用方给的阈值刚好。
+    #[test]
+    fn rotate_refuses_a_degenerate_prefix() {
+        let dir = scratch("degenerate");
+        let path = dir.join("journal.jsonl");
+        let journal = Journal::create(&path).unwrap();
+        seed(&journal, 1); // 3 records
+        assert!(
+            journal.rotate(2).unwrap().is_none(),
+            "a one-record prefix must not be folded"
+        );
+        assert_eq!(journal.len(), 3, "nothing moved, nothing archived");
+        assert!(
+            !dir.join("journal.seg0-1.jsonl").exists(),
+            "no segment was written for a degenerate fold"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// rotate 全程持住 append 锁的意义就在这条断言上：并发追加与旋转交错进行，
     /// 每条记录必须「要么进了归档段，要么还活在活文件里」，不重复也不丢。
     /// rename 前后释放锁会留一个写进旧 inode 的窗口——那个窗口就是这条测试。
@@ -645,5 +719,94 @@ mod tests {
         assert_eq!(report.in_flight.len(), 1);
         assert_eq!(report.state.stage, Some(Stage::Test));
         assert_eq!(report.state.iteration, 3);
+    }
+
+    /// 不变式 5 的可执行形式：在线投影必须与「把整个活文件重放一遍」逐次相等。
+    /// 这条断言是投影增量化唯一的安全带——否则预算停损和巡检读的是两份真相。
+    #[test]
+    fn projection_equals_a_full_replay_after_every_append() {
+        let dir = scratch("projection");
+        let path = dir.join("journal.jsonl");
+        let journal = Journal::create(&path).unwrap();
+        seed(&journal, 3);
+        journal
+            .append(&JournalRecord::ApprovalRequested {
+                task: "demo".into(),
+                peer: "harness-rd".into(),
+                req: "a-1".into(),
+                command: "cargo test".into(),
+            })
+            .unwrap();
+        journal
+            .append(&JournalRecord::ApprovalDecided {
+                req: "a-1".into(),
+                decision: "allow".into(),
+                by: "harness-sa".into(),
+            })
+            .unwrap();
+        journal
+            .append(&JournalRecord::BellReceived {
+                task: "demo".into(),
+                from: "harness-rd".into(),
+                bell: bell(3),
+            })
+            .unwrap();
+
+        let online = journal.projection();
+        let replayed = reconcile(&journal.replay());
+        assert_eq!(online.state, replayed.state, "budget/stage/iteration agree");
+        assert_eq!(
+            online.in_flight, replayed.in_flight,
+            "unsettled bells agree"
+        );
+        assert_eq!(journal.live_records(), journal.replay().len());
+        assert!(journal.file_bytes() > 0);
+
+        // a rotation replaces the file underneath: the projection follows it
+        journal.rotate(2).unwrap();
+        let after = journal.projection();
+        let after_replay = reconcile(&journal.replay());
+        assert_eq!(after.state, after_replay.state);
+        assert_eq!(after.in_flight, after_replay.in_flight);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `create` 打开的是追加模式：旧 journal 里已经花掉的钱和没结算的铃都必须
+    /// 被读回来，否则跨运行保留账本（`KESTREL_DEMO_KEEP_JOURNAL=1`）会变成
+    /// 「预算归零」，停损形同虚设。
+    #[test]
+    fn create_seeds_the_projection_of_an_existing_journal() {
+        let dir = scratch("resume");
+        let path = dir.join("journal.jsonl");
+        {
+            let journal = Journal::create(&path).unwrap();
+            journal
+                .append(&JournalRecord::BellSent {
+                    task: "demo".into(),
+                    to: "harness-rd".into(),
+                    bell: bell(1),
+                })
+                .unwrap();
+            journal
+                .append(&JournalRecord::BudgetSpent {
+                    peer: "harness-rd".into(),
+                    usage: Default::default(),
+                    usd: 0.5,
+                })
+                .unwrap();
+        }
+        let reopened = Journal::create(&path).unwrap();
+        let projection = reopened.projection();
+        assert_eq!(
+            projection.in_flight.len(),
+            1,
+            "unsettled bell survives reopen"
+        );
+        assert_eq!(
+            projection.state.spent_usd.get("harness-rd").copied(),
+            Some(0.5),
+            "the stop-loss still sees yesterday's spend"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

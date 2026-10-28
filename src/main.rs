@@ -159,6 +159,11 @@ struct DemoSaCmd {
     #[arg(long, default_value_t = 0)]
     rotate_after_records: usize,
 
+    /// Byte ceiling for the live journal (either ceiling triggers a rotation;
+    /// records vary in size, so a count alone can leave the file huge). 0 = off.
+    #[arg(long, default_value_t = 0)]
+    rotate_max_bytes: u64,
+
     /// Task namespace: stamped into every journal record, every bell and every
     /// artifact name, so several `demo-sa` processes can share one hub without
     /// reading each other's results. Keep it unique per pipeline.
@@ -235,6 +240,7 @@ async fn main() -> anyhow::Result<()> {
                 worktree: d.worktree,
                 approvals: d.approvals,
                 rotate_after: d.rotate_after_records,
+                rotate_max_bytes: d.rotate_max_bytes,
                 task_id: d.task_id,
                 rd_peer: d.rd_peer,
                 qa_peer: d.qa_peer,

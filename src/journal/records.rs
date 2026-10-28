@@ -153,7 +153,7 @@ impl Checkpoint {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Settled {
     /// (role, stage, iteration) 已收到回铃/已提交结果。
     keys: std::collections::HashSet<(String, String, u64)>,
@@ -161,35 +161,48 @@ struct Settled {
     max_iteration: u64,
 }
 
-pub fn reconcile(records: &[JournalRecord]) -> ReconcileReport {
-    let mut settled = Settled::default();
-    let mut in_flight: Vec<(TaskId, String, ThinBell)> = Vec::new();
-    let mut spent: BTreeMap<String, f64> = BTreeMap::new();
+/// The ONE fold of journal records. `reconcile` below is just this driven over a
+/// slice, and `Journal` keeps one of these alive so the online projection and a
+/// full replay cannot diverge — design §5 不变式 5 says state is DEFINED by the
+/// replay, so an incremental shortcut that disagrees with it would be a bug in
+/// the worst possible place (the budget stop-loss and the 巡检 decision).
+#[derive(Default, Clone)]
+pub struct Folder {
+    settled: Settled,
+    in_flight: Vec<(TaskId, String, ThinBell)>,
+    spent: BTreeMap<String, f64>,
+    /// records physically present in the live file (a checkpoint line counts
+    /// as one), which is what the rotation trigger looks at
+    live_records: usize,
+}
 
-    for r in records {
+impl Folder {
+    pub fn apply(&mut self, r: &JournalRecord) {
+        self.live_records += 1;
         match r {
             JournalRecord::BellSent { task, to, bell } => {
-                in_flight.push((task.clone(), to.clone(), bell.clone()));
-                settled.max_iteration = settled.max_iteration.max(bell.iteration);
-                settled.last_stage = Some(bell.stage);
+                self.in_flight
+                    .push((task.clone(), to.clone(), bell.clone()));
+                self.settled.max_iteration = self.settled.max_iteration.max(bell.iteration);
+                self.settled.last_stage = Some(bell.stage);
             }
             JournalRecord::BellReceived { bell, .. } => {
-                settled.keys.insert(bell_key(bell));
-                settled.max_iteration = settled.max_iteration.max(bell.iteration);
+                self.settled.keys.insert(bell_key(bell));
+                self.settled.max_iteration = self.settled.max_iteration.max(bell.iteration);
             }
             JournalRecord::ResultCommitted { stage, .. } => {
-                settled.last_stage = Some(*stage);
+                self.settled.last_stage = Some(*stage);
                 // dev 结果提交结算该 stage 的在途铃（任何 iteration）
-                in_flight.retain(|(_, _, bell)| bell.stage != *stage);
+                self.in_flight.retain(|(_, _, bell)| bell.stage != *stage);
             }
             JournalRecord::StageWritten {
                 stage, iteration, ..
             } => {
-                settled.last_stage = Some(*stage);
-                settled.max_iteration = settled.max_iteration.max(*iteration);
+                self.settled.last_stage = Some(*stage);
+                self.settled.max_iteration = self.settled.max_iteration.max(*iteration);
             }
             JournalRecord::BudgetSpent { peer, usd, .. } => {
-                *spent.entry(peer.clone()).or_insert(0.0) += usd;
+                *self.spent.entry(peer.clone()).or_insert(0.0) += usd;
             }
             // Approvals and usage are audit records: they never move the stage
             // projection, and a replay must not count them as bells.
@@ -199,31 +212,52 @@ pub fn reconcile(records: &[JournalRecord]) -> ReconcileReport {
             JournalRecord::Snapshot { checkpoint, .. } => {
                 // hard reset of the fold: the prefix is already inside the
                 // checkpoint, and its in-flight set replaces whatever we had.
-                in_flight.clear();
+                self.in_flight.clear();
                 for b in &checkpoint.in_flight {
-                    in_flight.push((b.task.clone(), b.to.clone(), b.bell.clone()));
+                    self.in_flight
+                        .push((b.task.clone(), b.to.clone(), b.bell.clone()));
                 }
-                spent.clear();
-                spent.extend(checkpoint.spent_usd.clone());
-                settled.last_stage = checkpoint.stage;
-                settled.max_iteration = checkpoint.iteration;
+                self.spent.clear();
+                self.spent.extend(checkpoint.spent_usd.clone());
+                self.settled.last_stage = checkpoint.stage;
+                self.settled.max_iteration = checkpoint.iteration;
+                // Receipt keys of the archived prefix go with it: the bells they
+                // settled are no longer in `in_flight`, and keeping the keys
+                // alive could wrongly settle a reused (role, stage, iteration).
+                self.settled.keys.clear();
             }
         }
     }
-    // settle bells whose (role, stage, iteration) has a matching receipt
-    in_flight.retain(|(_, _, bell)| !settled.keys.contains(&bell_key(bell)));
 
-    ReconcileReport {
-        in_flight: in_flight
-            .into_iter()
-            .map(|(task, to, bell)| InFlightBell { task, to, bell })
-            .collect(),
-        state: StateSnapshot {
-            stage: settled.last_stage,
-            iteration: settled.max_iteration,
-            spent_usd: spent,
-        },
+    pub fn report(&self) -> ReconcileReport {
+        ReconcileReport {
+            in_flight: self
+                .in_flight
+                .iter()
+                .filter(|(_, _, bell)| !self.settled.keys.contains(&bell_key(bell)))
+                .cloned()
+                .map(|(task, to, bell)| InFlightBell { task, to, bell })
+                .collect(),
+            state: StateSnapshot {
+                stage: self.settled.last_stage,
+                iteration: self.settled.max_iteration,
+                spent_usd: self.spent.clone(),
+            },
+        }
     }
+
+    /// How many records the live file holds right now.
+    pub fn live_records(&self) -> usize {
+        self.live_records
+    }
+}
+
+pub fn reconcile(records: &[JournalRecord]) -> ReconcileReport {
+    let mut folder = Folder::default();
+    for r in records {
+        folder.apply(r);
+    }
+    folder.report()
 }
 
 fn bell_key(bell: &ThinBell) -> (String, String, u64) {
@@ -335,6 +369,42 @@ mod tests {
         );
         assert_eq!(rep.state.stage, Some(Stage::Dev));
         assert!(rep.state.spent_usd.is_empty());
+    }
+
+    /// A checkpoint resets the settled-receipt keys too. Without that, a bell
+    /// key that was settled *before* the archived prefix would silently settle a
+    /// re-dispatched bell with the same (role, stage, iteration) after it — the
+    /// SA would see "nothing in flight" and never re-dispatch.
+    #[test]
+    fn checkpoint_clears_stale_receipt_keys() {
+        let records = vec![
+            JournalRecord::BellSent {
+                task: "t".into(),
+                to: "rd".into(),
+                bell: bell("rd", Stage::Dev, 1),
+            },
+            JournalRecord::BellReceived {
+                task: "t".into(),
+                from: "rd".into(),
+                bell: bell("rd", Stage::Dev, 1),
+            },
+            JournalRecord::Snapshot {
+                covers: 2,
+                checkpoint: Checkpoint::default(),
+            },
+            // same key again: a re-dispatch after the rotation
+            JournalRecord::BellSent {
+                task: "t".into(),
+                to: "rd".into(),
+                bell: bell("rd", Stage::Dev, 1),
+            },
+        ];
+        let rep = reconcile(&records);
+        assert_eq!(
+            rep.in_flight.len(),
+            1,
+            "the reused bell is genuinely in flight: {rep:?}"
+        );
     }
 
     #[test]

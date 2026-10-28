@@ -14,7 +14,7 @@ use crate::cli::serve::{approval_command, decision_name};
 use crate::cli::task::artifact_path;
 use crate::core::ops::ApprovalDecision;
 use crate::journal::Journal;
-use crate::journal::records::{JournalRecord, Stage, ThinBell, Verdict, reconcile};
+use crate::journal::records::{JournalRecord, Stage, ThinBell, Verdict};
 use crate::permissions::{Decision, PermissionEngine};
 use crate::provider::wire::Usage;
 
@@ -45,6 +45,10 @@ pub struct DemoSaArgs {
     /// rotate, which is the default: the journal stays one file until somebody
     /// decides a long run needs the bounded replay.
     pub rotate_after: usize,
+    /// Byte ceiling for the live journal: records vary in size (an approval
+    /// record carries stderr), so a record count alone can leave a long-running
+    /// journal file huge. 0 disables this condition.
+    pub rotate_max_bytes: u64,
     /// Task namespace for this pipeline: it stamps every journal record, every
     /// bell, and — through `cli::task` — the artifact names both ends agree on.
     /// Two `demo-sa` processes with different ids can share one hub.
@@ -65,6 +69,23 @@ impl DemoSaArgs {
             _ => &self.qa_peer,
         }
     }
+}
+
+/// When to fold the journal into a checkpoint: either ceiling trips it, and a
+/// zero ceiling disables that condition. Both inputs are O(1) reads (the live
+/// record count comes from the online projection, the size from metadata) —
+/// a rotation check must never cost more than the append it is guarding.
+pub fn rotation_due(
+    live_records: usize,
+    live_bytes: u64,
+    cap_records: usize,
+    cap_bytes: u64,
+) -> bool {
+    if live_records < 2 {
+        // folding a single record into a checkpoint is pure overhead
+        return false;
+    }
+    (cap_records > 0 && live_records >= cap_records) || (cap_bytes > 0 && live_bytes >= cap_bytes)
 }
 
 /// 一个 stage 的派发结果：收敛（pass）。
@@ -94,7 +115,9 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
         // 值循环：Pass = stage 收敛；Fail/重试走 continue（iter 已自增）。
         let _outcome: StageOutcome = loop {
             // --- 预算停损：账本先看，超限 STOP escalate（退出码非 0）。
-            let total: f64 = reconcile(&journal.replay()).state.spent_usd.values().sum();
+            // O(1) 投影，不是每次派发都重放整个活文件（不变式 5：两者由同一次折叠产
+            // 生，`projection_equals_a_full_replay_after_every_append` 钉住这条）
+            let total: f64 = journal.projection().state.spent_usd.values().sum();
             if total + args.per_dispatch_usd > args.max_usd {
                 anyhow::bail!(
                     "[sa] budget stop-loss: spent {total:.2} + next {} > max {}",
@@ -200,7 +223,8 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
                 _ => {
                     // 铃丢了：巡检 = journal 对账 + 读盘。工件在盘上即视为完成
                     // （worker 写完工件、死于拉铃前——不重复派发）。
-                    let still_in_flight = reconcile(&journal.replay())
+                    let still_in_flight = journal
+                        .projection()
                         .in_flight
                         .iter()
                         .any(|b| b.bell.stage == stage && b.bell.iteration == iter);
@@ -224,10 +248,14 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
                 verdict: verdict.clone(),
             })?;
             // 一次 stage 结算是一个天然的检查点边界：此后的前缀不再影响对账，
-            // 折叠它才能让长时间运行的 pipeline 的 replay 保持有界。
-            if args.rotate_after > 0
-                && journal.len() >= args.rotate_after
-                && let Some(rotated) = journal.rotate(args.rotate_after / 2)?
+            // 折叠它才能让长时间运行的 pipeline 的 replay 保持有界。触发由
+            // `rotation_due` 判定：条数或字节，两个输入都是 O(1) 读，不重放文件。
+            if rotation_due(
+                journal.live_records(),
+                journal.file_bytes(),
+                args.rotate_after,
+                args.rotate_max_bytes,
+            ) && let Some(rotated) = journal.rotate(journal.live_records() / 2)?
             {
                 println!(
                     "[sa] journal rotated: {} record(s) archived into {}, live file now {} record(s)",
@@ -448,6 +476,21 @@ fn parse_verdict(result: &str) -> WorkerVerdict {
 mod tests {
     use super::*;
 
+    /// 轮转触发是纯函数：条数或字节任一超限即折，0 表示该条件关闭；
+    /// 只有一条记录时不折（检查点比原文还长就是自欺）。
+    #[test]
+    fn rotation_trigger_accepts_either_ceiling() {
+        assert!(!rotation_due(10, 1_000, 0, 0), "both ceilings off");
+        assert!(rotation_due(10, 1_000, 10, 0), "record ceiling trips");
+        assert!(!rotation_due(9, 1_000, 10, 0));
+        assert!(rotation_due(3, 5_000, 0, 5_000), "byte ceiling trips alone");
+        assert!(!rotation_due(2, 5_000, 0, 5_001));
+        assert!(
+            !rotation_due(1, 9_999_999, 1, 1),
+            "a one-record journal is never worth a checkpoint"
+        );
+    }
+
     /// task id 是 journal 记录、门铃、工件名三处**同源**的命名空间；peer 由 stage
     /// 决定并可被第二条 pipeline 改写。§9.11④ 的 bug 正是这三处各拼一遍 format!。
     #[test]
@@ -465,6 +508,7 @@ mod tests {
             worktree: None,
             approvals: None,
             rotate_after: 0,
+            rotate_max_bytes: 0,
             task_id: "demo".into(),
             rd_peer: "harness-rd".into(),
             qa_peer: "harness-qa".into(),
