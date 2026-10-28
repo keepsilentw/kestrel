@@ -1,9 +1,10 @@
 # kestrel 设计文档：Rust harness kernel
 
-> 状态：M0-M4 已实现并通过测试（163/163）；§10 二期已落地四项——`ApproveMode::Bus`、
-> 「判定 = 工件 + 证据文件」、bus 重连重放（停车补投 + 客户端重连）、journal 快照/截断语义。
+> 状态：M0-M4 已实现并通过测试（169/169）；§10 二期已落地五项——`ApproveMode::Bus`、
+> 「判定 = 工件 + 证据文件」、bus 重连重放（停车补投 + 客户端重连）、journal 快照/截断语义、
+> 多任务并行（task 命名空间 + 前缀寻址）。
 > 质量闸门保持人工执行（本仓库不挂 CI，见 §9.19⑥）。
-> 实现规模：src 48 文件 11,093 行 + tests 8 文件 2,229 行（plan 预算 ~10-13k 行内）。
+> 实现规模：src 49 文件 11,361 行 + tests 8 文件 2,284 行（plan 预算 ~10-13k 行内）。
 > 输入：实现规划（plan.md）与调研语料（codex / pi study notes、三方资料库 references.md）——均为开发过程资料，未随本仓库发布。
 > 本文沉淀实现后的最终设计；与 plan 的偏差在 §9 逐条记录。
 
@@ -116,7 +117,7 @@ role 文件的路径字段（`write_roots`/`read_only_islands`/`policy_file`/`pr
 
 faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_request` 纯函数）→ 零真 key 覆盖全部验收；三层测试（单元/组件 golden/e2e）；determinism 经 `IdGen`/`Clock` 注入；沙箱 e2e 仅 macOS（`#[cfg(target_os="macos")]`）；闸门 = `cargo fmt --check` + `clippy -D warnings` + 全测试，**人工执行、每次改动都跑**：本仓库不挂 CI（2026-10-28 试过 `ci.yml`，同日按决定移除，见 §9.19⑥），所以这道闸门没有兜底机制——rust/clippy 1.98 那次破功就是因为只靠人记得跑。
 
-163 项 = lib 单测 121 + bin 单测（CLI 形状）4 + 集成 38（core_loop 5 / m1_tools 8 / m2_session 6 / m4_bus 12 / sandbox_e2e 4 / wire_anthropic 2 / discipline 1）。计数以实跑为准，改测试时同步这一行：此前 README / design / 报告三处各写一个数（137 / 137 / 121），实跑只有 130，漂移本身记在 §9.19。总线测试需要真 UDS `bind`，在严格沙箱或容器里以 `EPERM` 失败，属环境限制而非回归。
+169 项 = lib 单测 126 + bin 单测（CLI 形状）4 + 集成 39（core_loop 5 / m1_tools 8 / m2_session 6 / m4_bus 13 / sandbox_e2e 4 / wire_anthropic 2 / discipline 1）。计数以实跑为准，改测试时同步这一行：此前 README / design / 报告三处各写一个数（137 / 137 / 121），实跑只有 130，漂移本身记在 §9.19。总线测试需要真 UDS `bind`，在严格沙箱或容器里以 `EPERM` 失败，属环境限制而非回归。
 
 ## 9 与 plan 的偏差（诚实台账）
 
@@ -161,10 +162,17 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
     ③ 轮转顺序即安全性：全程持住 append 锁 → 段落盘 fsync → 新活文件写 `.new` 并 fsync → `rename` 原子替换 → 通过已持有的 guard 换 fd（先放锁再换会有「写进旧 inode」的窗口）。**段名取「覆盖的记录区间」而不是计数器**，`covers` 因此是累计值：这样「段已写好、rename 前崩溃」后重试会覆盖同一个文件，而不是把同一段前缀归档第二份——后者会让 `replay_all` 把预算重复计一遍。测试：`a_crashed_rotation_is_retried_idempotently`（手工造出崩溃残留）与 `concurrent_appends_survive_rotation`（4 线程并发追加 × 40 轮 rotate，断言 40 条记录不重不丢、无 `.new` 残留）。
     语义边界：**这不是删除**。段文件不自动清理，`session` 树仍完全不截断；`demo-sa --rotate-after-records` 默认 0（不轮转），因为阈值该由派发节奏定，不该由库猜。
 
+23. **多任务并行（2026-10-28）**：一个 hub 上并存多条 pipeline，前提不是并发而是**命名空间不串台**。原先 `demo-sa` 把 task 写死成 `"demo"`，工件名 `{session}-{stage}-iter{n}.json`：两条 pipeline 打同一个 worker 名、同一个 stage 时，后一条会读到前一条的工件并把它判成 pass——这是 §9.11④「两端各拼一遍文件名」那类 bug 的升级版。现在四件事：
+    ① `cli/task.rs` 是唯一一份命名契约：`artifact_name(session, task, stage, iteration)`——SA 找文件与 worker 写文件调同一个函数，`serve` 不再自己 `format!`。
+    ② task id 三处同源：journal 每条记录、门铃 payload（`task_id`）、工件名与结果铃（worker 原样带回，SA 不会认错回执）。没带 `task_id` 的铃落进 `default` 命名空间，而不是从自由文本 `task` 里猜一个出来。
+    ③ slug 把任意文本变成安全的文件名片段：非 `[A-Za-z0-9._-]` 一律变 `-`（中文任务名退化成 `demo-LRU-cache`），`/` 被消灭，`.` 与 `..` 换成带 FNV-1a 后缀的名字，超长截断也保留唯一性。**task id 来自另一个进程却要变成文件名，它不是可信任的输入**。
+    ④ 寻址用前缀：`serve --session t2:harness-rd` 配 `demo-sa --task-id t2 --rd-peer t2:harness-rd --journal t2.jsonl`。session id 本来就是 opaque 字符串，hub 不改一行代码就能把两条 pipeline 路由隔开；`--rd-peer/--qa-peer` 让 SA 知道该打哪一对 worker。
+    边界要说清：这一项解决的是「并存不串台」，不是「一个引擎同时服务两个 task」。单活跃槽（§4 不变式）依旧，同一 worker 收到两颗铃仍是一回合一回合地跑；真并发需要 worker 池，仍在 §10。
+
 ## 10 二期清单
 
-已落地（2026-10-28）：~~`ApproveMode::Bus`~~（授权表 + 超时 fail-closed + journal 审计，§9.20）、~~SA 判定升级到「工件 + 证据文件」~~（绝对路径存在性/非空核对，§9.20）、~~bus 重连重放~~（离线 session 停车补投 + 客户端自动重连；RPC 与「写入即死」的帧不重放，§9.21）、~~journal 快照/截断语义~~（检查点 + 归档段 + 崩溃安全轮转，§9.22）。
+已落地（2026-10-28）：~~`ApproveMode::Bus`~~（授权表 + 超时 fail-closed + journal 审计，§9.20）、~~SA 判定升级到「工件 + 证据文件」~~（绝对路径存在性/非空核对，§9.20）、~~bus 重连重放~~（离线 session 停车补投 + 客户端自动重连；RPC 与「写入即死」的帧不重放，§9.21）、~~journal 快照/截断语义~~（检查点 + 归档段 + 崩溃安全轮转，§9.22）、~~多任务并行~~（task 命名空间三处同源 + 前缀寻址，§9.23）。
 
-仍在清单上：tree-sitter-bash 命令解析、execpolicy DSL（Starlark）、landlock/bwrap（Linux 沙箱）、TUI（行级 diff 形制，pi-tui 蓝本）、openai-responses wire、MCP 客户端、model-in-the-loop evals、多任务并行（peers 加 task 前缀）、审批批复的可靠投递（现在仍走 fire-and-forget Notify：批复迟到即被丢弃，等价于超时 deny）、journal 的**自动**轮转策略（`rotate` 已可用，`demo-sa --rotate-after-records` 默认关闭——长运行的阈值该由派发节奏决定，不由库猜）。
+仍在清单上：tree-sitter-bash 命令解析、execpolicy DSL（Starlark）、landlock/bwrap（Linux 沙箱）、TUI（行级 diff 形制，pi-tui 蓝本）、openai-responses wire、MCP 客户端、model-in-the-loop evals、审批批复的可靠投递（现在仍走 fire-and-forget Notify：批复迟到即被丢弃，等价于超时 deny）、journal 的**自动**轮转策略（`rotate` 已可用，`demo-sa --rotate-after-records` 默认关闭——长运行的阈值该由派发节奏决定，不由库猜）、一个引擎内真正并发地服务多个 task（单活跃槽是刻意的不变式：今天多 task 在同一 worker 上串行，真并行靠各自的 worker 实例）。
 
 新划出的两条边界：`BudgetSpent` 的价格表（有单价表之后 usd 才能真正按 token 结算，而不是 per-dispatch 名义值）；证据的类型化（`evidence` 从「路径存在」升级到「测试产物/截图按 stage 要求齐全」）。

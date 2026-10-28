@@ -1,8 +1,8 @@
 # kestrel
 
-为星型多 Agent harness 写的 Rust harness kernel：引擎 1.1k 行 + wire 层 2.6k + 工具/权限/沙箱 2.3k + 会话 0.9k + 总线/journal 1.9k + CLI/配置 2.4k（`src` 48 文件 11.1k 行，`tests` 8 文件 2.2k 行）。设计文档（中文）见本仓库 `docs/design.md`。
+为星型多 Agent harness 写的 Rust harness kernel：引擎 1.1k 行 + wire 层 2.6k + 工具/权限/沙箱 2.3k + 会话 0.9k + 总线/journal 1.9k + CLI/配置 2.7k（`src` 49 文件 11.4k 行，`tests` 8 文件 2.3k 行）。设计文档（中文）见本仓库 `docs/design.md`。
 
-Status: M0-M4 complete + 二期开工（`ApproveMode::Bus`、SA 判定含证据核对、bus 停车补投与自动重连、journal 快照/截断）——163 tests，fmt / clippy `-D warnings` / test 三闸门全绿（人工执行：本仓库不挂 CI）
+Status: M0-M4 complete + 二期开工（`ApproveMode::Bus`、SA 判定含证据核对、bus 停车补投与自动重连、journal 快照/截断、多任务 task 命名空间）——169 tests，fmt / clippy `-D warnings` / test 三闸门全绿（人工执行：本仓库不挂 CI）
 
 ## Quick start
 
@@ -30,7 +30,7 @@ cargo run -p kestrel -- -p "continue the previous task" \
 ## Build & test
 
 ```bash
-cargo test          # 163 项；沙箱 e2e 需 macOS（真实 /usr/bin/sandbox-exec）
+cargo test          # 169 项；沙箱 e2e 需 macOS（真实 /usr/bin/sandbox-exec）
 cargo fmt --check && cargo clippy --all-targets -- -D warnings   # 质量闸门
 ```
 
@@ -82,6 +82,12 @@ Notify 停车（每 session 32 帧、全局 256 帧，drop-oldest 并 warn），
 socket」的帧**不重放**——重复铃由 SA 侧的 write-ahead 对账（journal + 读盘巡检）
 消化，而不是靠总线猜「大概没送到」。
 
+**多任务并行**：一个 hub 上可以并存多条 pipeline。用带前缀的 session 地址隔开路由
+（`serve --session t2:harness-rd`），再用 `demo-sa --task-id t2 --rd-peer
+t2:harness-rd --journal t2.jsonl` 告诉 SA 打哪一对 worker；task id 会盖进 journal
+记录、门铃、工件名与结果铃四处，命名契约由 `cli/task.rs` 一处算出，两端不会各拼一遍。
+注意单活跃槽仍在：同一 worker 收到多颗铃是一回合一个地跑，真并发需要 worker 池。
+
 ## Journal 截断
 
 `demo-sa --rotate-after-records N`（默认 0 = 不截断）：活文件超过 N 条记录时，把
@@ -108,6 +114,7 @@ src/
               + snapshot 检查点与归档段轮转（截断不丢未结算的铃）
   cli/        -p 单发 / serve 常驻 worker / demo-sa 脚本化 SA / hub 总线进程
               + evidence.rs（证据契约：从结论提路径 + 盘上核对）
+              + task.rs（task 命名空间：工件名契约 + slug 防路径穿越）
   config/     角色加载（含 $VAR 路径展开）+ KESTREL_HOME
 harness/      三角色 demo：roles/*.toml + roles/sa.approvals.json + systems/*.md + run-demo.sh
 tests/        fixtures/*.sse|*.jsonl|*.events.jsonl + 验收测试 + 纪律闸门
