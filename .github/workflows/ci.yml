@@ -1,0 +1,30 @@
+name: ci
+
+# The repo's quality gate is fmt + clippy -D warnings + the acceptance suite
+# (design §8). It was run by hand only, and one rust/clippy upgrade (1.98)
+# broke `clippy -D warnings` unnoticed — so the gate lives here now.
+# macOS runs the real Seatbelt e2e tests; Linux proves the kernel stays
+# portable (sandbox layer degrades to Unsandboxed there).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  quality:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
