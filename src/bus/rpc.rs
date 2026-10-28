@@ -321,6 +321,35 @@ const REPLAY_CAPACITY: usize = 64;
 /// How long one inbound poll keeps trying to bring the connection back.
 const RECONNECT_WINDOW: Duration = Duration::from_secs(10);
 
+/// RAII owner of a borrowed inbox receiver. Dropping the guard without
+/// consuming it puts the receiver back, which is what makes `recv_notify()`
+/// safe to poll inside `tokio::select!` (a cancelled branch must not take the
+/// inbox out of the connection for good).
+struct Taken<'a> {
+    conn: &'a Mutex<Conn>,
+    rx: Option<mpsc::UnboundedReceiver<Envelope>>,
+}
+
+impl Taken<'_> {
+    /// Put the receiver back for the next poll.
+    fn restore(&mut self) {
+        if let Some(rx) = self.rx.take() {
+            self.conn.lock().unwrap().inbox = Some(rx);
+        }
+    }
+
+    /// The connection is dead: throw the receiver away instead of restoring it.
+    fn close(&mut self) {
+        self.rx = None;
+    }
+}
+
+impl Drop for Taken<'_> {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
 impl BusClient {
     /// Connect + Hello. `session` registers this connection as the handler
     /// for Notify frames addressed to that session (worker mode). Fails fast
@@ -546,17 +575,22 @@ impl BusClient {
                     return Ok(conn.parked.remove(i));
                 }
             }
-            let mut rx = self
-                .conn
-                .lock()
-                .unwrap()
-                .inbox
-                .take()
-                .ok_or_else(|| anyhow::anyhow!("inbox already polled"))?;
-            let got = rx.recv().await;
+            // The receiver is handed out through a guard: a `tokio::select!` that
+            // loses the race DROPS this future mid-await, and a receiver that
+            // never gets put back would leave every later poll of this client
+            // failing with "inbox already polled" (observed as a silently dead
+            // pump in the worker pool).
+            let mut taken = Taken {
+                conn: &self.conn,
+                rx: self.conn.lock().unwrap().inbox.take(),
+            };
+            let got = match taken.rx.as_mut() {
+                Some(rx) => rx.recv().await,
+                None => anyhow::bail!("inbox already polled"),
+            };
             match got {
                 Some(env) => {
-                    self.conn.lock().unwrap().inbox = Some(rx);
+                    taken.restore();
                     match matching {
                         Some(req) if env.route.req != *req => {
                             self.conn.lock().unwrap().parked.push(env);
@@ -565,9 +599,10 @@ impl BusClient {
                     }
                 }
                 None => {
-                    // The socket died. Mark it dead without touching the queues.
+                    // The socket died: drop the receiver, mark the connection
+                    // dead, and keep the queues (parked/replay) intact.
+                    taken.close();
                     self.conn.lock().unwrap().tx = None;
-                    drop(rx);
                     if matching.is_some() {
                         // An RPC cannot survive a reconnect: the hub routes the
                         // Response back over the connection that registered it.

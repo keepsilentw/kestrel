@@ -564,6 +564,32 @@ async fn dead_socket_reconnects_and_replays_only_unsent_frames() {
     drop(client);
 }
 
+/// 回归：`tokio::select!` 取消落败分支时会 drop 掉正在 await 的收件 future。
+/// 连接里的接收器是「取出来用、用完放回」的，如果 drop 时不归还，这个客户端之后
+/// 每一次读都会以 `inbox already polled` 失败——泵会静默变哑，铃一颗也收不到。
+#[tokio::test]
+async fn a_cancelled_inbound_poll_leaves_the_connection_usable() {
+    let path = temp_bus("cancel-poll");
+    let _hub = BusHub::bind(&path).unwrap();
+    let client = BusClient::connect(&path, "w", Some("w-1")).await.unwrap();
+    let peer = BusClient::connect(&path, "peer", None).await.unwrap();
+
+    // three polls that start and are cancelled before anything arrives
+    for _ in 0..3 {
+        tokio::select! {
+            _ = client.recv_notify() => {}
+            _ = tokio::time::sleep(Duration::from_millis(5)) => {}
+        }
+    }
+
+    peer.notify("w-1", json!({ "task": "after the cancelled polls" }));
+    let got = tokio::time::timeout(Duration::from_secs(2), client.recv_notify())
+        .await
+        .expect("a cancelled poll must not take the inbox away for good")
+        .expect("inbox read failed");
+    assert_eq!(got.payload["task"], "after the cancelled polls");
+}
+
 /// One length-prefixed frame off an accepted connection (test-side hub reader).
 async fn read_one_frame(
     sock: &mut tokio::net::UnixStream,
