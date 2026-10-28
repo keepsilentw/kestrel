@@ -201,6 +201,83 @@ async fn crash_reconciliation_avoids_redispatch() {
     std::fs::remove_dir_all(&task_dir).ok();
 }
 
+/// 巡检读的是活文件；截断之后它仍必须看见那颗没结算的铃，且预算不被重复计。
+/// 这条测试钉住 §10 快照/截断语义的两条性质：检查点带 in_flight，折叠不重复计数。
+#[tokio::test]
+async fn rotation_does_not_hide_an_in_flight_bell() {
+    let task_dir = std::env::temp_dir().join(format!("kestrel-sa-rotate-{}", std::process::id()));
+    std::fs::create_dir_all(&task_dir).unwrap();
+    let journal = Journal::create(&task_dir.join("journal.jsonl")).unwrap();
+
+    // settled iterations 1..=3 + one bell (iter 4) that will never be answered
+    for iteration in 1..=4u64 {
+        journal
+            .append(&JournalRecord::StageWritten {
+                task: "t1".into(),
+                stage: Stage::Dev,
+                iteration,
+            })
+            .unwrap();
+        let bell = ThinBell {
+            role: "rd".into(),
+            stage: Stage::Dev,
+            check: None,
+            iteration,
+            r#ref: json!({ "spec_ref": "Spec.md" }),
+        };
+        journal
+            .append(&JournalRecord::BellSent {
+                task: "t1".into(),
+                to: "harness-rd".into(),
+                bell: bell.clone(),
+            })
+            .unwrap();
+        journal
+            .append(&JournalRecord::BudgetSpent {
+                peer: "harness-rd".into(),
+                usage: Default::default(),
+                usd: 0.5,
+            })
+            .unwrap();
+        if iteration < 4 {
+            journal
+                .append(&JournalRecord::BellReceived {
+                    task: "t1".into(),
+                    from: "harness-rd".into(),
+                    bell,
+                })
+                .unwrap();
+        }
+    }
+    let before = reconcile(&journal.replay());
+    let spent_before = before.state.spent_usd.get("harness-rd").copied().unwrap();
+    assert_eq!(before.in_flight.len(), 1);
+
+    // --- rotate so only the newest few records stay live
+    let rotated = journal.rotate(3).unwrap().expect("rotation");
+    assert!(journal.len() < 15);
+    let live = reconcile(&journal.replay());
+    let whole = reconcile(&journal.replay_all());
+    assert_eq!(
+        live.in_flight.len(),
+        1,
+        "巡检只看活文件也要看见那颗未回的铃"
+    );
+    assert_eq!(live.in_flight[0].bell.iteration, 4);
+    assert_eq!(live.state, whole.state, "预算与阶段投影不因截断而失真");
+    assert_eq!(live.in_flight, whole.in_flight);
+    assert_eq!(
+        live.state.spent_usd.get("harness-rd").copied().unwrap(),
+        spent_before,
+        "no double counting after a checkpoint"
+    );
+    assert!(
+        rotated.archived_to.exists() && journal.replay_all().len() >= 15,
+        "the archived prefix keeps the raw audit trail"
+    );
+    std::fs::remove_dir_all(&task_dir).ok();
+}
+
 /// Acceptance 6: budget accumulates in the journal and trips the stop-loss.
 #[tokio::test]
 async fn budget_stop_loss_trips() {

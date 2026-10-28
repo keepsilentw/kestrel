@@ -152,6 +152,12 @@ struct DemoSaCmd {
     /// Without it the SA denies every reverse request — fail closed.
     #[arg(long)]
     approvals: Option<PathBuf>,
+
+    /// Fold the journal into a checkpoint once the live file holds this many
+    /// records (the older prefix moves to `<journal>.seg<N>.jsonl`, never
+    /// deleted). 0 keeps the original single-file, never-truncated behaviour.
+    #[arg(long, default_value_t = 0)]
+    rotate_after_records: usize,
 }
 
 #[derive(Args, Debug)]
@@ -212,6 +218,7 @@ async fn main() -> anyhow::Result<()> {
                 bell_timeout: Duration::from_secs(d.bell_timeout_secs),
                 worktree: d.worktree,
                 approvals: d.approvals,
+                rotate_after: d.rotate_after_records,
             })
             .await;
         }

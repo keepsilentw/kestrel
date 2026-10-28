@@ -92,6 +92,16 @@ pub enum JournalRecord {
         peer: String,
         usage: crate::provider::wire::Usage,
     },
+    /// Checkpoint written by a rotation (design §10 快照/截断语义): it summarizes
+    /// the raw records that rotations archived out of the live file. `covers` is
+    /// CUMULATIVE from the beginning of the journal, not just this rotation's
+    /// share, so the next segment can be named by the range it covers: a rotation
+    /// that crashed before the rename and is retried overwrites the same segment
+    /// instead of archiving the same prefix twice. Recovery reads the live file
+    /// only and still knows the unsettled bells. A fold that sees this record
+    /// RESTARTS from the checkpoint — the archived prefix is already folded into
+    /// it, replaying both would double-count the budget.
+    Snapshot { covers: u64, checkpoint: Checkpoint },
 }
 
 /// State projection rebuilt from the journal (state.json 的内容来源).
@@ -113,11 +123,34 @@ pub struct ReconcileReport {
 }
 
 /// One BellSent that was never settled: (task, destination peer, bell).
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct InFlightBell {
     pub task: TaskId,
     pub to: String,
     pub bell: ThinBell,
+}
+
+/// Everything a replay would otherwise have to re-derive from the archived
+/// prefix — INCLUDING the unsettled bells. A snapshot that forgot them would
+/// turn a lost result bell into a silent re-dispatch after truncation, which is
+/// exactly the failure the journal exists to prevent.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Checkpoint {
+    pub stage: Option<Stage>,
+    pub iteration: u64,
+    pub spent_usd: BTreeMap<String, f64>,
+    pub in_flight: Vec<InFlightBell>,
+}
+
+impl Checkpoint {
+    pub fn capture(report: &ReconcileReport) -> Self {
+        Self {
+            stage: report.state.stage,
+            iteration: report.state.iteration,
+            spent_usd: report.state.spent_usd.clone(),
+            in_flight: report.in_flight.clone(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -163,6 +196,18 @@ pub fn reconcile(records: &[JournalRecord]) -> ReconcileReport {
             JournalRecord::ApprovalRequested { .. }
             | JournalRecord::ApprovalDecided { .. }
             | JournalRecord::UsageReported { .. } => {}
+            JournalRecord::Snapshot { checkpoint, .. } => {
+                // hard reset of the fold: the prefix is already inside the
+                // checkpoint, and its in-flight set replaces whatever we had.
+                in_flight.clear();
+                for b in &checkpoint.in_flight {
+                    in_flight.push((b.task.clone(), b.to.clone(), b.bell.clone()));
+                }
+                spent.clear();
+                spent.extend(checkpoint.spent_usd.clone());
+                settled.last_stage = checkpoint.stage;
+                settled.max_iteration = checkpoint.iteration;
+            }
         }
     }
     // settle bells whose (role, stage, iteration) has a matching receipt

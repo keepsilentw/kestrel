@@ -12,6 +12,8 @@
 #   KESTREL_WORKTREE          RD 的写入目录（role 的 write_roots 引用同一个变量）
 #   KESTREL_TEST_KILL_AFTER   崩溃注入点：bell_sent | result_received（见 sa_demo.rs）
 #   KESTREL_DEMO_KEEP_JOURNAL 置 1 则保留上一轮 journal/工件（崩溃恢复演练用）
+#   KESTREL_DEMO_ROTATE_AFTER 活文件超过这么多条记录就折成检查点并归档旧前缀
+#                             （默认 0 = 不截断，journal 始终是单文件）
 #   KESTREL_DEMO_TASK / KESTREL_DEMO_BELL_TIMEOUT / KESTREL_DEMO_MAX_USD
 #
 # 用法：./run-demo.sh
@@ -85,4 +87,5 @@ KESTREL_TEST_KILL_AFTER="${KESTREL_TEST_KILL_AFTER:-}" \
   --journal "$HERE/journal.jsonl" --artifacts-dir "$ARTIFACTS" \
   --worktree "$WORKTREE" \
   --approvals "$HERE/roles/sa.approvals.json" \
+  --rotate-after-records "${KESTREL_DEMO_ROTATE_AFTER:-0}" \
   --bell-timeout-secs "${KESTREL_DEMO_BELL_TIMEOUT:-300}" --max-usd "${KESTREL_DEMO_MAX_USD:-6.0}"

@@ -38,6 +38,12 @@ pub struct DemoSaArgs {
     /// prefix table (same format as a role policy). Absent means the SA denies
     /// every reverse request — fail closed, no default yes.
     pub approvals: Option<PathBuf>,
+    /// Journal truncation threshold (design §10 快照/截断语义): once the live
+    /// file holds this many records, everything older than half of it is folded
+    /// into a checkpoint and archived into `<journal>.seg<N>.jsonl`. 0 = never
+    /// rotate, which is the default: the journal stays one file until somebody
+    /// decides a long run needs the bounded replay.
+    pub rotate_after: usize,
 }
 
 /// 一个 stage 的派发结果：收敛（pass）。
@@ -198,6 +204,19 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
                 stage,
                 verdict: verdict.clone(),
             })?;
+            // 一次 stage 结算是一个天然的检查点边界：此后的前缀不再影响对账，
+            // 折叠它才能让长时间运行的 pipeline 的 replay 保持有界。
+            if args.rotate_after > 0
+                && journal.len() >= args.rotate_after
+                && let Some(rotated) = journal.rotate(args.rotate_after / 2)?
+            {
+                println!(
+                    "[sa] journal rotated: {} record(s) archived into {}, live file now {} record(s)",
+                    rotated.covered,
+                    rotated.archived_to.display(),
+                    journal.len()
+                );
+            }
             if verdict.pass {
                 println!("[sa] {stage_name} iter{iter}: pass");
                 break StageOutcome::Pass;
