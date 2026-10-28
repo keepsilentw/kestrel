@@ -9,10 +9,10 @@
 
 | 组 | 数量 | 覆盖 |
 |---|---|---|
-| 单测（lib） | 126 | wire 归一 / partial_json / retry / registry / 权限矩阵 / sbpl golden / session 树 / journal 对账与轮转 / 证据契约 / 审批授权表 / task 命名空间 |
+| 单测（lib） | 138 | wire 归一（含 openai-responses）/ partial_json / retry / registry / 权限矩阵 / sbpl golden / session 树 / journal 对账、轮转与在线投影 / 证据契约 / 审批授权表 / task 命名空间 |
 | 单测（bin：CLI 形状） | 4 | `--tools` 三态、`--approve` 三值（none / all / bus）、`--resume` 选择子、bus 模式保留 role 期限 |
 | 集成（core_loop 5 / m1_tools 8 / sandbox_e2e 4 / m2_session 6 / m4_bus 13 / wire_anthropic 2 / discipline 1） | 39 | 引擎验收 / 工具并发与审批超时 / 真实 Seatbelt / golden JSONL / 总线路由、审批往返、停车补投、重连重放、多 pipeline 并存、截断后巡检与崩溃对账 |
-| 合计 | **169**，全部通过；`fmt --check` 与 `clippy -D warnings` 干净（本机实跑；本仓库不挂 CI，闸门靠人工每次执行） | |
+| 合计 | **181**，全部通过；`fmt --check` 与 `clippy -D warnings` 干净（本机实跑；本仓库不挂 CI，闸门靠人工每次执行） | |
 
 > 计数以 2026-10-28 实跑为准。历史上这张表漂移过三次（101 → 121 → 137，实跑 130），
 > §8.3 里那句「137/137」也是其中之一——数字一旦需要人肉同步就会失真，而没有 CI 兜底，
@@ -204,3 +204,44 @@ assistant: [tool_use(c2)]             user: [tool_result(c2)]
 
 真端点侧的已知空洞：`--max-usd` 仍是 per-dispatch 名义值（无价格表），真实 token 现在只进
 `usage_reported` 记录，不参与停损判断。
+
+## 10. 2026-10-28 openai-responses wire：只有 fixture 级验证
+
+`api = "openai-responses"`（`POST /v1/responses` + `response.*` 事件族）新增，7 项单测：
+
+| 项 | 用例 | 结果 |
+|---|---|---|
+| 请求形状（顶层 `instructions` / `input` 项 / 扁平 tools / `store:false`） | `openai_responses::request_shape_is_the_responses_api` | 通过；并行调用天然是独立 input 项，无 chat 那条成组要求（§9.12 的约束不外溢） |
+| thinking blob 分流 | 同上 | Responses 形状的 `reasoning` 项原样回显；anthropic 形状跳过 |
+| 文本 + usage | `text_stream_with_usage` | usage 搭终止事件，input/output/cached 三项对上 |
+| 工具批次归一 | `function_call_stream_becomes_a_tool_batch` | begin/args/end 按 `output_index` 成组；`call_id` 取事件的 `call_id`，不是 `item.id` |
+| token 上限映射 | `incomplete_from_token_cap_maps_to_length` | `max_output_tokens` → `Length`，「整批 fail」纪律在这条 wire 上仍生效 |
+| 失败与限流 | `failed_and_error_events_are_terminal_errors` | `response.failed` / `error` → Error；rate limit 标 retryable 交给重试层 |
+| 流被截断 | `eof_mid_stream_is_aborted_and_drops_calls` | Aborted 且不交出已积累的 tool call |
+
+**这条 wire 没跑过任何真端点**：本会话没有 OpenAI 凭据也没有网络。它与 §2 那三条实测 wire
+不同级，风险点写在 design §9.24——usage 字段命名、`call_id` 与 `item.id` 的实际填法、
+reasoning 项的回显要求，都要等真端点定案（§9.9 的 Qwen 教训就是这么暴露的）。registry 侧
+只有 `config.rs` 的解析测试证明 `api = "openai-responses"` 能被选中并落到会话头部。
+
+## 11. 2026-10-28 journal 在线投影与轮转触发
+
+不变式 5 原先的实现是「每次派发都把活文件读一遍再折一次」，O(历史) 挂在预算停损与丢铃
+巡检这两条热路径上。现在折叠逻辑只有 `Folder` 一份（`reconcile` 是它的批处理外壳），
+`Journal` 持一份在线投影随 append 推进。
+
+| 项 | 用例 | 结果 |
+|---|---|---|
+| 在线投影 == 全量重放 | `journal::projection_equals_a_full_replay_after_every_append`（含轮转后重新播种） | 逐次相等：state 与 in_flight 都不分裂 |
+| 跨运行续账本 | `journal::create_seeds_the_projection_of_an_existing_journal` | 旧文件里的花费与未结算铃被读回（修掉「重启即归零」） |
+| 检查点清掉陈旧回执键 | `records::checkpoint_clears_stale_receipt_keys` | 轮转后复用同一 (role, stage, iteration) 的铃不会被误判成已结算 |
+| 轮转触发（纯函数） | `sa_demo::rotation_trigger_accepts_either_ceiling` | 条数或字节任一超限即折；0 关闭；少于 2 条不折 |
+| 退化前缀由库挡住 | `journal::rotate_refuses_a_degenerate_prefix` | 前缀不足 2 条原始记录时 `rotate` 返回 `None`，不写段、活文件不变长 |
+| O(1) 读 | `live_records()` 走投影、`file_bytes()` 走 metadata | 触发判断不再重放文件 |
+
+**顺带修掉的既有缺陷**：`Journal::create` 以追加模式打开，却把投影当空的——配合
+`KESTREL_DEMO_KEEP_JOURNAL=1`（跨运行保留账本做崩溃恢复演练）时，昨天花掉的钱和不
+结算的铃在重启后被忘掉，`--max-usd` 停损形同虚设。现在 `create` / `open` 都从盘上播种。
+
+轮转阈值本身仍由调用方给（`--rotate-after-records` / `--rotate-max-bytes`，默认 0 = 不截断）：
+库不猜派发节奏，这条策略留在 §10。

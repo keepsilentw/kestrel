@@ -1,10 +1,11 @@
 # kestrel 设计文档：Rust harness kernel
 
-> 状态：M0-M4 已实现并通过测试（169/169）；§10 二期已落地五项——`ApproveMode::Bus`、
+> 状态：M0-M4 已实现并通过测试（181/181）；§10 二期已落地七项——`ApproveMode::Bus`、
 > 「判定 = 工件 + 证据文件」、bus 重连重放（停车补投 + 客户端重连）、journal 快照/截断语义、
-> 多任务并行（task 命名空间 + 前缀寻址）。
+> 多任务并行（task 命名空间 + 前缀寻址）、openai-responses wire（**真端点未实测**，§9.24）、
+> journal 投影增量化与轮转触发（§9.25）。
 > 质量闸门保持人工执行（本仓库不挂 CI，见 §9.19⑥）。
-> 实现规模：src 49 文件 11,361 行 + tests 8 文件 2,284 行（plan 预算 ~10-13k 行内）。
+> 实现规模：src 50 文件 12,139 行 + tests 8 文件 2,284 行（plan 预算 ~10-13k 行内）。
 > 输入：实现规划（plan.md）与调研语料（codex / pi study notes、三方资料库 references.md）——均为开发过程资料，未随本仓库发布。
 > 本文沉淀实现后的最终设计；与 plan 的偏差在 §9 逐条记录。
 
@@ -26,7 +27,7 @@ flowchart TD
         ORCH --> SANDBOX["sandbox: Seatbelt 包裹<br/>denial 检测 → 升级循环"]
         TURN --> PERM["permissions: 三态前缀表<br/>word-only tokenizer fail-closed"]
         TURN --> SESSION["session 树 JSONL<br/>无损 compaction"]
-        TURN --> WIRE["provider wire<br/>anthropic / openai-completions<br/>+ compat 位 + partial-json + retry"]
+        TURN --> WIRE["provider wire<br/>anthropic / openai-completions / openai-responses<br/>+ compat 位 + partial-json + retry"]
         SESSION --> TREE[("session 文件<br/>~/.kestrel/sessions/")]
     end
     subgraph 总线[bus（M4）：UDS 哑 RPC]
@@ -67,7 +68,7 @@ flowchart TD
 2. **fail-closed**：tokenizer 解析不了 → Ask；未设角色/无策略 → Ask 或 Deny；QA 写范围为零；审批者沉默、回复不可解析、或 SA 没有授权表 → Deny（`approve_timeout_secs`，默认 120s）。
 3. **只追加**：session 永不截断；journal 的**活文件**可以变短，但只允许在旧前缀已被折成 `snapshot` 检查点并归档成段之后——历史不消失，只是搬出活文件（§9.22）。回滚/恢复 = 重放；半写容忍（残行 skip）。
 4. **sender identity**：Hello 声明 + 帧内 sender 强一致；伪装者断连；bus 来源 item 渲染带 `<bell from>` 标注。
-5. **journal 是真相**：StageWritten → BellSent → notify 的调用序强制 write-ahead；state 投影从 journal 重生成。
+5. **journal 是真相**：StageWritten → BellSent → notify 的调用序强制 write-ahead；state 投影从 journal 重生成。投影可以**增量维护**（`Folder` 每追加一条走一步，避免每次派发都重放整个文件），但增量与全量必须是同一次折叠——`projection_equals_a_full_replay_after_every_append` 断言两者逐次相等，否则「预算停损读的是缓存、巡检读的是重放」会分成两份真相。
 
 ## 5 安全模型
 
@@ -117,7 +118,7 @@ role 文件的路径字段（`write_roots`/`read_only_islands`/`policy_file`/`pr
 
 faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_request` 纯函数）→ 零真 key 覆盖全部验收；三层测试（单元/组件 golden/e2e）；determinism 经 `IdGen`/`Clock` 注入；沙箱 e2e 仅 macOS（`#[cfg(target_os="macos")]`）；闸门 = `cargo fmt --check` + `clippy -D warnings` + 全测试，**人工执行、每次改动都跑**：本仓库不挂 CI（2026-10-28 试过 `ci.yml`，同日按决定移除，见 §9.19⑥），所以这道闸门没有兜底机制——rust/clippy 1.98 那次破功就是因为只靠人记得跑。
 
-169 项 = lib 单测 126 + bin 单测（CLI 形状）4 + 集成 39（core_loop 5 / m1_tools 8 / m2_session 6 / m4_bus 13 / sandbox_e2e 4 / wire_anthropic 2 / discipline 1）。计数以实跑为准，改测试时同步这一行：此前 README / design / 报告三处各写一个数（137 / 137 / 121），实跑只有 130，漂移本身记在 §9.19。总线测试需要真 UDS `bind`，在严格沙箱或容器里以 `EPERM` 失败，属环境限制而非回归。
+181 项 = lib 单测 138 + bin 单测（CLI 形状）4 + 集成 39（core_loop 5 / m1_tools 8 / m2_session 6 / m4_bus 13 / sandbox_e2e 4 / wire_anthropic 2 / discipline 1）。计数以实跑为准，改测试时同步这一行：此前 README / design / 报告三处各写一个数（137 / 137 / 121），实跑只有 130，漂移本身记在 §9.19。总线测试需要真 UDS `bind`，在严格沙箱或容器里以 `EPERM` 失败，属环境限制而非回归。
 
 ## 9 与 plan 的偏差（诚实台账）
 
@@ -169,10 +170,22 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
     ④ 寻址用前缀：`serve --session t2:harness-rd` 配 `demo-sa --task-id t2 --rd-peer t2:harness-rd --journal t2.jsonl`。session id 本来就是 opaque 字符串，hub 不改一行代码就能把两条 pipeline 路由隔开；`--rd-peer/--qa-peer` 让 SA 知道该打哪一对 worker。
     边界要说清：这一项解决的是「并存不串台」，不是「一个引擎同时服务两个 task」。单活跃槽（§4 不变式）依旧，同一 worker 收到两颗铃仍是一回合一回合地跑；真并发需要 worker 池，仍在 §10。
 
+24. **openai-responses wire（2026-10-28，第三条 v1 wire）**：`api = "openai-responses"` → `POST /v1/responses`。它与 chat 的差三处，不是兼容位能糊过去的：系统提示走顶层 `instructions`；历史是 `input` 项列表（`message` / `function_call` / `function_call_output`），因此**并行工具批次天然成组**——§9.12 那条「一个 assistant 装全部 tool_use」的形状约束是 chat/anthropic 的事，这条 wire 上不存在；usage 搭在终止事件 `response.completed` 的 `response.usage` 里，所以 §9.9「finish_reason 之后还有 usage」的延后终止补丁在这里没有对应问题（终止事件本身就是唯一的 usage 载体）。
+    映射规则要说清：`response.incomplete` + `incomplete_details.reason == "max_output_tokens"` → **`Length`，不软成 Stop**，否则 §4 的「length 整批 fail」纪律在这条 wire 上静默失效；`response.failed` / 顶层 `error` → `Error`（`server_error` / `rate_limit_error` 标 retryable，交给 retry 层）；流尾没有终止事件 → `Aborted`，且**不吐出已积累的 tool call**（回合会丢弃 partials）。
+    取舍延续 §9.3：只发有行为依据的字段——`store: false`（会话树才是真相源，不让服务端另存一份）、`max_output_tokens`、扁平 tools + `tool_choice`；`reasoning.effort` 没实测就不发。思考内容仍是不透明 blob：blob 本身就是 Responses 的 `reasoning` 项（带 `encrypted_content`）时原样回显，anthropic 形状的 blob 直接跳过。
+    **诚实边界**：这条 wire 只有金身请求体 + fixture 事件流验证（7 项），**没有跑过任何真端点**——本会话既无 OpenAI 凭据也无网络。它与 §9.7-9.10 那三条实测过的 wire 不同级：usage 字段命名、`call_id` 与 `item.id` 的实际填法、reasoning 项的回显要求，都可能像 Qwen 那轮（§9.9）一样暴露结构偏差。真端点实测已随 model-in-the-loop evals 排在 §10。
+
+25. **journal 投影增量化 + 轮转触发（2026-10-28）**：不变式 5 说「state 投影从 journal 重生成」，实现里它是**每次派发都把活文件读一遍再折一次**——O(历史) 的开销挂在最热的路径上（预算停损 + 丢铃巡检都要它）。现在：
+    ① 折叠逻辑抽成唯一的 `Folder`（`apply` 一条 / `report` 取投影），`reconcile(records)` 只是把它跑一遍。在线投影与全量重放因此**不可能各写一套**；`projection_equals_a_full_replay_after_every_append` 逐条断言两者相等（含轮转后重新播种）。
+    ② `Journal` 持一份在线投影：`append` 顺带推进一步（锁序固定 file → projection，与 `rotate` 一致），`projection()` / `live_records()` / `file_bytes()` 都是 O(1)。SA 的预算停损与丢铃巡检改读投影。
+    ③ 轮转触发 `rotation_due(records, bytes, cap_records, cap_bytes)`：两个上限任一超限即折，0 关闭该条件。字节上限是必要的——记录大小不齐（一条 `approval_requested` 带着 stderr），只按条数封顶挡不住文件长大。保留新近一半，于是活文件在上限的 1/2~1 之间浮动。**退化情形由库自己挡**：`rotate` 在前缀不足 2 条原始记录时返回 `None`——折一条记录进检查点会让活文件变长（检查点那行比它替换的记录更贵），这种守卫不能指望调用方给的阈值刚好。
+    ④ 顺带修掉一个既有缺陷：`Journal::create` 开的是追加模式，却把投影当空的。配合 `KESTREL_DEMO_KEEP_JOURNAL=1`（跨运行续账本）时，**昨天花掉的钱与没结算的铃在重启后被忘掉**，停损形同虚设。现在 `create`/`open` 都从盘上播种（`create_seeds_the_projection_of_an_existing_journal`）。
+    仍不做的事：库自己决定阈值。`--rotate-after-records` / `--rotate-max-bytes` 默认 0（不截断），策略归派发节奏的主人（SA/人），这条留在 §10。
+
 ## 10 二期清单
 
-已落地（2026-10-28）：~~`ApproveMode::Bus`~~（授权表 + 超时 fail-closed + journal 审计，§9.20）、~~SA 判定升级到「工件 + 证据文件」~~（绝对路径存在性/非空核对，§9.20）、~~bus 重连重放~~（离线 session 停车补投 + 客户端自动重连；RPC 与「写入即死」的帧不重放，§9.21）、~~journal 快照/截断语义~~（检查点 + 归档段 + 崩溃安全轮转，§9.22）、~~多任务并行~~（task 命名空间三处同源 + 前缀寻址，§9.23）。
+已落地（2026-10-28）：~~`ApproveMode::Bus`~~（授权表 + 超时 fail-closed + journal 审计，§9.20）、~~SA 判定升级到「工件 + 证据文件」~~（绝对路径存在性/非空核对，§9.20）、~~bus 重连重放~~（离线 session 停车补投 + 客户端自动重连；RPC 与「写入即死」的帧不重放，§9.21）、~~journal 快照/截断语义~~（检查点 + 归档段 + 崩溃安全轮转，§9.22）、~~多任务并行~~（task 命名空间三处同源 + 前缀寻址，§9.23）、~~openai-responses wire~~（第三条 v1 wire，金身 + fixture 验证，**真端点未实测**，§9.24）、~~journal 投影增量化与轮转触发~~（在线投影 = 全量重放 + 条数/字节双上限，§9.25）。
 
-仍在清单上：tree-sitter-bash 命令解析、execpolicy DSL（Starlark）、landlock/bwrap（Linux 沙箱）、TUI（行级 diff 形制，pi-tui 蓝本）、openai-responses wire、MCP 客户端、model-in-the-loop evals、审批批复的可靠投递（现在仍走 fire-and-forget Notify：批复迟到即被丢弃，等价于超时 deny）、journal 的**自动**轮转策略（`rotate` 已可用，`demo-sa --rotate-after-records` 默认关闭——长运行的阈值该由派发节奏决定，不由库猜）、一个引擎内真正并发地服务多个 task（单活跃槽是刻意的不变式：今天多 task 在同一 worker 上串行，真并行靠各自的 worker 实例）。
+仍在清单上：tree-sitter-bash 命令解析、execpolicy DSL（Starlark）、landlock/bwrap（Linux 沙箱）、TUI（行级 diff 形制，pi-tui 蓝本）、MCP 客户端、model-in-the-loop evals（含 openai-responses 的真端点实测，§9.24）、审批批复的可靠投递（请求与批复都是 Notify：§9.21 的停车补投已覆盖「审批者当时不在线」，剩下的缺口是批复迟到——回合结束即丢弃，语义停在超时 deny）、journal 轮转的**默认策略**（机制已齐：`rotate` + 条数/字节双上限 + O(1) 触发，§9.25；阈值仍由调用方给，库不猜派发节奏）、一个引擎内真正并发地服务多个 task（单活跃槽是刻意的不变式：今天多 task 在同一 worker 上串行，真并行靠各自的 worker 实例）。
 
 新划出的两条边界：`BudgetSpent` 的价格表（有单价表之后 usd 才能真正按 token 结算，而不是 per-dispatch 名义值）；证据的类型化（`evidence` 从「路径存在」升级到「测试产物/截图按 stage 要求齐全」）。

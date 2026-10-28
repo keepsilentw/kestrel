@@ -2,7 +2,7 @@
 
 为星型多 Agent harness 写的 Rust harness kernel：引擎 1.1k 行 + wire 层 2.6k + 工具/权限/沙箱 2.3k + 会话 0.9k + 总线/journal 1.9k + CLI/配置 2.7k（`src` 49 文件 11.4k 行，`tests` 8 文件 2.3k 行）。设计文档（中文）见本仓库 `docs/design.md`。
 
-Status: M0-M4 complete + 二期开工（`ApproveMode::Bus`、SA 判定含证据核对、bus 停车补投与自动重连、journal 快照/截断、多任务 task 命名空间）——169 tests，fmt / clippy `-D warnings` / test 三闸门全绿（人工执行：本仓库不挂 CI）
+Status: M0-M4 complete + 二期开工（`ApproveMode::Bus`、SA 判定含证据核对、bus 停车补投与自动重连、journal 快照/截断与在线投影、多任务 task 命名空间、openai-responses wire）——181 tests，fmt / clippy `-D warnings` / test 三闸门全绿（人工执行：本仓库不挂 CI）
 
 ## Quick start
 
@@ -30,7 +30,7 @@ cargo run -p kestrel -- -p "continue the previous task" \
 ## Build & test
 
 ```bash
-cargo test          # 169 项；沙箱 e2e 需 macOS（真实 /usr/bin/sandbox-exec）
+cargo test          # 181 项；沙箱 e2e 需 macOS（真实 /usr/bin/sandbox-exec）
 cargo fmt --check && cargo clippy --all-targets -- -D warnings   # 质量闸门
 ```
 
@@ -66,6 +66,8 @@ SA 的判定只读盘，且分三层：通路（有答案、未 abort、worker �
 （`approval_requested` / `approval_decided`），「谁放宽了沙箱」崩溃后可复现。
 `-p` 单发模式没有总线可问：`approve = "bus"` 在启动时直接报错，不静默降级。
 
+`api` 三值：`anthropic-messages` / `openai-completions` / `openai-responses`。第三条是 §10 二期补上的 wire（`/v1/responses` + `response.*` 事件族），只有 fixture 级验证，**尚未真端点实测**（见 design.md §9.24）。`--base-url` 直连模式仍固定用 anthropic wire。
+
 ## Sessions
 
 每次运行落一个 append-only JSONL 树（`~/.kestrel/sessions/<cwd-slug>/`）。`-p`
@@ -90,7 +92,8 @@ t2:harness-rd --journal t2.jsonl` 告诉 SA 打哪一对 worker；task id 会盖
 
 ## Journal 截断
 
-`demo-sa --rotate-after-records N`（默认 0 = 不截断）：活文件超过 N 条记录时，把
+`demo-sa --rotate-after-records N` / `--rotate-max-bytes B`（都默认 0 = 不截断）：活文件
+超过 N 条记录或 B 字节时，把
 较旧的前缀折成一个 `snapshot` 检查点并搬进归档段 `journal.seg<from>-<to>.jsonl`（名字就是
 它覆盖的记录区间），活文件
 只剩「检查点 + 最近若干条」。检查点里带着**未结算的铃**和每个 peer 的花费，所以巡检、
@@ -98,19 +101,25 @@ t2:harness-rd --journal t2.jsonl` 告诉 SA 打哪一对 worker；task id 会盖
 轮转顺序是崩溃安全的（归档 fsync → 新活文件 fsync → rename 原子替换），任何一步断电，
 盘上都还有一份可读的 journal。**这不是删除**：段文件不自动清理，session 树也永不截断。
 
+投影是在线维护的：`Journal` 每追加一条就把折叠推进一步，`projection()`（stage /
+iteration / 每 peer 花费 / 未结算的铃）、`live_records()`、`file_bytes()` 都是 O(1)，
+所以预算停损不再每次派发重放整个文件。在线与重放由**同一个** `Folder` 折叠产生，
+测试逐条断言两者相等——否则「停损读缓存、巡检读重放」会分裂成两份真相。
+
 ## Module map
 
 ```
 src/
   core/       actor(Op/Event) + run_turn + steering + 取消树        # 引擎
-  provider/   wire trait + anthropic/openai_chat + compat + partial_json + retry + registry
+  provider/   wire trait + anthropic / openai_chat / openai_responses + compat + partial_json
+              + retry + registry
   tools/      bash/read/write/edit + orchestrator(并行门闸 + 审批反向请求/超时)
   permissions/ 三态前缀表 + word-only tokenizer（fail-closed）
   sandbox/    Seatbelt 包裹（4 sbpl 模板）+ denial 检测 + 升级循环
   session/    append-only 树 JSONL + 无损 compaction（firstKeptEntryId）
   bus/        帧协议(4B 长度+strict 信封) + 哑 RPC 路由 + sender identity
               + 离线 session 停车补投 / 客户端自动重连（RPC 不跨重连）
-  journal/    write-ahead 真相源 + 崩溃对账 + 预算/用量/审批账本
+  journal/    write-ahead 真相源 + 崩溃对账 + 在线投影 + 预算/用量/审批账本
               + snapshot 检查点与归档段轮转（截断不丢未结算的铃）
   cli/        -p 单发 / serve 常驻 worker / demo-sa 脚本化 SA / hub 总线进程
               + evidence.rs（证据契约：从结论提路径 + 盘上核对）
