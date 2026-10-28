@@ -107,6 +107,12 @@ struct ServeCmd {
     #[arg(long, default_value = "artifacts")]
     artifacts_dir: PathBuf,
 
+    /// How many tasks this worker hosts engines for, concurrently (one engine
+    /// and one session tree per task). Over the ceiling a bell is refused with
+    /// a visible error bell. 0 = no ceiling.
+    #[arg(long, default_value_t = 4)]
+    max_tasks: usize,
+
     #[command(flatten)]
     backend: BackendArgs,
 }
@@ -223,6 +229,7 @@ async fn main() -> anyhow::Result<()> {
                 model,
                 api_key,
                 artifacts_dir: s.artifacts_dir,
+                max_tasks: s.max_tasks,
                 approve: approve.map(|mode| with_role_deadline(mode, Some(&role))),
             })
             .await;

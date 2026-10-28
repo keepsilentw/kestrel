@@ -3,6 +3,7 @@
 
 pub mod evidence;
 pub mod hub;
+pub mod pool;
 pub mod run;
 pub mod sa_demo;
 pub mod serve;
