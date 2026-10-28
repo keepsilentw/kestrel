@@ -1,8 +1,8 @@
 # kestrel
 
-为星型多 Agent harness 写的 Rust harness kernel：引擎 1.1k 行 + wire 层 2.6k + 工具/权限/沙箱 2.3k + 会话 0.9k + 总线/journal 1.4k + CLI/配置 2.3k（`src` 48 文件 10.5k 行，`tests` 8 文件 2.2k 行）。设计文档（中文）见本仓库 `docs/design.md`。
+为星型多 Agent harness 写的 Rust harness kernel：引擎 1.1k 行 + wire 层 2.6k + 工具/权限/沙箱 2.3k + 会话 0.9k + 总线/journal 1.9k + CLI/配置 2.4k（`src` 48 文件 11.1k 行，`tests` 8 文件 2.2k 行）。设计文档（中文）见本仓库 `docs/design.md`。
 
-Status: M0-M4 complete + 二期开工（`ApproveMode::Bus`、SA 判定含证据核对、bus 停车补投与自动重连）——156 tests，fmt / clippy `-D warnings` / test 三闸门全绿（人工执行：本仓库不挂 CI）
+Status: M0-M4 complete + 二期开工（`ApproveMode::Bus`、SA 判定含证据核对、bus 停车补投与自动重连、journal 快照/截断）——163 tests，fmt / clippy `-D warnings` / test 三闸门全绿（人工执行：本仓库不挂 CI）
 
 ## Quick start
 
@@ -30,7 +30,7 @@ cargo run -p kestrel -- -p "continue the previous task" \
 ## Build & test
 
 ```bash
-cargo test          # 156 项；沙箱 e2e 需 macOS（真实 /usr/bin/sandbox-exec）
+cargo test          # 163 项；沙箱 e2e 需 macOS（真实 /usr/bin/sandbox-exec）
 cargo fmt --check && cargo clippy --all-targets -- -D warnings   # 质量闸门
 ```
 
@@ -82,6 +82,16 @@ Notify 停车（每 session 32 帧、全局 256 帧，drop-oldest 并 warn），
 socket」的帧**不重放**——重复铃由 SA 侧的 write-ahead 对账（journal + 读盘巡检）
 消化，而不是靠总线猜「大概没送到」。
 
+## Journal 截断
+
+`demo-sa --rotate-after-records N`（默认 0 = 不截断）：活文件超过 N 条记录时，把
+较旧的前缀折成一个 `snapshot` 检查点并搬进归档段 `journal.seg<from>-<to>.jsonl`（名字就是
+它覆盖的记录区间），活文件
+只剩「检查点 + 最近若干条」。检查点里带着**未结算的铃**和每个 peer 的花费，所以巡检、
+崩溃对账与预算停损的结论与不截断时完全一致；完整审计读 `replay_all()`（段 + 活文件）。
+轮转顺序是崩溃安全的（归档 fsync → 新活文件 fsync → rename 原子替换），任何一步断电，
+盘上都还有一份可读的 journal。**这不是删除**：段文件不自动清理，session 树也永不截断。
+
 ## Module map
 
 ```
@@ -95,6 +105,7 @@ src/
   bus/        帧协议(4B 长度+strict 信封) + 哑 RPC 路由 + sender identity
               + 离线 session 停车补投 / 客户端自动重连（RPC 不跨重连）
   journal/    write-ahead 真相源 + 崩溃对账 + 预算/用量/审批账本
+              + snapshot 检查点与归档段轮转（截断不丢未结算的铃）
   cli/        -p 单发 / serve 常驻 worker / demo-sa 脚本化 SA / hub 总线进程
               + evidence.rs（证据契约：从结论提路径 + 盘上核对）
   config/     角色加载（含 $VAR 路径展开）+ KESTREL_HOME

@@ -1,8 +1,9 @@
 # kestrel 设计文档：Rust harness kernel
 
-> 状态：M0-M4 已实现并通过测试（156/156）；§10 二期已落地三项——`ApproveMode::Bus`、
-> 「判定 = 工件 + 证据文件」、bus 重连重放（停车补投 + 客户端重连）。质量闸门保持人工执行（本仓库不挂 CI，见 §9.19⑥）。
-> 实现规模：src 48 文件 10,308 行 + tests 8 文件 2,025 行（plan 预算 ~10-13k 行内）。
+> 状态：M0-M4 已实现并通过测试（163/163）；§10 二期已落地四项——`ApproveMode::Bus`、
+> 「判定 = 工件 + 证据文件」、bus 重连重放（停车补投 + 客户端重连）、journal 快照/截断语义。
+> 质量闸门保持人工执行（本仓库不挂 CI，见 §9.19⑥）。
+> 实现规模：src 48 文件 11,093 行 + tests 8 文件 2,229 行（plan 预算 ~10-13k 行内）。
 > 输入：实现规划（plan.md）与调研语料（codex / pi study notes、三方资料库 references.md）——均为开发过程资料，未随本仓库发布。
 > 本文沉淀实现后的最终设计；与 plan 的偏差在 §9 逐条记录。
 
@@ -63,7 +64,7 @@ flowchart TD
 
 1. **取消三件套**：每个 await 过 `or_cancel`；`tokio::spawn` 必须包 `AbortOnDropHandle`（`tests/discipline.rs` 静态闸门，fire-and-forget/managed 两类豁免标记）；`ResponseStream` drop 通知上游。
 2. **fail-closed**：tokenizer 解析不了 → Ask；未设角色/无策略 → Ask 或 Deny；QA 写范围为零；审批者沉默、回复不可解析、或 SA 没有授权表 → Deny（`approve_timeout_secs`，默认 120s）。
-3. **只追加**：session 与 journal 永不截断；回滚/恢复 = 重放；半写容忍（残行 skip）。
+3. **只追加**：session 永不截断；journal 的**活文件**可以变短，但只允许在旧前缀已被折成 `snapshot` 检查点并归档成段之后——历史不消失，只是搬出活文件（§9.22）。回滚/恢复 = 重放；半写容忍（残行 skip）。
 4. **sender identity**：Hello 声明 + 帧内 sender 强一致；伪装者断连；bus 来源 item 渲染带 `<bell from>` 标注。
 5. **journal 是真相**：StageWritten → BellSent → notify 的调用序强制 write-ahead；state 投影从 journal 重生成。
 
@@ -115,7 +116,7 @@ role 文件的路径字段（`write_roots`/`read_only_islands`/`policy_file`/`pr
 
 faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_request` 纯函数）→ 零真 key 覆盖全部验收；三层测试（单元/组件 golden/e2e）；determinism 经 `IdGen`/`Clock` 注入；沙箱 e2e 仅 macOS（`#[cfg(target_os="macos")]`）；闸门 = `cargo fmt --check` + `clippy -D warnings` + 全测试，**人工执行、每次改动都跑**：本仓库不挂 CI（2026-10-28 试过 `ci.yml`，同日按决定移除，见 §9.19⑥），所以这道闸门没有兜底机制——rust/clippy 1.98 那次破功就是因为只靠人记得跑。
 
-156 项 = lib 单测 115 + bin 单测（CLI 形状）4 + 集成 37（core_loop 5 / m1_tools 8 / m2_session 6 / m4_bus 11 / sandbox_e2e 4 / wire_anthropic 2 / discipline 1）。计数以实跑为准，改测试时同步这一行：此前 README / design / 报告三处各写一个数（137 / 137 / 121），实跑只有 130，漂移本身记在 §9.19。总线测试需要真 UDS `bind`，在严格沙箱或容器里以 `EPERM` 失败，属环境限制而非回归。
+163 项 = lib 单测 121 + bin 单测（CLI 形状）4 + 集成 38（core_loop 5 / m1_tools 8 / m2_session 6 / m4_bus 12 / sandbox_e2e 4 / wire_anthropic 2 / discipline 1）。计数以实跑为准，改测试时同步这一行：此前 README / design / 报告三处各写一个数（137 / 137 / 121），实跑只有 130，漂移本身记在 §9.19。总线测试需要真 UDS `bind`，在严格沙箱或容器里以 `EPERM` 失败，属环境限制而非回归。
 
 ## 9 与 plan 的偏差（诚实台账）
 
@@ -154,10 +155,16 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
     ③ **RPC 不跨重连**：Response 的路由属于那条死连接，所以 `request` 在无连接时 fail fast，Request 帧也不进重放队列。同理，已经写进「随后死掉的 socket」的帧不重放——hub 可能已经处理过它，重复铃由 SA 侧 write-ahead 对账消化（§5 不变式 5），而不是靠总线猜「大概没送到」。审批批复因此可能因重连而迟到并被 worker 丢弃（`open` 已在回合结束时清空）——语义仍是超时 deny，不会变成静默放行。
     未做：跨 hub 进程重启的停车表恢复（停车只在一个 hub 生命周期内有效）、按 peer 的可靠投递确认。`run-demo.sh` 里等注册的那一拍仍然需要。
 
+22. **journal 快照/截断语义（2026-10-28）**：不变式 3 原话是「journal 永不截断」，实现上等于把一个只增不减的文件当成真相本体。现在拆开三件事：
+    ① `JournalRecord::Snapshot { covers, checkpoint }`——检查点折的是「到此刻为止的投影」：stage / iteration / 每 peer 花费 / **未结算的铃清单**。最后这项是关键：截断若丢掉 in_flight，一次「worker 写完工件但死在拉铃前」就会被 SA 误读成「从没派发过」而重烧一轮预算，正是 journal 要防的事。
+    ② `rotate(keep)` 把新于 `keep` 之外的前缀折成检查点并搬到归档段 `<stem>.seg<from>-<to>.jsonl`；段文件+活文件 = 完整历史（`replay_all()`），审计链不断。活文件的 `replay()` 里出现 Snapshot 时，折叠**从检查点重启**而不是继续累加，否则预算会被重复计一次。
+    ③ 轮转顺序即安全性：全程持住 append 锁 → 段落盘 fsync → 新活文件写 `.new` 并 fsync → `rename` 原子替换 → 通过已持有的 guard 换 fd（先放锁再换会有「写进旧 inode」的窗口）。**段名取「覆盖的记录区间」而不是计数器**，`covers` 因此是累计值：这样「段已写好、rename 前崩溃」后重试会覆盖同一个文件，而不是把同一段前缀归档第二份——后者会让 `replay_all` 把预算重复计一遍。测试：`a_crashed_rotation_is_retried_idempotently`（手工造出崩溃残留）与 `concurrent_appends_survive_rotation`（4 线程并发追加 × 40 轮 rotate，断言 40 条记录不重不丢、无 `.new` 残留）。
+    语义边界：**这不是删除**。段文件不自动清理，`session` 树仍完全不截断；`demo-sa --rotate-after-records` 默认 0（不轮转），因为阈值该由派发节奏定，不该由库猜。
+
 ## 10 二期清单
 
-已落地（2026-10-28）：~~`ApproveMode::Bus`~~（授权表 + 超时 fail-closed + journal 审计，§9.20）、~~SA 判定升级到「工件 + 证据文件」~~（绝对路径存在性/非空核对，§9.20）、~~bus 重连重放~~（离线 session 停车补投 + 客户端自动重连；RPC 与「写入即死」的帧不重放，§9.21）。
+已落地（2026-10-28）：~~`ApproveMode::Bus`~~（授权表 + 超时 fail-closed + journal 审计，§9.20）、~~SA 判定升级到「工件 + 证据文件」~~（绝对路径存在性/非空核对，§9.20）、~~bus 重连重放~~（离线 session 停车补投 + 客户端自动重连；RPC 与「写入即死」的帧不重放，§9.21）、~~journal 快照/截断语义~~（检查点 + 归档段 + 崩溃安全轮转，§9.22）。
 
-仍在清单上：tree-sitter-bash 命令解析、execpolicy DSL（Starlark）、landlock/bwrap（Linux 沙箱）、TUI（行级 diff 形制，pi-tui 蓝本）、openai-responses wire、MCP 客户端、model-in-the-loop evals、journal 快照/截断语义、多任务并行（peers 加 task 前缀）、审批批复的可靠投递（现在仍走 fire-and-forget Notify：批复迟到即被丢弃，等价于超时 deny）。
+仍在清单上：tree-sitter-bash 命令解析、execpolicy DSL（Starlark）、landlock/bwrap（Linux 沙箱）、TUI（行级 diff 形制，pi-tui 蓝本）、openai-responses wire、MCP 客户端、model-in-the-loop evals、多任务并行（peers 加 task 前缀）、审批批复的可靠投递（现在仍走 fire-and-forget Notify：批复迟到即被丢弃，等价于超时 deny）、journal 的**自动**轮转策略（`rotate` 已可用，`demo-sa --rotate-after-records` 默认关闭——长运行的阈值该由派发节奏决定，不由库猜）。
 
 新划出的两条边界：`BudgetSpent` 的价格表（有单价表之后 usd 才能真正按 token 结算，而不是 per-dispatch 名义值）；证据的类型化（`evidence` 从「路径存在」升级到「测试产物/截图按 stage 要求齐全」）。

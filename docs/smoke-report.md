@@ -9,10 +9,10 @@
 
 | 组 | 数量 | 覆盖 |
 |---|---|---|
-| 单测（lib） | 115 | wire 归一 / partial_json / retry / registry / 权限矩阵 / sbpl golden / session 树 / journal 对账 / 证据契约 / 审批授权表 |
+| 单测（lib） | 121 | wire 归一 / partial_json / retry / registry / 权限矩阵 / sbpl golden / session 树 / journal 对账与轮转 / 证据契约 / 审批授权表 |
 | 单测（bin：CLI 形状） | 4 | `--tools` 三态、`--approve` 三值（none / all / bus）、`--resume` 选择子、bus 模式保留 role 期限 |
-| 集成（core_loop 5 / m1_tools 8 / sandbox_e2e 4 / m2_session 6 / m4_bus 11 / wire_anthropic 2 / discipline 1） | 37 | 引擎验收 / 工具并发与审批超时 / 真实 Seatbelt / golden JSONL / 总线路由、审批往返、停车补投、重连重放与崩溃对账 |
-| 合计 | **156**，全部通过；`fmt --check` 与 `clippy -D warnings` 干净（本机实跑；本仓库不挂 CI，闸门靠人工每次执行） | |
+| 集成（core_loop 5 / m1_tools 8 / sandbox_e2e 4 / m2_session 6 / m4_bus 12 / wire_anthropic 2 / discipline 1） | 38 | 引擎验收 / 工具并发与审批超时 / 真实 Seatbelt / golden JSONL / 总线路由、审批往返、停车补投、重连重放、截断后巡检与崩溃对账 |
+| 合计 | **163**，全部通过；`fmt --check` 与 `clippy -D warnings` 干净（本机实跑；本仓库不挂 CI，闸门靠人工每次执行） | |
 
 > 计数以 2026-10-28 实跑为准。历史上这张表漂移过三次（101 → 121 → 137，实跑 130），
 > §8.3 里那句「137/137」也是其中之一——数字一旦需要人肉同步就会失真，而没有 CI 兜底，
@@ -194,6 +194,10 @@ assistant: [tool_use(c2)]             user: [tool_result(c2)]
 | 离线 session 停车补投 | `m4_bus::bells_for_an_offline_session_are_parked_and_redelivered_in_order` | worker 重启后按派发顺序收到两颗铃，sender 身份保留 |
 | 错地址不静默停车 | `m4_bus::never_registered_session_still_answers_error` | 从未注册的 session 立刻回 `unknown session` Error |
 | 断线重连与重放边界 | `m4_bus::dead_socket_reconnects_and_replays_only_unsent_frames` | 重连带 re-Hello；未送出的帧补发，已写入死 socket 的帧不补；RPC 立即失败 |
+| journal 截断不改变投影 | `journal::rotate_archives_the_prefix_without_changing_the_projection` + `m4_bus::rotation_does_not_hide_an_in_flight_bell` | 折叠活文件与折叠「段+活文件」给出同一 state / in_flight；预算不被重复计 |
+| 检查点自带未结算的铃 | `journal::rotate_keeps_unsettled_bells_reconcilable` | 全量轮转后（活文件只剩检查点）巡检仍看见那颗未回的铃 |
+| 轮转的崩溃安全顺序 | `journal::concurrent_appends_survive_rotation`（4 线程并发追加 × 40 轮 rotate） | 40 条记录不重不丢，无 `.new` 残留 |
+| 崩溃后重试的幂等性 | `journal::a_crashed_rotation_is_retried_idempotently` | 段名取覆盖区间：「段已写好、rename 前崩溃」的残留被同一个区间覆盖，预算不被重复计 |
 
 真端点侧的已知空洞：`--max-usd` 仍是 per-dispatch 名义值（无价格表），真实 token 现在只进
 `usage_reported` 记录，不参与停损判断。
