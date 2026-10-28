@@ -25,6 +25,7 @@ use crate::core::ops::{ApprovalDecision, Op};
 use crate::permissions::PermissionEngine;
 use crate::provider::anthropic::AnthropicWire;
 use crate::provider::openai_chat::OpenAiChatWire;
+use crate::provider::openai_responses::OpenAiResponsesWire;
 use crate::provider::retry::RetryTransport;
 use crate::provider::wire::{
     HttpTransport, ModelMeta, ResolvedAuth, StopReason, Usage, WireFormat, WireId,
@@ -94,6 +95,7 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let wire: Arc<dyn WireFormat> = match args.model.wire {
         WireId::AnthropicMessages => Arc::new(AnthropicWire),
         WireId::OpenAiCompletions => Arc::new(OpenAiChatWire),
+        WireId::OpenAiResponses => Arc::new(OpenAiResponsesWire),
     };
     let handle = AgentHandle::spawn(EngineConfig {
         provider: wire,

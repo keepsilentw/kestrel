@@ -13,6 +13,7 @@ use crate::core::id::{SystemClock, UuidGen};
 use crate::permissions::PermissionEngine;
 use crate::provider::anthropic::AnthropicWire;
 use crate::provider::openai_chat::OpenAiChatWire;
+use crate::provider::openai_responses::OpenAiResponsesWire;
 use crate::provider::retry::RetryTransport;
 use crate::provider::wire::{
     HttpTransport, ModelMeta, ResolvedAuth, StopReason, WireFormat, WireId,
@@ -49,6 +50,7 @@ pub async fn run_once(args: RunArgs) -> anyhow::Result<i32> {
     let wire: Arc<dyn WireFormat> = match model.wire {
         WireId::AnthropicMessages => Arc::new(AnthropicWire),
         WireId::OpenAiCompletions => Arc::new(OpenAiChatWire),
+        WireId::OpenAiResponses => Arc::new(OpenAiResponsesWire),
     };
 
     // Role config: from --role file, or permissive defaults for ad-hoc runs.

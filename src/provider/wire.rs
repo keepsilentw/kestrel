@@ -18,6 +18,12 @@ pub enum WireId {
     AnthropicMessages,
     #[serde(rename = "openai-completions")]
     OpenAiCompletions,
+    /// The OpenAI Responses API (`/v1/responses`, `response.*` SSE family).
+    /// A different wire from chat-completions, not a compat flag on it: the
+    /// request takes an `input` item list, tools are flat, and the terminal
+    /// event carries the usage.
+    #[serde(rename = "openai-responses")]
+    OpenAiResponses,
 }
 
 /// Price per million tokens (USD). Budget math lands in M4.
@@ -75,6 +81,7 @@ impl ModelMeta {
         match self.wire {
             WireId::AnthropicMessages => "anthropic-messages",
             WireId::OpenAiCompletions => "openai-completions",
+            WireId::OpenAiResponses => "openai-responses",
         }
     }
 

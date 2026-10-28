@@ -5,6 +5,7 @@ pub mod anthropic;
 pub mod config;
 pub mod faux;
 pub mod openai_chat;
+pub mod openai_responses;
 pub mod partial_json;
 pub mod retry;
 pub mod wire;

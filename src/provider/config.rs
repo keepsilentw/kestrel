@@ -201,6 +201,15 @@ id = "llama-x"
 max_tokens_field = "max_completion_tokens"
 tolerate_unknown_finish = true
 stream_include_usage = true
+
+# the third v1 wire: the Responses API is a different `api` value, not a flag
+[providers.oai-responses]
+base_url = "https://api.openai.com"
+api = "openai-responses"
+key = "sk-resp"
+
+[[providers.oai-responses.models]]
+id = "resp-model"
 "#
     }
 
@@ -252,6 +261,12 @@ stream_include_usage = true
         );
         assert_eq!(l.compat.tolerate_unknown_finish, Some(true));
         assert_eq!(l.compat.stream_include_usage, Some(true));
+        // `api = "openai-responses"` resolves to the Responses wire, and the
+        // session header string follows it
+        let rr = r.model_meta("oai-responses", "resp-model").unwrap();
+        assert_eq!(rr.wire, WireId::OpenAiResponses);
+        assert_eq!(rr.wire_id_str(), "openai-responses");
+        assert_eq!(rr.base_url, "https://api.openai.com");
     }
 
     #[test]
