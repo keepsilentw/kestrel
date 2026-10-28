@@ -9,11 +9,15 @@
 
 | 组 | 数量 | 覆盖 |
 |---|---|---|
-| 单测（lib） | 91 | wire 归一 / partial_json / retry / registry / 权限矩阵 / sbpl golden / session 树 / journal 对账 |
-| 集成（core_loop / m1_tools / sandbox_e2e / m2_session / m4_bus / wire_anthropic / discipline） | 30 | 引擎验收 / 工具并发 / 真实 Seatbelt / golden JSONL / 总线路由与崩溃对账 |
-| 合计 | **121**，全部通过；`fmt --check` 与 `clippy -D warnings` 干净 | |
+| 单测（lib） | 115 | wire 归一 / partial_json / retry / registry / 权限矩阵 / sbpl golden / session 树 / journal 对账 / 证据契约 / 审批授权表 |
+| 单测（bin：CLI 形状） | 4 | `--tools` 三态、`--approve` 三值（none / all / bus）、`--resume` 选择子、bus 模式保留 role 期限 |
+| 集成（core_loop 5 / m1_tools 8 / sandbox_e2e 4 / m2_session 6 / m4_bus 11 / wire_anthropic 2 / discipline 1） | 37 | 引擎验收 / 工具并发与审批超时 / 真实 Seatbelt / golden JSONL / 总线路由、审批往返、停车补投、重连重放与崩溃对账 |
+| 合计 | **156**，全部通过；`fmt --check` 与 `clippy -D warnings` 干净，三者已在 `.github/workflows/ci.yml`（ubuntu + macOS）执行 | |
 
-> 计数以 2026-09-17 实跑为准；此处原先记录的 101 项是早期修订，未随测试增补同步。
+> 计数以 2026-10-28 实跑为准。历史上这张表漂移过三次（101 → 121 → 137，实跑 130），
+> §8.3 里那句「137/137」也是其中之一——数字一旦需要人肉同步就会失真，现在由 CI 兜底，
+> 本行随 `cargo test` 输出更新（漂移记录见 design.md §9.19）。
+> 总线测试要真 UDS `bind`：在严格沙箱/容器内以 `EPERM` 失败，属环境限制而非回归。
 
 ## 2. 端点 smoke 结果
 
@@ -161,7 +165,7 @@ assistant: [tool_use(c2)]             user: [tool_result(c2)]
 
 ### 8.3 修复后回归
 
-- 自动化：137/137 通过（lib 102 + 集成 35；新增 resume/压缩可达、铃文本、判定解析、CLI flag 形状等回归）；`fmt --check` 与 `clippy -D warnings` 干净。
+- 自动化：130/130 通过（当时实跑计数；本报告原先写 137/137 与 lib 102 + 集成 35，属数字漂移，复核见 §1）；新增 resume/压缩可达、铃文本、判定解析、CLI flag 形状等回归；`fmt --check` 与 `clippy -D warnings` 干净。
 - 假端点：`--tools` 三态（缺省请求无 tools 字段 / `--tools` 带 / `--tools false` 不带）；`--resume last` 后请求历史从 1 条变 3 条；role 声明 `approve="all"` 时无需 CLI 即可走审批重试；缺文件错误带出文件名。
 - 常驻 worker：一次运行两个回合写进**同一个**会话文件，`compaction` 检查点落盘（`tokens_before` 658 → 1258，第二次带 `seed` 合并）。
 - 真端点：Qwen anthropic / Qwen openai 的 usage 记账不变；DeepSeek 两个并行 bash 调用仍成组收敛。
@@ -170,5 +174,25 @@ assistant: [tool_use(c2)]             user: [tool_result(c2)]
 ### 8.4 遗留
 
 1. 联跑是否绿取决于 worker 当次能否收敛；判定严格之后，失败路径（回派 → iter 上限 → 非零退出）是真实行为，不是回归缺陷。任务/提示词层面的收敛调优仍属 demo 打磨。
-2. `ApproveMode::Bus`（worker 把审批反向请求发给 SA/真人）未接线，worker 只能靠 role 预先声明 none/all 二值。
-3. SA 判定目前只吃 `result` 文字与 `aborted`/`stop`，还没核对工件里引用的证据文件是否真实存在。
+2. ~~`ApproveMode::Bus`（worker 把审批反向请求发给 SA/真人）未接线~~ —— 2026-10-28 接线（§9）：请求带 `tool`+`args`+命令，SA 按 `roles/sa.approvals.json` 判定，超时/断开由 worker deny。**尚未在真端点联跑里验证**（只过了单测与总线级 e2e）。
+3. ~~SA 判定只吃 `result` 文字与 `aborted`/`stop`~~ —— 2026-10-28 加了第三层：`serve` 从结论提绝对路径写进工件 `evidence`，SA 核对这些路径存在且非空（§9）。按类型核对证据（截图/测试产物）仍在清单上。
+
+## 9. 2026-10-28 二期开工：审批反向请求 + 证据层
+
+本轮没有新端点接入，两项能力在既有三端点之外验证（真端点联跑待人工执行 `harness/run-demo.sh`）：
+
+| 项 | 验证方式 | 结果 |
+|---|---|---|
+| `ApproveMode::Bus` 数据形状 | `tests/m4_bus.rs::approval_request_is_answered_by_the_sas_authority`：worker 发请求 → SA 用授权表判 → 回铃 → worker 解析 | 通过；非 `allow` 的回复一律读成 deny |
+| 审批超时 fail-closed | `tests/m1_tools.rs::bus_approval_without_answer_denies_on_deadline`：无审批者应答 | 120ms 期限到点回 is_error，回合不挂死 |
+| SA 授权表 | `sa_demo.rs::approval_authority_is_a_table_not_a_mood` | 显式 Allow 放行；Ask/Deny/空命令/无表全 deny |
+| 证据层 | `cli/evidence.rs` 6 项 + `converged_answer_without_checkable_evidence_is_fail` | 「PASS 但给不出文件」与「文件不在盘上」都判 fail 并回派 |
+| role 路径 `$VAR` 展开 | `config::role_paths_expand_env_references` | `$WT`、`$WT/sub`、`$MISSING:-fallback` 正确；未设且无 fallback 报出拼写 |
+| journal 审计扩展 | `records::approval_and_usage_records_are_audit_only` | 审批/用量记录不落进「在途铃」投影，回放不误判 |
+
+| 离线 session 停车补投 | `m4_bus::bells_for_an_offline_session_are_parked_and_redelivered_in_order` | worker 重启后按派发顺序收到两颗铃，sender 身份保留 |
+| 错地址不静默停车 | `m4_bus::never_registered_session_still_answers_error` | 从未注册的 session 立刻回 `unknown session` Error |
+| 断线重连与重放边界 | `m4_bus::dead_socket_reconnects_and_replays_only_unsent_frames` | 重连带 re-Hello；未送出的帧补发，已写入死 socket 的帧不补；RPC 立即失败 |
+
+真端点侧的已知空洞：`--max-usd` 仍是 per-dispatch 名义值（无价格表），真实 token 现在只进
+`usage_reported` 记录，不参与停损判断。

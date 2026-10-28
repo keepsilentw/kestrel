@@ -1,7 +1,8 @@
 # kestrel 设计文档：Rust harness kernel
 
-> 状态：M0-M4 已实现并通过测试（137/137，clippy `-D warnings` 干净）。
-> 实现规模：src 47 文件 9,337 行 + tests 8 文件 1,872 行（plan 预算 ~10-13k 行内）。
+> 状态：M0-M4 已实现并通过测试（156/156）；§10 二期已落地三项——`ApproveMode::Bus`、
+> 「判定 = 工件 + 证据文件」、bus 重连重放（停车补投 + 客户端重连）。质量闸门进 CI（`.github/workflows/ci.yml`，ubuntu + macOS）。
+> 实现规模：src 48 文件 10,308 行 + tests 8 文件 2,025 行（plan 预算 ~10-13k 行内）。
 > 输入：实现规划（plan.md）与调研语料（codex / pi study notes、三方资料库 references.md）——均为开发过程资料，未随本仓库发布。
 > 本文沉淀实现后的最终设计；与 plan 的偏差在 §9 逐条记录。
 
@@ -61,7 +62,7 @@ flowchart TD
 实现强制的不变式（都有测试背书）：
 
 1. **取消三件套**：每个 await 过 `or_cancel`；`tokio::spawn` 必须包 `AbortOnDropHandle`（`tests/discipline.rs` 静态闸门，fire-and-forget/managed 两类豁免标记）；`ResponseStream` drop 通知上游。
-2. **fail-closed**：tokenizer 解析不了 → Ask；未设角色/无策略 → Ask 或 Deny；QA 写范围为零。
+2. **fail-closed**：tokenizer 解析不了 → Ask；未设角色/无策略 → Ask 或 Deny；QA 写范围为零；审批者沉默、回复不可解析、或 SA 没有授权表 → Deny（`approve_timeout_secs`，默认 120s）。
 3. **只追加**：session 与 journal 永不截断；回滚/恢复 = 重放；半写容忍（残行 skip）。
 4. **sender identity**：Hello 声明 + 帧内 sender 强一致；伪装者断连；bus 来源 item 渲染带 `<bell from>` 标注。
 5. **journal 是真相**：StageWritten → BellSent → notify 的调用序强制 write-ahead；state 投影从 journal 重生成。
@@ -69,6 +70,14 @@ flowchart TD
 ## 5 安全模型
 
 双层：策略层（JSON 三态前缀表，policy = 数据，决策 Allow/Ask/Deny；`all_segments_explicitly_allowed` 才允许免沙箱）× OS 层（Seatbelt `(deny default)` + 参数化 writable_roots + 祖先 `file-write-unlink` 防 rename 逃逸 + 网络全禁仅留 loopback proxy）。沙箱失败经 exit 2/126/127/SIGSYS/stderr 特征判定 → ApprovalRequest → 批准后脱沙箱重试一次。**诚实边界**：v1 威胁模型是防手滑防漂移（同机同用户），命令解析是保守 word-only（`&&`/管道分段评估，其余结构一律判失败），不防恶意。
+
+审批的第三种落点（`ApproveMode::Bus`，§10 二期首项）：Ask 不再只有「预先 all / 预先 none」两个答案，worker 可以把请求发给一个审批 peer。三个约束让它不会变成后门：
+
+1. **请求带数据不带心情**：`approval_request` 帧携带 `tool` + `args` + 可判定的 `command`（`approval_detail` 把工具名与参数折进载荷），审批者判的是命令行本身，不是一段措辞。
+2. **审批者的权力也是一张表**：SA 用 `roles/sa.approvals.json`（与 role policy 同格式的三态前缀表）判定，只有显式 Allow 放行；Ask/Deny/命令为空/没有表 → deny。协调者不能放宽角色策略里没写过的东西。
+3. **沉默 = 拒绝**：`approve_timeout_secs`（默认 120s）到点由 worker 自己 deny，审批不会把回合挂死；总线断开时立刻 deny 全部在途请求，不在死 socket 上空转。
+
+`-p` 单发模式没有总线可问，声明 `approve = "bus"` 启动即报错（不静默降级成 none）。审批的两个动作都进 journal（`approval_requested` → `approval_decided`，先写盘再回铃），所以「谁把沙箱放宽了」在崩溃后仍可复现——不变式 5 对安全事件的延伸。
 
 ## 6 配置与多后端
 
@@ -82,7 +91,11 @@ flowchart TD
 
 每角色一个 TOML = 「一角色一后端」：SA→qwen3.8-max、RD→deepseek-v4-flash、QA→glm-5.3-flash（示例见 `harness/roles/`）。对照 CC 方案（harness-v3 §6.2 的 settings 优先级对抗 + 钉全集仪式）此处 provider 归属在类型层唯一，无需仪式。
 
-工具审批走同一条优先级链：`--approve all|none`（runtime）> role 的 `[permissions].approve` > `none`（拒绝，fail-closed）。此前 `serve` 硬编码 HeadlessDeny，worker 永远走不到「沙箱拒绝 → 审批 → 脱沙箱重试」这条回路；现在 role 可以自己声明（QA 保持默认拒绝 = 写范围为零的纪律不变，RD 也一样默认拒绝，只是不再是代码写死）。`ApproveMode::Bus`（把审批反向请求发给 SA/真人）仍是二期。
+工具审批走同一条优先级链：`--approve all|none|bus`（runtime）> role 的 `[permissions].approve` > `none`（拒绝，fail-closed）。此前 `serve` 硬编码 HeadlessDeny，worker 永远走不到「沙箱拒绝 → 审批 → 脱沙箱重试」这条回路；现在 role 可以声明三态（demo 里 RD = `bus` 且 `approver = "harness-sa"`，QA 保持缺省拒绝）。runtime 只覆盖**模式**，不覆盖 role 声明的 `approve_timeout_secs`（`with_role_deadline`）——一个 CLI flag 不该顺手把审批等待改成无限。
+
+role 文件的路径字段（`write_roots`/`read_only_islands`/`policy_file`/`prompt_file`）支持 `$VAR` 与 `$VAR:-fallback`：role 是共享文件，把某台机器的绝对路径钉进 `write_roots` 等于把沙箱写范围钉死在那台机器上（demo 的 worktree 由 `run-demo.sh` 导出 `KESTREL_WORKTREE`，于是 SA 广播的 `ref` 与 RD 能写的目录同源）。变量未设且无 fallback 是**带拼写的硬错误**——静默丢掉一个写根会悄悄改变沙箱边界。
+
+预算不写进 role：`[budget].max_usd` 曾在三份 role 里各有一份，而代码中没有任何读者——花钱的上限由 SA 的 journal 账本执行（`demo-sa --max-usd`），单点权威，与「provider 归属唯一」是同一条理由。
 
 会话归属：`-p` 一次调用一个 append-only 树，默认新建，`--resume last|<id>|<path>` 续接；`serve` 一个 worker 一棵树 + 一个常驻引擎——每颗门铃是同一棵树上的下一个回合，因此历史、read-before-edit 台账与压缩检查点跨派发存活（`AgentHandle::spawn` 从树上重建 history/history_ids，并把 ctx_tokens 预置为重建上下文的估算值，否则恢复出的大会话要先采样一次才可能触发压缩）。
 
@@ -100,7 +113,9 @@ flowchart TD
 
 ## 8 测试策略
 
-faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_request` 纯函数）→ 零真 key 覆盖全部验收；三层测试（单元/组件 golden/e2e）；determinism 经 `IdGen`/`Clock` 注入；沙箱 e2e 仅 macOS（`#[cfg(target_os="macos")]`）；闸门 = `cargo fmt --check` + `clippy -D warnings` + 全测试。
+faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_request` 纯函数）→ 零真 key 覆盖全部验收；三层测试（单元/组件 golden/e2e）；determinism 经 `IdGen`/`Clock` 注入；沙箱 e2e 仅 macOS（`#[cfg(target_os="macos")]`）；闸门 = `cargo fmt --check` + `clippy -D warnings` + 全测试，2026-10-28 起由 `.github/workflows/ci.yml` 在 ubuntu + macOS 两个 runner 上执行（此前闸门只靠人工，1.98 那次 clippy 破功就是这么漏掉的）。
+
+156 项 = lib 单测 115 + bin 单测（CLI 形状）4 + 集成 37（core_loop 5 / m1_tools 8 / m2_session 6 / m4_bus 11 / sandbox_e2e 4 / wire_anthropic 2 / discipline 1）。计数以实跑为准，改测试时同步这一行：此前 README / design / 报告三处各写一个数（137 / 137 / 121），实跑只有 130，漂移本身记在 §9.19。总线测试需要真 UDS `bind`，在严格沙箱或容器里以 `EPERM` 失败，属环境限制而非回归。
 
 ## 9 与 plan 的偏差（诚实台账）
 
@@ -129,8 +144,20 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
 17. **联跑的计时与预算假设过期（2026-10-26）**：SA 原先硬编码 180s 等回铃、2.0 USD 预算，二者都是「一次派发 = 一次冷引擎」时代的数字。常驻引擎 + 8 轮工具回合 + 真网关（BigModel 单轮实测 48-77s）下 180s 必然误判为「铃丢了」；一次诚实回派也会直接触顶。改为 `--bell-timeout-secs`（默认 300）与 `--max-usd`（默认 6.0 = 4 stage × 3 iter × 0.5，让预算覆盖声明的重试策略），run-demo.sh 可用 `KESTREL_DEMO_BELL_TIMEOUT` / `KESTREL_DEMO_MAX_USD` 覆盖。
 18. **判定变严之后，demo 自身的矛盾才暴露（2026-10-26）**：① 角色 prompt 要求 RD/QA「把结果写进 artifacts」，可 RD 的写范围只有 worktree、QA 写范围为零——它们每轮都在撞自己角色的墙；结论改为「文字回答，由 `serve` 落成工件」。② QA 没有目录发现手段（策略只放 `ls`/`rg`/`cat`/`cargo`/`python3 -m`），又没有 RD 产出清单，只能猜文件名，三轮都只能回「证据不足」；因此 RD 的 `DONE` 必须逐条列出新建/修改的绝对路径与测试入口，QA 按清单取证（读 RD 工件 → 按路径读源码 → 单条已允许的命令执行），并且 `python3 -m` 进入两侧允许表（此前 QA 的允许表里没有测试运行器，`test` stage 在结构上不可能拿到执行证据）。③ 命令拼接纪律：`&&`/管道分段求值，任一段不在允许表里整条被拒——prompt 里写明用单条命令，避免把策略失败读成实现失败。这三条都不是内核缺陷，但只有先把 SA 判定做实，它们才会被看见（此前「工件存在即 pass」把它们全盖住了）。
 
+19. **文档与配置的漂移（2026-10-28 修正）**：① 测试数三处不一致——README/design 写 137、报告写 121、实跑 130；② README 的规模拆解（wire ~1.5k、总线+journal ~1.5k）与实测（provider 2.58k、bus+journal 1.08k）不符；③ journal 的 `budget_spent` 记 `usage: 0` 却写 `usd: 0.5`，读起来像按 token 计费，实际是 `per_dispatch_usd` 的固定名义扣费——口径改为「fixture 名义停损」，真实 token 由结果铃带回并另记 `usage_reported`；④ 三份 role 的 `[budget].max_usd` 没有任何读者，删除；⑤ RD 的 `write_roots` 硬编码 `/tmp/kestrel-worktree`，改为 `$KESTREL_WORKTREE:-…`；⑥ 没有 CI，1.98 那次 clippy 破功（§9.15）只有人肉跑闸门才看得见——补 `ci.yml`（ubuntu + macOS）。数字与配置写错的代价不是难看，而是让人不再核对它们。
+
+20. **二期开工：审批反向请求 + 证据层（2026-10-28）**：`ApproveMode::Bus` 落地（§5）。三个关键取舍：请求载荷必须带 `tool` + `args`（`approval_detail`），否则审批者只能对措辞表态；审批者自己的权力也来自一张三态前缀表（`roles/sa.approvals.json`，只有显式 Allow 放行）；`Waited::TimedOut` 与总线断开都由 worker 侧 deny——一期的 `Bus` 分支是无期限等待，一个不答的 SA 能把 worker 的回合永久挂住，这本身就是可用性缺陷。SA 判定加第三层「证据核对」（`cli/evidence.rs`）：`serve` 从结论取绝对路径（优先机器可读的 `evidence:` 行）写进工件，`verdict_from_artifact` **只在 worker 声称收敛时**核对这些路径存在且非空，FAIL 不额外举证——证据层是为了防止「把 verify 说成通过」，不是给拒绝增加文书工作。同时 `serve` 在回合结束清空在途请求，迟到的批复不会被下一个回合误读。尚未做：按文件类型核对证据（截图/测试产物）、`-p` 模式的本地审批通道。审批请求与批复都是 Notify，跨断线投递由 §9.21 负责，但迟到的批复仍被 worker 丢弃——语义停在超时 deny，不会变成静默放行。
+
+21. **bus 重连重放（2026-10-28，部分落地）**：总线原先「断线即静默丢帧」，`serve` 还会因 `recv_notify` 报错而退出——hub 重启 = 整个拓扑报废。现在三件事分开处理：
+    ① hub 断线只清连接表，**保留 session 归属**，于是「注册过但不在线」与「从未注册」可区分：前者的 Notify 进停车队列（每 session 32 帧、全局 256 帧，drop-oldest 并 warn），重新 Hello 时按序补投；后者仍立刻回 `unknown session` Error——把拼错的 session 名静默停车等于让铃永远没人听见。
+    ② 客户端 `recv_notify` 自动重连（100ms 起指数退避，单窗口 10s），`Drop` 显式 abort 两个 pump 任务，让 hub 立即看到 EOF 并开始停车；worker 不再因 hub 重启而退出。
+    ③ **RPC 不跨重连**：Response 的路由属于那条死连接，所以 `request` 在无连接时 fail fast，Request 帧也不进重放队列。同理，已经写进「随后死掉的 socket」的帧不重放——hub 可能已经处理过它，重复铃由 SA 侧 write-ahead 对账消化（§5 不变式 5），而不是靠总线猜「大概没送到」。审批批复因此可能因重连而迟到并被 worker 丢弃（`open` 已在回合结束时清空）——语义仍是超时 deny，不会变成静默放行。
+    未做：跨 hub 进程重启的停车表恢复（停车只在一个 hub 生命周期内有效）、按 peer 的可靠投递确认。`run-demo.sh` 里等注册的那一拍仍然需要。
+
 ## 10 二期清单
 
-tree-sitter-bash 命令解析、execpolicy DSL（Starlark）、landlock/bwrap（Linux）、TUI（行级 diff 形制，pi-tui 蓝本）、openai-responses wire、MCP 客户端、model-in-the-loop evals、journal 快照/截断语义、bus 重连重放、多任务并行（peers 加 task 前缀）。
+已落地（2026-10-28）：~~`ApproveMode::Bus`~~（授权表 + 超时 fail-closed + journal 审计，§9.20）、~~SA 判定升级到「工件 + 证据文件」~~（绝对路径存在性/非空核对，§9.20）、~~bus 重连重放~~（离线 session 停车补投 + 客户端自动重连；RPC 与「写入即死」的帧不重放，§9.21）。
 
-另加两条本次复盘划出的边界：`ApproveMode::Bus`（worker 把审批反向请求发给 SA/真人，而不是靠 role 预先声明 none/all 二值）；SA 判定从「工件文字」升级到「工件 + 证据文件」（截图/测试产物路径核对），当前 `verdict_from_artifact` 只做到不放过空答案。
+仍在清单上：tree-sitter-bash 命令解析、execpolicy DSL（Starlark）、landlock/bwrap（Linux 沙箱）、TUI（行级 diff 形制，pi-tui 蓝本）、openai-responses wire、MCP 客户端、model-in-the-loop evals、journal 快照/截断语义、多任务并行（peers 加 task 前缀）、审批批复的可靠投递（现在仍走 fire-and-forget Notify：批复迟到即被丢弃，等价于超时 deny）。
+
+新划出的两条边界：`BudgetSpent` 的价格表（有单价表之后 usd 才能真正按 token 结算，而不是 per-dispatch 名义值）；证据的类型化（`evidence` 从「路径存在」升级到「测试产物/截图按 stage 要求齐全」）。
