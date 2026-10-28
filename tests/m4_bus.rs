@@ -575,3 +575,58 @@ async fn read_one_frame(
     sock.read_exact(&mut body).await?;
     decode_envelope(&body)
 }
+
+/// 多任务并行：一个 hub 上并存两条 pipeline。session 名带 task 前缀即可路由互不
+/// 串台；task id 随铃走，工件名由两端共用的 `cli::task` 算出，所以同一个 worker
+/// 名下的两个 task 不会写进同一个文件。第三条没注册过的 pipeline 仍然报错。
+#[tokio::test]
+async fn two_pipelines_share_one_hub_without_cross_talk() {
+    use kestrel::cli::task::artifact_name;
+
+    let path = temp_bus("multitask");
+    let hub = BusHub::bind(&path).unwrap();
+    let _ = hub;
+    let t1 = BusClient::connect(&path, "t1:harness-rd", Some("t1:harness-rd"))
+        .await
+        .unwrap();
+    let t2 = BusClient::connect(&path, "t2:harness-rd", Some("t2:harness-rd"))
+        .await
+        .unwrap();
+    let sa = BusClient::connect(&path, "harness-sa", None).await.unwrap();
+
+    for (addr, id) in [("t1:harness-rd", "t1"), ("t2:harness-rd", "t2")] {
+        sa.notify(
+            addr,
+            json!({ "role": "rd", "stage": "dev", "iteration": 1, "task": "build it", "task_id": id }),
+        );
+    }
+    let a = tokio::time::timeout(Duration::from_secs(2), t1.recv_notify())
+        .await
+        .expect("pipeline 1 got no bell")
+        .unwrap();
+    let b = tokio::time::timeout(Duration::from_secs(2), t2.recv_notify())
+        .await
+        .expect("pipeline 2 got no bell")
+        .unwrap();
+    assert_eq!(a.payload["task_id"], "t1", "no cross-talk");
+    assert_eq!(b.payload["task_id"], "t2");
+    assert_eq!(a.route.session, "t1:harness-rd");
+
+    // the artifact contract: same worker role, same stage, same iteration,
+    // two tasks -> two different files (this is what used to collide)
+    assert_ne!(
+        artifact_name("t1:harness-rd", "t1", "dev", 1),
+        artifact_name("t2:harness-rd", "t2", "dev", 1)
+    );
+    let single = artifact_name("harness-rd", "demo", "dev", 1);
+    assert_eq!(single, "harness-rd-demo-dev-iter1.json");
+
+    // an address nobody registered is still an error, not a silent park
+    sa.notify("t3:harness-rd", json!({ "task_id": "t3" }));
+    let err = tokio::time::timeout(Duration::from_secs(2), sa.recv_notify())
+        .await
+        .expect("no error frame for the unknown pipeline")
+        .unwrap();
+    assert_eq!(err.kind, FrameKind::Error);
+    assert_eq!(err.payload["error"], "unknown session");
+}

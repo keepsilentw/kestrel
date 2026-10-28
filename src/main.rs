@@ -154,10 +154,26 @@ struct DemoSaCmd {
     approvals: Option<PathBuf>,
 
     /// Fold the journal into a checkpoint once the live file holds this many
-    /// records (the older prefix moves to `<journal>.seg<N>.jsonl`, never
+    /// records (the older prefix moves to `<journal>.seg<from>-<to>.jsonl`, never
     /// deleted). 0 keeps the original single-file, never-truncated behaviour.
     #[arg(long, default_value_t = 0)]
     rotate_after_records: usize,
+
+    /// Task namespace: stamped into every journal record, every bell and every
+    /// artifact name, so several `demo-sa` processes can share one hub without
+    /// reading each other's results. Keep it unique per pipeline.
+    #[arg(long, default_value = "demo")]
+    task_id: String,
+
+    /// Peer the dev stage is dispatched to. A second pipeline points this at its
+    /// own worker, e.g. `--rd-peer t2:harness-rd` with `serve --session
+    /// t2:harness-rd`.
+    #[arg(long, default_value = "harness-rd")]
+    rd_peer: String,
+
+    /// Peer the review/test/build stages are dispatched to.
+    #[arg(long, default_value = "harness-qa")]
+    qa_peer: String,
 }
 
 #[derive(Args, Debug)]
@@ -219,6 +235,9 @@ async fn main() -> anyhow::Result<()> {
                 worktree: d.worktree,
                 approvals: d.approvals,
                 rotate_after: d.rotate_after_records,
+                task_id: d.task_id,
+                rd_peer: d.rd_peer,
+                qa_peer: d.qa_peer,
             })
             .await;
         }

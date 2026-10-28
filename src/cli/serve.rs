@@ -16,6 +16,7 @@ use serde_json::Value;
 use crate::bus::frame::{Envelope, FrameKind};
 use crate::bus::rpc::BusClient;
 use crate::cli::evidence::evidence_from_answer;
+use crate::cli::task::{artifact_name, task_of};
 use crate::config::RoleConfig;
 use crate::core::actor::{AgentHandle, EngineConfig};
 use crate::core::events::{Event, EventMsg, MessageItem};
@@ -132,6 +133,9 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         let sender = bell.sender.clone();
         let iteration = bell.payload["iteration"].as_u64().unwrap_or(0);
         let task = bell_prompt(&bell.payload);
+        // 一条 worker 可以被多条 pipeline 共用（单活跃槽 = 串行），所以 task id 必须
+        // 一路带到工件名与结果铃里，否则两个 task 会写同一个文件、SA 会认错回执。
+        let task_id = task_of(&bell.payload);
         let approver = approver_override.clone().unwrap_or_else(|| sender.clone());
 
         // 注入面防线: bell 以带来源标注的 item 进入 prompt（acceptance 4）。
@@ -258,14 +262,16 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         }
 
         // Write the result artifact (SA 巡检读盘为准), then ring the result.
-        // The name is the SA's disk-polling contract: {session}-{stage}-iter{n}.json
-        // — demo-sa reconstructs exactly this path, so both ends must agree.
+        // The name comes from `cli::task::artifact_name` — the SAME function the
+        // SA uses to look it up, because the two ends agreeing by eye is exactly
+        // how a stage once passed on a file nobody was reading (design §9.11④).
         let stage = bell.payload["stage"].as_str().unwrap_or("unknown");
-        let artifact = args
-            .artifacts_dir
-            .join(format!("{}-{}-iter{}.json", args.session, stage, iteration));
+        let artifact =
+            args.artifacts_dir
+                .join(artifact_name(&args.session, &task_id, stage, iteration));
         let artifact_json = serde_json::json!({
             "session": args.session,
+            "task_id": task_id,
             "stage": bell.payload["stage"],
             "iteration": iteration,
             "aborted": aborted,
@@ -283,6 +289,7 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             &sender,
             serde_json::json!({
                 "role": args.session,
+                "task_id": task_id,
                 "stage": bell.payload["stage"],
                 "iteration": iteration,
                 "usage": usage,
@@ -348,6 +355,11 @@ pub fn bell_prompt(payload: &serde_json::Value) -> String {
         .or_else(|| payload["ref"]["task"].as_str())
         .unwrap_or("(no task text in bell; see ref on disk)");
     let mut out = String::from(task);
+    // 谁在派这活：一个 worker 串行服务多条 pipeline 时，task id 是唯一的区分线索
+    if let Some(id) = payload["task_id"].as_str().filter(|t| !t.trim().is_empty()) {
+        out.push_str("\ntask id: ");
+        out.push_str(id);
+    }
     if let Some(check) = payload["check"].as_str() {
         out.push_str("\ncheck: ");
         out.push_str(check);

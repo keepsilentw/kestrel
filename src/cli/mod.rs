@@ -6,3 +6,4 @@ pub mod hub;
 pub mod run;
 pub mod sa_demo;
 pub mod serve;
+pub mod task;

@@ -11,6 +11,7 @@ use crate::bus::frame::Envelope;
 use crate::bus::rpc::BusClient;
 use crate::cli::evidence::{check_evidence, evidence_from_answer};
 use crate::cli::serve::{approval_command, decision_name};
+use crate::cli::task::artifact_path;
 use crate::core::ops::ApprovalDecision;
 use crate::journal::Journal;
 use crate::journal::records::{JournalRecord, Stage, ThinBell, Verdict, reconcile};
@@ -40,10 +41,30 @@ pub struct DemoSaArgs {
     pub approvals: Option<PathBuf>,
     /// Journal truncation threshold (design §10 快照/截断语义): once the live
     /// file holds this many records, everything older than half of it is folded
-    /// into a checkpoint and archived into `<journal>.seg<N>.jsonl`. 0 = never
+    /// into a checkpoint and archived into `<journal>.seg<from>-<to>.jsonl`. 0 = never
     /// rotate, which is the default: the journal stays one file until somebody
     /// decides a long run needs the bounded replay.
     pub rotate_after: usize,
+    /// Task namespace for this pipeline: it stamps every journal record, every
+    /// bell, and — through `cli::task` — the artifact names both ends agree on.
+    /// Two `demo-sa` processes with different ids can share one hub.
+    pub task_id: String,
+    /// Peer the dev stage is dispatched to (a second pipeline points this at its
+    /// own worker, e.g. `--rd-peer t2:harness-rd`).
+    pub rd_peer: String,
+    /// Peer the review/test/build stages are dispatched to.
+    pub qa_peer: String,
+}
+
+impl DemoSaArgs {
+    /// Which peer serves a stage. Absent a prefix, all pipelines talk to the
+    /// same `harness-rd` / `harness-qa` — the single-task demo behaviour.
+    pub fn peer_for(&self, stage: Stage) -> &str {
+        match stage {
+            Stage::Dev => &self.rd_peer,
+            _ => &self.qa_peer,
+        }
+    }
 }
 
 /// 一个 stage 的派发结果：收敛（pass）。
@@ -66,10 +87,7 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
     let stages = [Stage::Dev, Stage::Review, Stage::Test, Stage::Build];
 
     for stage in stages {
-        let target = match stage {
-            Stage::Dev => "harness-rd",
-            _ => "harness-qa",
-        };
+        let target = args.peer_for(stage);
         let stage_name = format!("{stage:?}").to_lowercase();
         let mut iter = 1u64;
 
@@ -90,7 +108,7 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
 
             // --- 先写盘，再拉铃（规则 1：顺序即纪律）。
             journal.append(&JournalRecord::StageWritten {
-                task: "demo".into(),
+                task: args.task_id.clone(),
                 stage,
                 iteration: iter,
             })?;
@@ -106,7 +124,7 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
                 }),
             };
             journal.append(&JournalRecord::BellSent {
-                task: "demo".into(),
+                task: args.task_id.clone(),
                 to: target.into(),
                 bell: bell.clone(),
             })?;
@@ -124,6 +142,7 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
                 serde_json::json!({
                     "role": bell.role, "stage": stage_name,
                     "iteration": iter, "task": args.task, "ref": bell.r#ref,
+                    "task_id": args.task_id,
                 }),
             );
 
@@ -139,7 +158,7 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
                 }
                 match tokio::time::timeout(deadline - now, sa.recv_notify()).await {
                     Ok(Ok(env)) if env.payload["type"].as_str() == Some("approval_request") => {
-                        answer_approval(&journal, &sa, authority.as_ref(), &env)?;
+                        answer_approval(&journal, &sa, authority.as_ref(), &env, &args.task_id)?;
                     }
                     Ok(Ok(env)) => break Some(env),
                     Ok(Err(e)) => {
@@ -149,14 +168,14 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
                     Err(_) => break None,
                 }
             };
-            let artifact = args
-                .artifacts
-                .join(format!("{target}-{stage_name}-iter{iter}.json"));
+            // 命名走 cli::task 里唯一的一份契约：worker 写哪个文件与 SA 找哪个文件
+            // 必须由同一个函数算出（§9.11④ 的教训正是两端各拼一遍 format!）。
+            let artifact = artifact_path(&args.artifacts, target, &args.task_id, &stage_name, iter);
 
             match result {
                 Some(env) if env.payload["result_ref"].is_string() => {
                     journal.append(&JournalRecord::BellReceived {
-                        task: "demo".into(),
+                        task: args.task_id.clone(),
                         from: env.sender.clone(),
                         bell: bell.clone(),
                     })?;
@@ -200,7 +219,7 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
             // 不等于 stage 收敛——空结果、abort、worker 侧 stop=error 都是 fail。
             let verdict = verdict_from_artifact(&artifact);
             journal.append(&JournalRecord::ResultCommitted {
-                task: "demo".into(),
+                task: args.task_id.clone(),
                 stage,
                 verdict: verdict.clone(),
             })?;
@@ -241,6 +260,7 @@ fn answer_approval(
     sa: &BusClient,
     authority: Option<&PermissionEngine>,
     env: &Envelope,
+    task: &str,
 ) -> anyhow::Result<()> {
     let req = env.payload["req"].as_str().unwrap_or_default().to_string();
     let worker = env.payload["session"]
@@ -254,7 +274,7 @@ fn answer_approval(
         None => approval_command(&env.payload["detail"]),
     };
     journal.append(&JournalRecord::ApprovalRequested {
-        task: "demo".into(),
+        task: task.into(),
         peer: worker.clone(),
         req: req.clone(),
         command: command.clone(),
@@ -427,6 +447,58 @@ fn parse_verdict(result: &str) -> WorkerVerdict {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// task id 是 journal 记录、门铃、工件名三处**同源**的命名空间；peer 由 stage
+    /// 决定并可被第二条 pipeline 改写。§9.11④ 的 bug 正是这三处各拼一遍 format!。
+    #[test]
+    fn task_namespace_and_peer_wiring() {
+        use crate::cli::task::DEFAULT_TASK;
+        let args = DemoSaArgs {
+            bus_socket: PathBuf::from("/tmp/bus.sock"),
+            task: "demo: 实现一个 LRU cache".into(),
+            journal: PathBuf::from("/tmp/journal.jsonl"),
+            artifacts: PathBuf::from("/tmp/artifacts"),
+            per_dispatch_usd: 0.5,
+            max_usd: 6.0,
+            max_iterations: 3,
+            bell_timeout: Duration::from_secs(300),
+            worktree: None,
+            approvals: None,
+            rotate_after: 0,
+            task_id: "demo".into(),
+            rd_peer: "harness-rd".into(),
+            qa_peer: "harness-qa".into(),
+        };
+        assert_eq!(args.peer_for(Stage::Dev), "harness-rd");
+        assert_eq!(args.peer_for(Stage::Build), "harness-qa");
+
+        // 第二条 pipeline：自己的 peer 前缀 + 自己的 task id => 自己的工件
+        let second = DemoSaArgs {
+            task_id: "t2".into(),
+            rd_peer: "t2:harness-rd".into(),
+            ..args
+        };
+        let first_name = artifact_path(&PathBuf::from("/a"), "harness-rd", "demo", "dev", 1);
+        let second_name = artifact_path(
+            &PathBuf::from("/a"),
+            second.peer_for(Stage::Dev),
+            &second.task_id,
+            "dev",
+            1,
+        );
+        assert_ne!(first_name, second_name, "two pipelines never share a file");
+        assert_eq!(
+            second_name.file_name().unwrap().to_str().unwrap(),
+            "t2-harness-rd-t2-dev-iter1.json"
+        );
+        // a bell that carries no task id lands in the default namespace
+        assert_eq!(
+            artifact_path(&PathBuf::from("/a"), "harness-rd", DEFAULT_TASK, "dev", 2)
+                .file_name()
+                .unwrap(),
+            "harness-rd-default-dev-iter2.json"
+        );
+    }
 
     fn write_artifact(name: &str, body: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("kestrel-verdict-{}", std::process::id()));
