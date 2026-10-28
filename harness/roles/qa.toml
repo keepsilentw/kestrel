@@ -17,6 +17,5 @@ read_only_islands = []
 
 [permissions.sandbox]
 network = "none"
-
-[budget]
-max_usd = 1.5
+# 预算由 SA 的 journal 账本统一停损（`--max-usd`）；role 里的 max_usd 没人读。
+# QA 保持 approve 缺省 = 拒绝：写范围为零的纪律不因「能请求审批」而放宽。

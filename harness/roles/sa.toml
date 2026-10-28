@@ -17,6 +17,6 @@ read_only_islands = []
 
 [permissions.sandbox]
 network = "none"
-
-[budget]
-max_usd = 5.0
+# SA 才是记账的人：`demo-sa --max-usd` 上限、journal 账本停损都由它执行。
+# 它的审批授权表是 roles/sa.approvals.json（`demo-sa --approvals`），与这里的
+# policy_file 分开：那份管 SA 自己能做什么，这份管它允许别人做什么。

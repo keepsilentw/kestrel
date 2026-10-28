@@ -67,6 +67,31 @@ pub enum JournalRecord {
         usage: crate::provider::wire::Usage,
         usd: f64,
     },
+    /// An approval reverse-request the SA answered for a worker
+    /// (`ApproveMode::Bus`). Appended BEFORE the reply is sent: who widened a
+    /// sandbox is audit trail, not an afterthought (design §5 不变式 5).
+    ApprovalRequested {
+        task: TaskId,
+        peer: String,
+        req: String,
+        /// The command the worker wanted to run; empty when the request did
+        /// not carry one (then the SA has nothing to decide on).
+        command: String,
+    },
+    ApprovalDecided {
+        req: String,
+        /// `"allow"` | `"deny"` — anything else is a deny upstream.
+        decision: String,
+        by: String,
+    },
+    /// Token usage as reported by the worker. `BudgetSpent.usd` is a nominal
+    /// per-dispatch fixture charge (no pricing table yet); this record is the
+    /// measurement, so the ledger no longer implies a cost model it does not
+    /// have.
+    UsageReported {
+        peer: String,
+        usage: crate::provider::wire::Usage,
+    },
 }
 
 /// State projection rebuilt from the journal (state.json 的内容来源).
@@ -133,6 +158,11 @@ pub fn reconcile(records: &[JournalRecord]) -> ReconcileReport {
             JournalRecord::BudgetSpent { peer, usd, .. } => {
                 *spent.entry(peer.clone()).or_insert(0.0) += usd;
             }
+            // Approvals and usage are audit records: they never move the stage
+            // projection, and a replay must not count them as bells.
+            JournalRecord::ApprovalRequested { .. }
+            | JournalRecord::ApprovalDecided { .. }
+            | JournalRecord::UsageReported { .. } => {}
         }
     }
     // settle bells whose (role, stage, iteration) has a matching receipt
@@ -218,6 +248,48 @@ mod tests {
         let rep = reconcile(&records);
         assert_eq!(rep.in_flight.len(), 1);
         assert_eq!(rep.state.iteration, 2);
+    }
+
+    /// Approval and usage records are audit trail: they roundtrip through the
+    /// wire format and never settle a bell, so a replay cannot mistake a
+    /// decision for a worker receipt.
+    #[test]
+    fn approval_and_usage_records_are_audit_only() {
+        let records = vec![
+            JournalRecord::BellSent {
+                task: "t".into(),
+                to: "rd".into(),
+                bell: bell("rd", Stage::Dev, 1),
+            },
+            JournalRecord::ApprovalRequested {
+                task: "t".into(),
+                peer: "rd".into(),
+                req: "a-1".into(),
+                command: "cargo test".into(),
+            },
+            JournalRecord::ApprovalDecided {
+                req: "a-1".into(),
+                decision: "allow".into(),
+                by: "harness-sa".into(),
+            },
+            JournalRecord::UsageReported {
+                peer: "rd".into(),
+                usage: Default::default(),
+            },
+        ];
+        for r in &records {
+            let line = serde_json::to_string(r).unwrap();
+            let back: JournalRecord = serde_json::from_str(&line).unwrap();
+            assert_eq!(serde_json::to_string(&back).unwrap(), line, "roundtrip");
+        }
+        let rep = reconcile(&records);
+        assert_eq!(
+            rep.in_flight.len(),
+            1,
+            "an approval decision is not a bell receipt"
+        );
+        assert_eq!(rep.state.stage, Some(Stage::Dev));
+        assert!(rep.state.spent_usd.is_empty());
     }
 
     #[test]

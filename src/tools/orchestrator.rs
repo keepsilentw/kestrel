@@ -6,6 +6,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
@@ -17,6 +18,7 @@ use crate::core::approvals::ApprovalBoard;
 use crate::core::events::EventMsg;
 use crate::core::id::IdGen;
 use crate::core::ops::ApprovalDecision;
+use serde_json::Value;
 
 pub type EmitFn = Arc<dyn Fn(EventMsg) + Send + Sync>;
 
@@ -45,19 +47,26 @@ async fn prepare_one(
                     )));
                 }
                 ApproveMode::HeadlessAllow => ApprovalDecision::AllowOnce,
-                ApproveMode::Bus => {
+                ApproveMode::Bus { timeout } => {
                     let req = idgen.next_id();
                     emit(EventMsg::ApprovalRequest {
                         req: req.clone(),
-                        prompt,
-                        detail,
+                        prompt: prompt.clone(),
+                        detail: approval_detail(&call.name, &call.args, detail),
                     });
                     let rx = approvals.open_with(req);
-                    match wait_decision(rx, token).await {
-                        None => {
+                    match wait_decision(rx, token, timeout).await {
+                        Waited::Decision(d) => d,
+                        Waited::TimedOut => {
+                            return Err(ToolOutcome::error(format!(
+                                "approval timed out after {}s, denied (the approver never \
+                                 answered): {prompt}",
+                                timeout.as_secs()
+                            )));
+                        }
+                        Waited::Cancelled => {
                             return Err(ToolOutcome::error("aborted while waiting for approval"));
                         }
-                        Some(d) => d,
                     }
                 }
             };
@@ -81,12 +90,38 @@ async fn prepare_one(
 async fn wait_decision(
     rx: tokio::sync::oneshot::Receiver<ApprovalDecision>,
     token: &CancellationToken,
-) -> Option<ApprovalDecision> {
+    timeout: Duration,
+) -> Waited {
     tokio::select! {
         biased;
-        _ = token.cancelled() => None,
-        d = rx => d.ok(),
+        _ = token.cancelled() => Waited::Cancelled,
+        _ = tokio::time::sleep(timeout) => Waited::TimedOut,
+        d = rx => d.map_or(Waited::Cancelled, Waited::Decision),
     }
+}
+
+/// How a bus-approval wait can end. A silent approver never means an
+/// open-ended wait: the worker denies and hands the model an is_error result
+/// it can react to (fail closed, design §5 纪律 2).
+pub(crate) enum Waited {
+    Decision(ApprovalDecision),
+    TimedOut,
+    Cancelled,
+}
+
+/// Fold the tool name and its arguments into the approval payload: the
+/// approver decides from data (the actual command, the actual paths), not from
+/// the prose prompt (design §10, ApproveMode::Bus).
+pub(crate) fn approval_detail(tool: &str, args: &Value, detail: Value) -> Value {
+    let mut out = serde_json::Map::new();
+    out.insert("tool".to_string(), Value::String(tool.to_string()));
+    out.insert("args".to_string(), args.clone());
+    if let Value::Object(map) = detail {
+        for (k, v) in map {
+            out.insert(k, v);
+        }
+    }
+    Value::Object(out)
 }
 
 fn reject_to_outcome(r: Reject) -> ToolOutcome {
@@ -155,19 +190,32 @@ async fn run_one(
                     return ToolOutcome::error(format!("sandbox denied (headless): {stderr}"));
                 }
                 ApproveMode::HeadlessAllow => ApprovalDecision::AllowOnce,
-                ApproveMode::Bus => {
+                ApproveMode::Bus { timeout } => {
                     let req = idgen.next_id();
                     emit(EventMsg::ApprovalRequest {
                         req: req.clone(),
                         prompt: "sandboxed command failed (suspected sandbox denial); \
                                  rerun outside the sandbox?"
                             .into(),
-                        detail: serde_json::json!({ "stderr": stderr, "call_id": call.call_id }),
+                        detail: approval_detail(
+                            &call.name,
+                            &call.args,
+                            serde_json::json!({ "stderr": stderr, "call_id": call.call_id }),
+                        ),
                     });
                     let rx = approvals.open_with(req);
-                    match wait_decision(rx, token).await {
-                        None => return ToolOutcome::error("aborted during sandbox escalation"),
-                        Some(d) => d,
+                    match wait_decision(rx, token, timeout).await {
+                        Waited::Decision(d) => d,
+                        Waited::TimedOut => {
+                            return ToolOutcome::error(format!(
+                                "sandbox escalation timed out after {}s, staying sandboxed \
+                                 (no answer from the approver)",
+                                timeout.as_secs()
+                            ));
+                        }
+                        Waited::Cancelled => {
+                            return ToolOutcome::error("aborted during sandbox escalation");
+                        }
                     }
                 }
             };

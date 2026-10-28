@@ -283,11 +283,17 @@ async fn tool_error_fed_back_and_loop_continues() {
 }
 
 /// Approval reverse-request path (Bus mode): NeedsApproval -> ApprovalRequest
-/// event -> Op::Approval(AllowOnce) -> executes; Deny -> is_error.
+/// event -> Op::Approval(AllowOnce) -> executes. The request must also carry
+/// the data an approver judges on (tool + args), not just prose.
 #[tokio::test]
 async fn approval_reverse_request_roundtrip() {
     let registry = ToolRegistry::new(vec![Arc::new(kestrel::tools::bash::Bash)]);
-    let mut ctx = ctx_for(std::env::temp_dir(), kestrel::tools::ApproveMode::Bus);
+    let mut ctx = ctx_for(
+        std::env::temp_dir(),
+        kestrel::tools::ApproveMode::Bus {
+            timeout: Duration::from_secs(30),
+        },
+    );
     ctx.engine = Arc::new(kestrel::permissions::PermissionEngine::new(PolicyTable {
         default: Decision::Ask,
         rules: vec![],
@@ -342,6 +348,71 @@ async fn approval_reverse_request_roundtrip() {
     let results = handle.await.unwrap();
     assert!(!results[0].1.is_error, "{:?}", results[0].1);
     assert!(results[0].1.content_text().contains("reverse-ok"));
+}
+
+/// A silent approver must not hold a turn open forever: `approve = "bus"`
+/// carries a deadline, and past it the worker denies the call itself
+/// (fail closed, design §5 纪律 2).
+#[tokio::test]
+async fn bus_approval_without_answer_denies_on_deadline() {
+    let registry = ToolRegistry::new(vec![Arc::new(kestrel::tools::bash::Bash)]);
+    let mut ctx = ctx_for(
+        std::env::temp_dir(),
+        kestrel::tools::ApproveMode::Bus {
+            timeout: Duration::from_millis(120),
+        },
+    );
+    ctx.engine = Arc::new(kestrel::permissions::PermissionEngine::new(PolicyTable {
+        default: Decision::Ask,
+        rules: vec![],
+        forbidden_prefixes: vec![],
+    }));
+    let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel();
+    let emit: kestrel::tools::orchestrator::EmitFn = Arc::new(move |m| {
+        let _ = seen_tx.send(m);
+    });
+    let started = Instant::now();
+    let outcome = dispatch_batch(
+        &registry,
+        &[tool_call(
+            "a",
+            "bash",
+            serde_json::json!({"command": "echo silent-approver"}),
+        )],
+        &ctx,
+        &tokio_util::sync::CancellationToken::new(),
+        &emit,
+        &kestrel::core::approvals::ApprovalBoard::default(),
+        &(Arc::new(kestrel::core::id::SeqGen::new()) as Arc<dyn kestrel::core::id::IdGen>),
+    )
+    .await
+    .into_iter()
+    .next()
+    .expect("one outcome")
+    .1;
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the deadline bounds the wait, not the bell timeout"
+    );
+    assert!(outcome.is_error);
+    let text = outcome.content_text();
+    assert!(
+        text.contains("timed out"),
+        "expected a timeout denial: {text}"
+    );
+
+    let mut judged = false;
+    while let Ok(msg) = seen_rx.try_recv() {
+        if let EventMsg::ApprovalRequest { detail, .. } = msg {
+            assert_eq!(detail["tool"], "bash", "approver sees the tool");
+            assert_eq!(
+                detail["args"]["command"], "echo silent-approver",
+                "approver sees the command"
+            );
+            judged = true;
+        }
+    }
+    assert!(judged, "an ApprovalRequest was emitted with tool + args");
 }
 
 /// One call through the real orchestrator, returning its outcome.

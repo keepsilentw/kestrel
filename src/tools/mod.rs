@@ -5,6 +5,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -120,15 +121,25 @@ impl ToolError {
     }
 }
 
-/// How `NeedsApproval` resolves when there is no human on the channel.
+/// How `NeedsApproval` resolves. The mode is decided by the priority chain
+/// runtime(`--approve`) > role(`[permissions].approve`) > deny (fail closed).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ApproveMode {
-    /// Reverse request over Op::Approval (bus/resident mode).
-    Bus,
+    /// Reverse request over the bus to a peer (SA or a human bridge): the
+    /// worker emits `EventMsg::ApprovalRequest`, the CLI layer carries it to
+    /// the approver, and the answer comes back as `Op::Approval`. `timeout`
+    /// bounds the wait — a silent approver DENIES, it never blocks the turn
+    /// forever and never widens by default (design §10, 一期遗留项).
+    Bus { timeout: Duration },
     /// Headless: deny immediately (CLI --approve none).
     HeadlessDeny,
     /// Headless: allow once (CLI --approve all).
     HeadlessAllow,
+}
+
+impl ApproveMode {
+    /// Fallback wait for a bus approver when the role stays silent.
+    pub const DEFAULT_BUS_TIMEOUT: Duration = Duration::from_secs(120);
 }
 
 /// Per-call context: role profile + sandbox + permission engine.

@@ -12,11 +12,16 @@ prompt_file = "../systems/rd.md"   # 相对 role 文件所在目录（harness/ro
 
 [permissions]
 policy_file = "writer.policy.json"
-write_roots = ["/tmp/kestrel-worktree"]     # demo 用；真实任务由 SA 派发时实例化
-read_only_islands = ["/tmp/kestrel-worktree/.git"]
+# 派发工作树由环境给出（run-demo.sh 导出），role 文件本身不钉死某台机器的路径。
+write_roots = ["$KESTREL_WORKTREE:-/tmp/kestrel-worktree"]
+read_only_islands = ["$KESTREL_WORKTREE:-/tmp/kestrel-worktree/.git"]
+# 反向审批：沙箱拒绝 / 策略 Ask 时问 SA（ApproveMode::Bus）。SA 无授权表或
+# 沉默 60s 都按 deny 处理——worker 不会因等待审批而挂住回合。
+approve = "bus"
+approver = "harness-sa"
+approve_timeout_secs = 60
 
 [permissions.sandbox]
 network = "none"
-
-[budget]
-max_usd = 2.0
+# 预算不在 role 里声明：花钱的上限由 SA 的 journal 账本统一停损（`--max-usd`），
+# 角色文件里写一个没人读的 max_usd 只会让人以为它有效。

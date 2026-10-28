@@ -30,7 +30,8 @@ struct Cli {
     #[arg(long)]
     role: Option<PathBuf>,
 
-    /// Headless approval policy: none (deny Ask) | all (allow Ask).
+    /// How an Ask-class tool call is answered: none (deny) | all (allow once) |
+    /// bus (ask the role's approver over the bus; `serve` only).
     #[arg(long, value_name = "POLICY")]
     approve: Option<String>,
 
@@ -145,6 +146,12 @@ struct DemoSaCmd {
     /// QA verifies the same tree.
     #[arg(long)]
     worktree: Option<PathBuf>,
+
+    /// Approval authority table for workers running `approve = "bus"`: a
+    /// three-state prefix policy JSON (same format as a role policy file).
+    /// Without it the SA denies every reverse request — fail closed.
+    #[arg(long)]
+    approvals: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -189,7 +196,7 @@ async fn main() -> anyhow::Result<()> {
                 model,
                 api_key,
                 artifacts_dir: s.artifacts_dir,
-                approve,
+                approve: approve.map(|mode| with_role_deadline(mode, Some(&role))),
             })
             .await;
         }
@@ -204,6 +211,7 @@ async fn main() -> anyhow::Result<()> {
                 max_iterations: 3,
                 bell_timeout: Duration::from_secs(d.bell_timeout_secs),
                 worktree: d.worktree,
+                approvals: d.approvals,
             })
             .await;
         }
@@ -220,13 +228,21 @@ async fn main() -> anyhow::Result<()> {
         Some(path) => Some(RoleConfig::load(path)?),
         None => None,
     };
-    let (model_meta, api_key) = resolve_backend(&cli.backend, role.as_ref())?;
     // Approval precedence: runtime flag > role file > deny (fail closed).
     let approve = match (approve, role.as_ref()) {
-        (Some(mode), _) => mode,
+        (Some(mode), r) => with_role_deadline(mode, r),
         (None, Some(r)) => r.approve_mode(),
         (None, None) => kestrel::tools::ApproveMode::HeadlessDeny,
     };
+    // A one-shot process has no bus to ask on: fail at startup rather than
+    // leaving every Ask-class call hanging until its deadline.
+    if matches!(approve, kestrel::tools::ApproveMode::Bus { .. }) {
+        anyhow::bail!(
+            "approve = bus needs `serve`: a one-shot run has no bus to reach its approver \
+             (use --approve none|all, or [permissions].approve in the role file)"
+        );
+    }
+    let (model_meta, api_key) = resolve_backend(&cli.backend, role.as_ref())?;
     let code = run_once(RunArgs {
         prompt,
         model: model_meta,
@@ -242,12 +258,35 @@ async fn main() -> anyhow::Result<()> {
     std::process::exit(code);
 }
 
-/// `--approve none|all` — the headless answer to an Ask-class tool call.
+/// `--approve none|all|bus` — how an Ask-class tool call gets answered:
+/// deny, allow-once, or ask an approver peer over the bus.
 fn parse_approve(value: &str) -> anyhow::Result<kestrel::tools::ApproveMode> {
     match value {
         "none" => Ok(kestrel::tools::ApproveMode::HeadlessDeny),
         "all" => Ok(kestrel::tools::ApproveMode::HeadlessAllow),
-        other => anyhow::bail!("--approve must be none|all, got {other:?}"),
+        "bus" => Ok(kestrel::tools::ApproveMode::Bus {
+            timeout: kestrel::tools::ApproveMode::DEFAULT_BUS_TIMEOUT,
+        }),
+        other => anyhow::bail!("--approve must be none|all|bus, got {other:?}"),
+    }
+}
+
+/// The runtime flag chooses the mode; the role file still owns the deadline it
+/// declared, so `--approve bus` never silently drops a role's timing.
+fn with_role_deadline(
+    mode: kestrel::tools::ApproveMode,
+    role: Option<&RoleConfig>,
+) -> kestrel::tools::ApproveMode {
+    match role {
+        Some(r)
+            if matches!(mode, kestrel::tools::ApproveMode::Bus { .. })
+                && r.permissions.approve_timeout_secs.is_some() =>
+        {
+            kestrel::tools::ApproveMode::Bus {
+                timeout: r.approve_timeout(),
+            }
+        }
+        _ => mode,
     }
 }
 
@@ -329,8 +368,9 @@ fn resolve_key(spec: &str) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, parse_approve};
+    use super::{Cli, parse_approve, with_role_deadline};
     use clap::Parser;
+    use kestrel::config::RoleConfig;
     use kestrel::tools::ApproveMode;
 
     #[test]
@@ -357,6 +397,39 @@ mod tests {
         assert_eq!(parse_approve("none").unwrap(), ApproveMode::HeadlessDeny);
         assert_eq!(parse_approve("all").unwrap(), ApproveMode::HeadlessAllow);
         assert!(parse_approve("sometimes").is_err());
+        assert_eq!(
+            parse_approve("bus").unwrap(),
+            ApproveMode::Bus {
+                timeout: ApproveMode::DEFAULT_BUS_TIMEOUT
+            }
+        );
+    }
+
+    /// `--approve bus` overrides the mode, never the role's declared deadline.
+    #[test]
+    fn bus_mode_keeps_the_roles_deadline() {
+        let role: RoleConfig = toml::from_str(
+            "role = \"rd\"\n[permissions]\napprove = \"none\"\napprove_timeout_secs = 7\n",
+        )
+        .unwrap();
+        assert_eq!(
+            with_role_deadline(parse_approve("bus").unwrap(), Some(&role)),
+            ApproveMode::Bus {
+                timeout: std::time::Duration::from_secs(7)
+            }
+        );
+        // no deadline declared => kernel default survives the override
+        assert_eq!(
+            with_role_deadline(parse_approve("bus").unwrap(), None),
+            ApproveMode::Bus {
+                timeout: ApproveMode::DEFAULT_BUS_TIMEOUT
+            }
+        );
+        // headless modes are untouched by a bus deadline
+        assert_eq!(
+            with_role_deadline(ApproveMode::HeadlessAllow, Some(&role)),
+            ApproveMode::HeadlessAllow
+        );
     }
 
     #[test]

@@ -5,16 +5,25 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use anyhow::Context;
+
+use crate::bus::frame::Envelope;
 use crate::bus::rpc::BusClient;
+use crate::cli::evidence::{check_evidence, evidence_from_answer};
+use crate::cli::serve::{approval_command, decision_name};
+use crate::core::ops::ApprovalDecision;
 use crate::journal::Journal;
 use crate::journal::records::{JournalRecord, Stage, ThinBell, Verdict, reconcile};
+use crate::permissions::{Decision, PermissionEngine};
+use crate::provider::wire::Usage;
 
 pub struct DemoSaArgs {
     pub bus_socket: PathBuf,
     pub task: String,
     pub journal: PathBuf,
     pub artifacts: PathBuf,
-    /// fixture 单次派发的记账金额（demo 无真实 usage）。
+    /// fixture 单次派发的名义记账金额：demo 没有价格表，`usd` 是按派发次数计的
+    /// 停损单位，不是账单。真实 token 用量另记 `usage_reported`（见下）。
     pub per_dispatch_usd: f64,
     pub max_usd: f64,
     pub max_iterations: u64,
@@ -25,6 +34,10 @@ pub struct DemoSaArgs {
     /// verifies the same tree instead of guessing — without it the reviewer has
     /// nothing on disk to look at and stages fail for the wrong reason.
     pub worktree: Option<PathBuf>,
+    /// Approval authority for workers running `approve = "bus"`: a three-state
+    /// prefix table (same format as a role policy). Absent means the SA denies
+    /// every reverse request — fail closed, no default yes.
+    pub approvals: Option<PathBuf>,
 }
 
 /// 一个 stage 的派发结果：收敛（pass）。
@@ -36,6 +49,13 @@ enum StageOutcome {
 pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
     let journal = Journal::create(&args.journal)?;
     let sa = BusClient::connect(&args.bus_socket, "harness-sa", None).await?;
+    let authority = match &args.approvals {
+        Some(path) => Some(
+            PermissionEngine::from_json_file(path)
+                .with_context(|| format!("load approval authority {}", path.display()))?,
+        ),
+        None => None,
+    };
     let kill_after = std::env::var("KESTREL_TEST_KILL_AFTER").unwrap_or_default();
     let stages = [Stage::Dev, Stage::Review, Stage::Test, Stage::Build];
 
@@ -103,9 +123,25 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
 
             // --- 等回铃；超时/丢失则巡检（journal 对账 + 读盘工件）。worker 是
             // 常驻引擎，一个回合可能跑满 8 轮工具调用，超时给足（可 --bell-timeout-secs 调）。
-            let result = match tokio::time::timeout(args.bell_timeout, sa.recv_notify()).await {
-                Ok(Ok(env)) => Some(env),
-                _ => None,
+            // 等待期间可能插进 worker 的审批反向请求（approve = "bus"）：答完接着等，
+            // 但截止时间不因答铃顺延——审批不能把 stage 的等待拖成无限。
+            let deadline = tokio::time::Instant::now() + args.bell_timeout;
+            let result = loop {
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    break None;
+                }
+                match tokio::time::timeout(deadline - now, sa.recv_notify()).await {
+                    Ok(Ok(env)) if env.payload["type"].as_str() == Some("approval_request") => {
+                        answer_approval(&journal, &sa, authority.as_ref(), &env)?;
+                    }
+                    Ok(Ok(env)) => break Some(env),
+                    Ok(Err(e)) => {
+                        println!("[sa] bell read failed: {e} -> inspecting disk");
+                        break None;
+                    }
+                    Err(_) => break None,
+                }
             };
             let artifact = args
                 .artifacts
@@ -118,6 +154,19 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
                         from: env.sender.clone(),
                         bell: bell.clone(),
                     })?;
+                    // Real tokens are booked separately: `usd` is the nominal
+                    // stop-loss unit of this fixture, never a bill.
+                    if let Some(usage) = env
+                        .payload
+                        .get("usage")
+                        .and_then(|u| serde_json::from_value::<Usage>(u.clone()).ok())
+                        && usage.total() > 0
+                    {
+                        journal.append(&JournalRecord::UsageReported {
+                            peer: env.sender.clone(),
+                            usage,
+                        })?;
+                    }
                     if kill_after == "result_received" {
                         eprintln!("[demo-sa] crash injection: after result received");
                         std::process::abort();
@@ -165,10 +214,74 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 回答一颗审批铃：先落 journal（谁请求、SA 判了什么），再回铃给 worker。
+/// 反向请求的授权同样是真相源的一部分——事后只存在于进程内存里的批准，崩溃后
+/// 无人能复现「是谁把沙箱放宽的」（design §5 不变式 5）。
+fn answer_approval(
+    journal: &Journal,
+    sa: &BusClient,
+    authority: Option<&PermissionEngine>,
+    env: &Envelope,
+) -> anyhow::Result<()> {
+    let req = env.payload["req"].as_str().unwrap_or_default().to_string();
+    let worker = env.payload["session"]
+        .as_str()
+        .unwrap_or(env.sender.as_str())
+        .to_string();
+    // The frame carries the command at the top level; fall back to the detail
+    // blob so an older worker is still judged on something real.
+    let command = match env.payload["command"].as_str() {
+        Some(c) => c.to_string(),
+        None => approval_command(&env.payload["detail"]),
+    };
+    journal.append(&JournalRecord::ApprovalRequested {
+        task: "demo".into(),
+        peer: worker.clone(),
+        req: req.clone(),
+        command: command.clone(),
+    })?;
+    let decision = decide_approval(authority, &command);
+    journal.append(&JournalRecord::ApprovalDecided {
+        req: req.clone(),
+        decision: decision_name(decision).to_string(),
+        by: "harness-sa".into(),
+    })?;
+    sa.notify(
+        &worker,
+        serde_json::json!({
+            "type": "approval_decision",
+            "req": req,
+            "decision": decision_name(decision),
+            "by": "harness-sa",
+        }),
+    );
+    println!(
+        "[sa] approval {} for {worker}: {command}",
+        decision_name(decision)
+    );
+    Ok(())
+}
+
+/// SA 的授权是一张表，不是一种心情：只有显式 Allow 才放行。没有表、没有可判定的
+/// 命令、Ask 或 Deny 一律回 DENY——协调者不能放宽角色策略里没写过的东西。
+pub fn decide_approval(authority: Option<&PermissionEngine>, command: &str) -> ApprovalDecision {
+    let Some(engine) = authority else {
+        return ApprovalDecision::Deny;
+    };
+    if command.trim().is_empty() {
+        return ApprovalDecision::Deny;
+    }
+    match engine.evaluate_command(command) {
+        Decision::Allow => ApprovalDecision::AllowOnce,
+        Decision::Ask | Decision::Deny => ApprovalDecision::Deny,
+    }
+}
+
 /// 从 worker 工件推出该 stage 的判定。契约字段由 `serve` 写入
-/// （`result` / `aborted` / `stop.*`），`result` 头部必须给出判定词。
-/// 两层都要过：通路层（有答案、未中断、worker 侧 stop 不是 error）与语义层
-/// （worker 自己声明的结论）——「工件在盘上」从来不等于「stage 通过」。
+/// （`result` / `aborted` / `stop.*` / `evidence`），`result` 头部必须给出判定词。
+/// 三层都要过：通路层（有答案、未中断、worker 侧 stop 不是 error）、语义层
+/// （worker 自己声明的结论）、证据层（它点名的文件确实在盘上有内容）——
+/// 「工件在盘上」从来不等于「stage 通过」。
 pub fn verdict_from_artifact(path: &Path) -> Verdict {
     let Ok(text) = std::fs::read_to_string(path) else {
         return Verdict {
@@ -188,11 +301,12 @@ pub fn verdict_from_artifact(path: &Path) -> Verdict {
         .unwrap_or_default()
         .trim()
         .to_string();
+    let mut converged = false;
     if result.is_empty() {
         issues.push("empty result".to_string());
     } else {
         match parse_verdict(&result) {
-            WorkerVerdict::Converged => {}
+            WorkerVerdict::Converged => converged = true,
             WorkerVerdict::Failed(line) => issues.push(format!("verdict: {line}")),
             WorkerVerdict::Missing => {
                 issues.push("no PASS/DONE/FAIL verdict in the head of result".into())
@@ -207,6 +321,28 @@ pub fn verdict_from_artifact(path: &Path) -> Verdict {
             "worker stop: {}",
             json["stop"]["message"].as_str().unwrap_or("error")
         ));
+    }
+    // 第三层（design §10 二期「工件 + 证据文件」的最小形态）：只有 worker 声称
+    // 收敛时才核证据——判定词是声明，它点名的路径要在盘上真实存在且有内容。
+    // 「PASS 但给不出可查的文件」不是收敛；FAIL 已经是 fail，不再要求它举证。
+    if converged {
+        let mut evidence: Vec<String> = json["evidence"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if evidence.is_empty() {
+            // 兼容没有 evidence 字段的旧工件：从正文里提绝对路径。
+            evidence = evidence_from_answer(&result);
+        }
+        if evidence.is_empty() {
+            issues.push("no evidence paths to verify".to_string());
+        } else {
+            issues.extend(check_evidence(&evidence));
+        }
     }
     Verdict {
         pass: issues.is_empty(),
@@ -281,11 +417,25 @@ mod tests {
         path
     }
 
+    /// A real file an artifact can point at: a converged verdict now has to be
+    /// checkable on disk, so the fixtures need something checkable.
+    fn evidence_file(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("kestrel-verdict-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, "content\n").unwrap();
+        path
+    }
+
     #[test]
     fn artifact_with_answer_is_pass() {
+        let ev = evidence_file("lru.py");
         let p = write_artifact(
             "ok.json",
-            r#"{"result":"DONE: LRU implemented in lru.py","aborted":false,"stop":{"type":"stop"}}"#,
+            &format!(
+                r#"{{"result":"DONE: LRU implemented","evidence":["{}"],"aborted":false,"stop":{{"type":"stop"}}}}"#,
+                ev.display()
+            ),
         );
         let v = verdict_from_artifact(&p);
         assert!(v.pass, "{:?}", v.issues);
@@ -299,7 +449,103 @@ mod tests {
         );
         let v = verdict_from_artifact(&p);
         assert!(!v.pass);
-        assert_eq!(v.issues.len(), 2, "{:?}", v.issues);
+        assert!(
+            v.issues.contains(&"empty result".to_string())
+                && v.issues.iter().any(|i| i.starts_with("worker stop:")),
+            "{:?}",
+            v.issues
+        );
+    }
+
+    /// 「判定 = 工件 + 证据文件」（design §10）：声称收敛却给不出文件、点名的
+    /// 文件不在盘上，都不算收敛；正文里的绝对路径也照样能被核。
+    #[test]
+    fn converged_answer_without_checkable_evidence_is_fail() {
+        let bare = write_artifact(
+            "bare.json",
+            r#"{"result":"PASS: 全部通过","aborted":false,"stop":{"type":"stop"}}"#,
+        );
+        let v = verdict_from_artifact(&bare);
+        assert!(!v.pass, "a claim with nothing to check is not a pass");
+        assert!(
+            v.issues
+                .contains(&"no evidence paths to verify".to_string()),
+            "{:?}",
+            v.issues
+        );
+
+        let missing = evidence_file("tmp-for-path.txt");
+        let gone = missing.with_file_name("definitely-not-there.py");
+        std::fs::remove_file(&missing).ok();
+        let p = write_artifact(
+            "ghost.json",
+            &format!(
+                r#"{{"result":"DONE: shipped","evidence":["{}"],"aborted":false,"stop":{{"type":"stop"}}}}"#,
+                gone.display()
+            ),
+        );
+        let v = verdict_from_artifact(&p);
+        assert!(!v.pass);
+        assert!(
+            v.issues.iter().any(|i| i.starts_with("evidence missing:")),
+            "{:?}",
+            v.issues
+        );
+
+        // prose paths are read when the artifact has no contract field
+        let real = evidence_file("cache.rs");
+        let p = write_artifact(
+            "prose.json",
+            &format!(
+                r#"{{"result":"PASS — 审阅了 {}","aborted":false,"stop":{{"type":"stop"}}}}"#,
+                real.display()
+            ),
+        );
+        assert!(
+            verdict_from_artifact(&p).pass,
+            "fallback to the answer text"
+        );
+    }
+
+    /// SA 的授权是策略表，不是心情：只有显式 Allow 放行；没有表、命令为空、
+    /// Ask/Deny 全部回 deny（fail closed）。
+    #[test]
+    fn approval_authority_is_a_table_not_a_mood() {
+        use crate::core::ops::ApprovalDecision;
+        use crate::permissions::PolicyTable;
+        // The same JSON shape the shipped authority file uses, so the fixture
+        // cannot drift from what `--approvals` actually loads.
+        let table: PolicyTable = serde_json::from_value(serde_json::json!({
+            "default": "ask",
+            "rules": [{ "pattern": ["cargo", ["test", "build"]], "decision": "allow" }],
+            "forbidden_prefixes": [["rm"]]
+        }))
+        .unwrap();
+        let engine = PermissionEngine::new(table);
+        assert_eq!(
+            decide_approval(Some(&engine), "cargo test"),
+            ApprovalDecision::AllowOnce
+        );
+        // Ask (not in the table) and Deny (forbidden) both come back as deny:
+        // the coordinator cannot widen what the role policy never named.
+        assert_eq!(
+            decide_approval(Some(&engine), "python3 -m pytest"),
+            ApprovalDecision::Deny
+        );
+        assert_eq!(
+            decide_approval(Some(&engine), "rm -rf /tmp/x"),
+            ApprovalDecision::Deny
+        );
+        assert_eq!(
+            decide_approval(Some(&engine), "   "),
+            ApprovalDecision::Deny,
+            "nothing to judge is not a licence to run"
+        );
+        assert_eq!(
+            decide_approval(None, "cargo test"),
+            ApprovalDecision::Deny,
+            "an SA without an authority table denies"
+        );
     }
 
     /// The worker's own verdict is what counts: text without PASS/DONE is not a
@@ -327,9 +573,15 @@ mod tests {
             "DONE: shipped",
             "BLOCKED: no perms",
         ] {
+            // Converged heads need evidence on disk; FAIL/BLOCKED ones are
+            // already fails and are not asked to produce any.
+            let ev = evidence_file("reviewed.rs");
             let p = write_artifact(
                 "head.json",
-                &format!(r#"{{"result":"{head}","aborted":false,"stop":{{"type":"stop"}}}}"#),
+                &format!(
+                    r#"{{"result":"{head}","evidence":["{}"],"aborted":false,"stop":{{"type":"stop"}}}}"#,
+                    ev.display()
+                ),
             );
             let pass = verdict_from_artifact(&p).pass;
             assert_eq!(

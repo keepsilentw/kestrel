@@ -7,6 +7,9 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+use kestrel::bus::frame::{decode_envelope, encode_frame};
 use kestrel::bus::rpc::BusClient;
 use kestrel::bus::{frame::FrameKind, rpc::BusHub};
 use kestrel::journal::Journal;
@@ -289,3 +292,209 @@ async fn engine_turn_from_bus_bell() {
 
 #[allow(unused)]
 fn _frame_kind_witness(_: FrameKind) {}
+
+/// 审批反向请求（`approve = "bus"`）在总线上的完整形状：worker 发出**可判定**的
+/// 请求（带命令），SA 按自己的授权表判定并回铃，worker 端把非 allow 一律读成
+/// deny。跨进程边界只验数据形状，不验心情。
+#[tokio::test]
+async fn approval_request_is_answered_by_the_sas_authority() {
+    use kestrel::core::ops::ApprovalDecision;
+
+    let path = temp_bus("approval");
+    let hub = BusHub::bind(&path).unwrap();
+    let _ = hub;
+    let worker = BusClient::connect(&path, "harness-rd", Some("harness-rd"))
+        .await
+        .unwrap();
+    let sa = BusClient::connect(&path, "harness-sa", None).await.unwrap();
+
+    let detail = json!({ "tool": "bash", "args": { "command": "cargo test" } });
+    worker.notify(
+        "harness-sa",
+        kestrel::cli::serve::approval_request_frame(
+            "harness-rd",
+            "rd",
+            "req-7",
+            "run command?",
+            &detail,
+        ),
+    );
+    let request = sa.recv_notify().await.unwrap();
+    assert_eq!(request.kind, FrameKind::Notify);
+    assert_eq!(request.payload["type"], "approval_request");
+    assert_eq!(
+        request.payload["command"], "cargo test",
+        "the approver judges a command, not a sentence"
+    );
+    assert_eq!(
+        request.sender, "harness-rd",
+        "identity travels with the frame"
+    );
+
+    // the SA decides from a table — exactly the file `--approvals` loads
+    let policy = std::env::temp_dir().join(format!(
+        "kestrel-approvals-{}-approval.json",
+        std::process::id()
+    ));
+    std::fs::write(
+        &policy,
+        r#"{"default":"ask","rules":[{"pattern":["cargo",["test"]],"decision":"allow"}]}"#,
+    )
+    .unwrap();
+    let authority = kestrel::permissions::PermissionEngine::from_json_file(&policy).unwrap();
+    let decision = kestrel::cli::sa_demo::decide_approval(
+        Some(&authority),
+        request.payload["command"].as_str().unwrap(),
+    );
+    sa.notify(
+        "harness-rd",
+        json!({
+            "type": "approval_decision",
+            "req": request.payload["req"],
+            "decision": kestrel::cli::serve::decision_name(decision),
+            "by": "harness-sa",
+        }),
+    );
+    let reply = worker.recv_notify().await.unwrap();
+    assert_eq!(
+        kestrel::cli::serve::decision_from_frame(&reply.payload),
+        ApprovalDecision::AllowOnce,
+        "an allowed command wakes the blocked tool"
+    );
+
+    // a reply that is not an explicit allow is a deny: a garbled answer is no consent
+    sa.notify(
+        "harness-rd",
+        json!({ "type": "approval_decision", "req": "req-8", "decision": "maybe" }),
+    );
+    let junk = worker.recv_notify().await.unwrap();
+    assert_eq!(
+        kestrel::cli::serve::decision_from_frame(&junk.payload),
+        ApprovalDecision::Deny
+    );
+    std::fs::remove_file(&policy).ok();
+}
+
+/// 门铃发给「注册过但此刻不在线」的 session：停车，等它重新 Hello 时按序补投。
+/// 这是 worker 重启不丢派发的机制——在此之前 hub 会把这些帧静默丢掉。
+#[tokio::test]
+async fn bells_for_an_offline_session_are_parked_and_redelivered_in_order() {
+    let path = temp_bus("parking");
+    let hub = BusHub::bind(&path).unwrap();
+    let _ = hub;
+
+    let first = BusClient::connect(&path, "harness-rd", Some("rd-1"))
+        .await
+        .unwrap();
+    let sa = BusClient::connect(&path, "harness-sa", None).await.unwrap();
+    // let the hub see the registration (and, after the drop, the disconnect)
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    drop(first);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    sa.notify("rd-1", json!({ "task": "first", "iteration": 1 }));
+    sa.notify("rd-1", json!({ "task": "second", "iteration": 2 }));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let back = BusClient::connect(&path, "harness-rd", Some("rd-1"))
+        .await
+        .unwrap();
+    let a = tokio::time::timeout(Duration::from_secs(2), back.recv_notify())
+        .await
+        .expect("parked bell 1 not delivered")
+        .unwrap();
+    let b = tokio::time::timeout(Duration::from_secs(2), back.recv_notify())
+        .await
+        .expect("parked bell 2 not delivered")
+        .unwrap();
+    assert_eq!(a.payload["task"], "first", "order is dispatch order");
+    assert_eq!(b.payload["task"], "second");
+    assert_eq!(a.sender, "harness-sa", "identity survives parking");
+}
+
+/// 从未注册过的地址仍然立刻回 Error 帧：静默停车会把拼错的 session 名变成
+/// 「谁都不会收到的铃」。
+#[tokio::test]
+async fn never_registered_session_still_answers_error() {
+    let path = temp_bus("typo");
+    let hub = BusHub::bind(&path).unwrap();
+    let _ = hub;
+    let sa = BusClient::connect(&path, "harness-sa", None).await.unwrap();
+
+    sa.notify("rd-typo", json!({ "task": "nowhere" }));
+    let err = tokio::time::timeout(Duration::from_secs(2), sa.recv_notify())
+        .await
+        .expect("no error frame for an unknown session")
+        .unwrap();
+    assert_eq!(err.kind, FrameKind::Error);
+    assert_eq!(err.payload["error"], "unknown session");
+}
+
+/// 断线之后：能补发的只有「从未交给活 socket」的帧；已经写进死 socket 的不补
+/// （hub 可能已经处理过它，重复铃由 journal 的 write-ahead 对账消化）。RPC 直接
+/// 失败，不排队——它的 Response 归属于那条死连接。
+#[tokio::test]
+async fn dead_socket_reconnects_and_replays_only_unsent_frames() {
+    let path = temp_bus("replay");
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    let client = BusClient::connect(&path, "harness-rd", Some("rd-1"))
+        .await
+        .unwrap();
+
+    // fake hub: take the first connection, then die
+    let (sock1, _) = listener.accept().await.unwrap();
+    drop(sock1);
+    // A is written into a socket that is going away: it counts as sent, then lost
+    client.notify("harness-sa", json!({ "task": "A" }));
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    // by now the outbound pump is gone, so B goes to the replay queue
+    client.notify("harness-sa", json!({ "task": "B" }));
+
+    let err = client
+        .request("harness-sa", json!({ "ping": true }))
+        .await
+        .expect_err("RPC does not queue while the bus is down");
+    assert!(err.to_string().contains("not sent"), "{err}");
+
+    // fake hub, second life: the reconnect happens inside recv_notify, so the
+    // accept side runs as a task and answers the re-Hello with the echoed frame.
+    let hub_side = tokio::spawn(async move {
+        let (mut sock2, _) = listener.accept().await?;
+        let hello = read_one_frame(&mut sock2).await?;
+        anyhow::ensure!(hello.kind == FrameKind::Hello, "re-Hello expected");
+        anyhow::ensure!(
+            hello.payload["session"] == "rd-1",
+            "the re-Hello re-registers the session"
+        );
+        let replayed = read_one_frame(&mut sock2).await?;
+        anyhow::ensure!(replayed.kind == FrameKind::Notify);
+        anyhow::ensure!(
+            replayed.payload["task"] == "B",
+            "the never-sent frame is flushed in order, got {:?}",
+            replayed.payload
+        );
+        sock2.write_all(&encode_frame(&replayed)?).await?;
+        // hand the socket back so it stays open until the test is done reading
+        Ok::<_, anyhow::Error>(sock2)
+    });
+
+    let got = tokio::time::timeout(Duration::from_secs(5), client.recv_notify())
+        .await
+        .expect("recv_notify did not survive the reconnect")
+        .expect("inbound frame after reconnect");
+    assert_eq!(got.payload["task"], "B");
+    let _sock2 = hub_side.await.expect("hub task").expect("hub side ok");
+    drop(client);
+}
+
+/// One length-prefixed frame off an accepted connection (test-side hub reader).
+async fn read_one_frame(
+    sock: &mut tokio::net::UnixStream,
+) -> anyhow::Result<kestrel::bus::frame::Envelope> {
+    let mut len = [0u8; 4];
+    sock.read_exact(&mut len).await?;
+    let n = u32::from_be_bytes(len) as usize;
+    let mut body = vec![0u8; n];
+    sock.read_exact(&mut body).await?;
+    decode_envelope(&body)
+}

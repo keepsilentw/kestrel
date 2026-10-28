@@ -9,8 +9,10 @@
 #   KESTREL_BIN               kestrel 可执行文件（默认 target/debug/kestrel）
 #   KESTREL_BUS_SOCKET        总线 socket 路径
 #   KESTREL_ARTIFACTS         工件目录
+#   KESTREL_WORKTREE          RD 的写入目录（role 的 write_roots 引用同一个变量）
 #   KESTREL_TEST_KILL_AFTER   崩溃注入点：bell_sent | result_received（见 sa_demo.rs）
 #   KESTREL_DEMO_KEEP_JOURNAL 置 1 则保留上一轮 journal/工件（崩溃恢复演练用）
+#   KESTREL_DEMO_TASK / KESTREL_DEMO_BELL_TIMEOUT / KESTREL_DEMO_MAX_USD
 #
 # 用法：./run-demo.sh
 set -euo pipefail
@@ -19,6 +21,10 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 SOCKET="${KESTREL_BUS_SOCKET:-$HOME/.kestrel/harness/bus.sock}"
 ARTIFACTS="${KESTREL_ARTIFACTS:-$HERE/artifacts}"
+# RD 的工作树导出给子进程：role 文件的 write_roots 读的是同一个 $KESTREL_WORKTREE，
+# 否则「SA 广播的 ref」与「RD 能写的目录」会各自解析成不同路径。
+WORKTREE="${KESTREL_WORKTREE:-/tmp/kestrel-worktree}"
+export KESTREL_WORKTREE="$WORKTREE"
 
 BIN="${KESTREL_BIN:-$ROOT/target/debug/kestrel}"
 if [ ! -x "$BIN" ]; then
@@ -40,7 +46,7 @@ if [ "${KESTREL_DEMO_KEEP_JOURNAL:-0}" != "1" ]; then
 fi
 mkdir -p "$ARTIFACTS"
 # RD 的沙箱写范围（rd.toml:[permissions].write_roots，也是它的 cwd）——demo 前置。
-mkdir -p "${KESTREL_WORKTREE:-/tmp/kestrel-worktree}"
+mkdir -p "$WORKTREE"
 rm -f "$SOCKET"
 
 PIDS=()
@@ -67,7 +73,8 @@ PIDS+=($!)
 PIDS+=($!)
 
 # 总线上没有"谁已注册"的查询接口，也没有就绪握手：worker 在 Hello 后即可被寻址，
-# 这里给一拍等注册完成，否则首批铃会被 hub 判为 unknown session 丢弃。
+# 这里给一拍等注册完成。停车补投只救「注册过之后掉线」的 session，首次注册前
+# 的铃仍会被 hub 判为 unknown session 退回 Error——那正是拼错地址该有的信号。
 sleep 1
 
 # --- 2. SA：脚本化状态机，验证 write-ahead 顺序、崩溃对账、fail 回环与预算停损。
@@ -76,5 +83,6 @@ sleep 1
 KESTREL_TEST_KILL_AFTER="${KESTREL_TEST_KILL_AFTER:-}" \
   "$BIN" demo-sa --bus-socket "$SOCKET" --task "${KESTREL_DEMO_TASK:-demo: 实现一个 LRU cache}" \
   --journal "$HERE/journal.jsonl" --artifacts-dir "$ARTIFACTS" \
-  --worktree "${KESTREL_WORKTREE:-/tmp/kestrel-worktree}" \
+  --worktree "$WORKTREE" \
+  --approvals "$HERE/roles/sa.approvals.json" \
   --bell-timeout-secs "${KESTREL_DEMO_BELL_TIMEOUT:-300}" --max-usd "${KESTREL_DEMO_MAX_USD:-6.0}"

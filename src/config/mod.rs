@@ -43,11 +43,20 @@ pub struct RoleConfig {
 pub struct PermissionsSection {
     #[serde(default)]
     pub policy_file: Option<PathBuf>,
-    /// Headless approval policy for Ask-class tool calls: `"none"` (default:
-    /// deny) | `"all"` (approve, then the unsandboxed retry). A worker runs
-    /// headless, so this is where a role opts into the escalation loop.
+    /// Approval policy for Ask-class tool calls: `"none"` (default: deny) |
+    /// `"all"` (approve, then the unsandboxed retry) | `"bus"` (ask a peer over
+    /// the bus — see `approver`). A worker runs headless, so this is where a
+    /// role opts into the escalation loop.
     #[serde(default)]
     pub approve: Option<String>,
+    /// Bus peer/session that answers `approve = "bus"` requests. Absent means
+    /// "ask whoever rang this bell" — the SA in the star topology.
+    #[serde(default)]
+    pub approver: Option<String>,
+    /// How long `approve = "bus"` waits for the approver before denying the
+    /// call itself (fail closed). Default 120s.
+    #[serde(default)]
+    pub approve_timeout_secs: Option<u64>,
     #[serde(default)]
     pub write_roots: Vec<PathBuf>,
     #[serde(default)]
@@ -75,8 +84,26 @@ impl RoleConfig {
     pub fn approve_mode(&self) -> crate::tools::ApproveMode {
         match self.permissions.approve.as_deref() {
             Some("all") => crate::tools::ApproveMode::HeadlessAllow,
+            Some("bus") => crate::tools::ApproveMode::Bus {
+                timeout: self.approve_timeout(),
+            },
             _ => crate::tools::ApproveMode::HeadlessDeny,
         }
+    }
+
+    /// Deadline for a bus approval: the role's `approve_timeout_secs`, else the
+    /// kernel default.
+    pub fn approve_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.permissions
+                .approve_timeout_secs
+                .unwrap_or(crate::tools::ApproveMode::DEFAULT_BUS_TIMEOUT.as_secs()),
+        )
+    }
+
+    /// Bus address of the peer allowed to answer this role's approvals.
+    pub fn approver(&self) -> Option<&str> {
+        self.permissions.approver.as_deref()
     }
 
     pub fn load(path: &Path) -> anyhow::Result<Self> {
@@ -86,7 +113,8 @@ impl RoleConfig {
     }
 
     /// Writable roots / islands are canonicalized against the role file's dir
-    /// when relative; `{worktree}` placeholders resolve per-dispatch later.
+    /// when relative, after `$VAR` / `$VAR:-default` expansion — the role file
+    /// is shared, the dispatch worktree is not.
     pub fn fs_policy(&self, base: &Path) -> anyhow::Result<FsPolicy> {
         let p = &self.permissions;
         let network = match p.sandbox.network.as_deref() {
@@ -152,13 +180,47 @@ pub fn kestrel_home() -> PathBuf {
 }
 
 fn canon(base: &Path, p: &Path) -> anyhow::Result<PathBuf> {
-    let joined = if p.is_absolute() {
-        p.to_path_buf()
+    let expanded = expand_env_path(p, &|name| std::env::var(name).ok())?;
+    let joined = if expanded.is_absolute() {
+        expanded
     } else {
-        base.join(p)
+        base.join(expanded)
     };
     let joined = joined.canonicalize().unwrap_or(joined);
     Ok(joined)
+}
+
+/// Expand a leading `$NAME` reference in a role path: `$NAME`,
+/// `$NAME:-default`, or `$NAME/rest`. An unset variable with no default is a
+/// hard error naming the spelling: a role that silently lost its write root
+/// would move the sandbox without anyone deciding to.
+fn expand_env_path(raw: &Path, lookup: &dyn Fn(&str) -> Option<String>) -> anyhow::Result<PathBuf> {
+    let text = raw.to_string_lossy().into_owned();
+    let Some(rest) = text.strip_prefix('$') else {
+        return Ok(raw.to_path_buf());
+    };
+    let name_len = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(rest.len());
+    let (name, tail) = rest.split_at(name_len);
+    if name.is_empty() {
+        anyhow::bail!("role path {text:?}: empty variable name after '$'");
+    }
+    // `:-` takes the REST of the string as the fallback (so a fallback may
+    // itself be a path); without it, a `/` after the name continues the path.
+    let (default, tail) = match tail.strip_prefix(":-") {
+        Some(d) => (d.to_string(), String::new()),
+        None => (String::new(), tail.to_string()),
+    };
+    let value = match (lookup(name), default.is_empty()) {
+        (Some(v), _) => v,
+        (None, false) => default,
+        (None, true) => anyhow::bail!(
+            "role path {text:?}: environment variable {name} is not set and declares no \
+             default (`${name}:-<fallback>`)"
+        ),
+    };
+    Ok(PathBuf::from(format!("{value}{tail}")))
 }
 
 #[cfg(test)]
@@ -192,6 +254,87 @@ mod tests {
         let junk: RoleConfig =
             toml::from_str("role = \"rd\"\n[permissions]\napprove = \"yolo\"").unwrap();
         assert_eq!(junk.approve_mode(), crate::tools::ApproveMode::HeadlessDeny);
+    }
+
+    /// `approve = "bus"` asks a peer instead of guessing: the role names the
+    /// approver and how long it may take. Silence is a DENY, never a hang.
+    #[test]
+    fn approve_bus_mode_carries_approver_and_deadline() {
+        let role: RoleConfig = toml::from_str(
+            "role = \"rd\"\n\
+             [permissions]\n\
+             approve = \"bus\"\n\
+             approver = \"harness-sa\"\n\
+             approve_timeout_secs = 5\n",
+        )
+        .unwrap();
+        assert_eq!(
+            role.approve_mode(),
+            crate::tools::ApproveMode::Bus {
+                timeout: std::time::Duration::from_secs(5)
+            }
+        );
+        assert_eq!(role.approver(), Some("harness-sa"));
+
+        // Absent timeout => kernel default, so a role cannot opt into bus mode
+        // and silently wait forever.
+        let plain: RoleConfig =
+            toml::from_str("role = \"rd\"\n[permissions]\napprove = \"bus\"").unwrap();
+        assert_eq!(
+            plain.approve_timeout(),
+            crate::tools::ApproveMode::DEFAULT_BUS_TIMEOUT
+        );
+        assert_eq!(plain.approver(), None);
+    }
+
+    /// Role paths are machine-independent: `$VAR` with a `:-fallback`, and an
+    /// unset variable without a fallback is a named error rather than a
+    /// silently relocated write root.
+    #[test]
+    fn role_paths_expand_env_references() {
+        let table: std::collections::BTreeMap<String, String> =
+            [("WT".to_string(), "/tmp/wt".to_string())]
+                .into_iter()
+                .collect();
+        let lookup = |n: &str| table.get(n).cloned();
+        assert_eq!(
+            expand_env_path(&PathBuf::from("$WT"), &lookup).unwrap(),
+            PathBuf::from("/tmp/wt")
+        );
+        assert_eq!(
+            expand_env_path(&PathBuf::from("$WT/sub"), &lookup).unwrap(),
+            PathBuf::from("/tmp/wt/sub")
+        );
+        assert_eq!(
+            expand_env_path(&PathBuf::from("$MISSING:-/tmp/fallback"), &lookup).unwrap(),
+            PathBuf::from("/tmp/fallback")
+        );
+        // a fallback may itself be a path: `:-` owns the rest of the string
+        assert_eq!(
+            expand_env_path(&PathBuf::from("$MISSING:-/tmp/wt/deep"), &lookup).unwrap(),
+            PathBuf::from("/tmp/wt/deep")
+        );
+        assert_eq!(
+            expand_env_path(&PathBuf::from("$WT:-/tmp/fallback"), &lookup).unwrap(),
+            PathBuf::from("/tmp/wt"),
+            "the environment wins over the fallback"
+        );
+        // literal paths are untouched
+        assert_eq!(
+            expand_env_path(&PathBuf::from("systems/rd.md"), &lookup).unwrap(),
+            PathBuf::from("systems/rd.md")
+        );
+        let err = expand_env_path(&PathBuf::from("$MISSING/deep"), &lookup)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("MISSING") && err.contains("not set"),
+            "unset variable names itself: {err}"
+        );
+        assert!(
+            expand_env_path(&PathBuf::from("$-x"), &lookup).is_err(),
+            "empty variable name is not guessed at"
+        );
     }
 
     #[test]
