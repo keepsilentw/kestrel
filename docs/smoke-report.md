@@ -12,10 +12,11 @@
 | 单测（lib） | 115 | wire 归一 / partial_json / retry / registry / 权限矩阵 / sbpl golden / session 树 / journal 对账 / 证据契约 / 审批授权表 |
 | 单测（bin：CLI 形状） | 4 | `--tools` 三态、`--approve` 三值（none / all / bus）、`--resume` 选择子、bus 模式保留 role 期限 |
 | 集成（core_loop 5 / m1_tools 8 / sandbox_e2e 4 / m2_session 6 / m4_bus 11 / wire_anthropic 2 / discipline 1） | 37 | 引擎验收 / 工具并发与审批超时 / 真实 Seatbelt / golden JSONL / 总线路由、审批往返、停车补投、重连重放与崩溃对账 |
-| 合计 | **156**，全部通过；`fmt --check` 与 `clippy -D warnings` 干净，三者已在 `.github/workflows/ci.yml`（ubuntu + macOS）执行 | |
+| 合计 | **156**，全部通过；`fmt --check` 与 `clippy -D warnings` 干净（本机实跑；本仓库不挂 CI，闸门靠人工每次执行） | |
 
 > 计数以 2026-10-28 实跑为准。历史上这张表漂移过三次（101 → 121 → 137，实跑 130），
-> §8.3 里那句「137/137」也是其中之一——数字一旦需要人肉同步就会失真，现在由 CI 兜底，
+> §8.3 里那句「137/137」也是其中之一——数字一旦需要人肉同步就会失真，而没有 CI 兜底，
+> 唯一防线就是改完立刻跑一遍并把输出写回这张表：
 > 本行随 `cargo test` 输出更新（漂移记录见 design.md §9.19）。
 > 总线测试要真 UDS `bind`：在严格沙箱/容器内以 `EPERM` 失败，属环境限制而非回归。
 

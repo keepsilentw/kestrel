@@ -2,7 +2,7 @@
 
 为星型多 Agent harness 写的 Rust harness kernel：引擎 1.1k 行 + wire 层 2.6k + 工具/权限/沙箱 2.3k + 会话 0.9k + 总线/journal 1.4k + CLI/配置 2.3k（`src` 48 文件 10.5k 行，`tests` 8 文件 2.2k 行）。设计文档（中文）见本仓库 `docs/design.md`。
 
-Status: M0-M4 complete + 二期开工（`ApproveMode::Bus`、SA 判定含证据核对、bus 停车补投与自动重连）——156 tests，fmt / clippy `-D warnings` / test 三闸门已进 CI（`.github/workflows/ci.yml`，ubuntu + macOS）
+Status: M0-M4 complete + 二期开工（`ApproveMode::Bus`、SA 判定含证据核对、bus 停车补投与自动重连）——156 tests，fmt / clippy `-D warnings` / test 三闸门全绿（人工执行：本仓库不挂 CI）
 
 ## Quick start
 
@@ -34,6 +34,7 @@ cargo test          # 156 项；沙箱 e2e 需 macOS（真实 /usr/bin/sandbox-e
 cargo fmt --check && cargo clippy --all-targets -- -D warnings   # 质量闸门
 ```
 
+> 没有 CI 兜底：上面两条命令是**每次改动都要人肉跑的闸门**，跑不过就不算完成。
 > 总线测试要在真 UDS 上 bind socket：容器/严格沙箱里会以 `EPERM` 失败，不是回归。
 
 ## Demo（星型三角色联跑）

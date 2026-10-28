@@ -1,7 +1,7 @@
 # kestrel 设计文档：Rust harness kernel
 
 > 状态：M0-M4 已实现并通过测试（156/156）；§10 二期已落地三项——`ApproveMode::Bus`、
-> 「判定 = 工件 + 证据文件」、bus 重连重放（停车补投 + 客户端重连）。质量闸门进 CI（`.github/workflows/ci.yml`，ubuntu + macOS）。
+> 「判定 = 工件 + 证据文件」、bus 重连重放（停车补投 + 客户端重连）。质量闸门保持人工执行（本仓库不挂 CI，见 §9.19⑥）。
 > 实现规模：src 48 文件 10,308 行 + tests 8 文件 2,025 行（plan 预算 ~10-13k 行内）。
 > 输入：实现规划（plan.md）与调研语料（codex / pi study notes、三方资料库 references.md）——均为开发过程资料，未随本仓库发布。
 > 本文沉淀实现后的最终设计；与 plan 的偏差在 §9 逐条记录。
@@ -113,7 +113,7 @@ role 文件的路径字段（`write_roots`/`read_only_islands`/`policy_file`/`pr
 
 ## 8 测试策略
 
-faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_request` 纯函数）→ 零真 key 覆盖全部验收；三层测试（单元/组件 golden/e2e）；determinism 经 `IdGen`/`Clock` 注入；沙箱 e2e 仅 macOS（`#[cfg(target_os="macos")]`）；闸门 = `cargo fmt --check` + `clippy -D warnings` + 全测试，2026-10-28 起由 `.github/workflows/ci.yml` 在 ubuntu + macOS 两个 runner 上执行（此前闸门只靠人工，1.98 那次 clippy 破功就是这么漏掉的）。
+faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_request` 纯函数）→ 零真 key 覆盖全部验收；三层测试（单元/组件 golden/e2e）；determinism 经 `IdGen`/`Clock` 注入；沙箱 e2e 仅 macOS（`#[cfg(target_os="macos")]`）；闸门 = `cargo fmt --check` + `clippy -D warnings` + 全测试，**人工执行、每次改动都跑**：本仓库不挂 CI（2026-10-28 试过 `ci.yml`，同日按决定移除，见 §9.19⑥），所以这道闸门没有兜底机制——rust/clippy 1.98 那次破功就是因为只靠人记得跑。
 
 156 项 = lib 单测 115 + bin 单测（CLI 形状）4 + 集成 37（core_loop 5 / m1_tools 8 / m2_session 6 / m4_bus 11 / sandbox_e2e 4 / wire_anthropic 2 / discipline 1）。计数以实跑为准，改测试时同步这一行：此前 README / design / 报告三处各写一个数（137 / 137 / 121），实跑只有 130，漂移本身记在 §9.19。总线测试需要真 UDS `bind`，在严格沙箱或容器里以 `EPERM` 失败，属环境限制而非回归。
 
@@ -144,7 +144,7 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
 17. **联跑的计时与预算假设过期（2026-10-26）**：SA 原先硬编码 180s 等回铃、2.0 USD 预算，二者都是「一次派发 = 一次冷引擎」时代的数字。常驻引擎 + 8 轮工具回合 + 真网关（BigModel 单轮实测 48-77s）下 180s 必然误判为「铃丢了」；一次诚实回派也会直接触顶。改为 `--bell-timeout-secs`（默认 300）与 `--max-usd`（默认 6.0 = 4 stage × 3 iter × 0.5，让预算覆盖声明的重试策略），run-demo.sh 可用 `KESTREL_DEMO_BELL_TIMEOUT` / `KESTREL_DEMO_MAX_USD` 覆盖。
 18. **判定变严之后，demo 自身的矛盾才暴露（2026-10-26）**：① 角色 prompt 要求 RD/QA「把结果写进 artifacts」，可 RD 的写范围只有 worktree、QA 写范围为零——它们每轮都在撞自己角色的墙；结论改为「文字回答，由 `serve` 落成工件」。② QA 没有目录发现手段（策略只放 `ls`/`rg`/`cat`/`cargo`/`python3 -m`），又没有 RD 产出清单，只能猜文件名，三轮都只能回「证据不足」；因此 RD 的 `DONE` 必须逐条列出新建/修改的绝对路径与测试入口，QA 按清单取证（读 RD 工件 → 按路径读源码 → 单条已允许的命令执行），并且 `python3 -m` 进入两侧允许表（此前 QA 的允许表里没有测试运行器，`test` stage 在结构上不可能拿到执行证据）。③ 命令拼接纪律：`&&`/管道分段求值，任一段不在允许表里整条被拒——prompt 里写明用单条命令，避免把策略失败读成实现失败。这三条都不是内核缺陷，但只有先把 SA 判定做实，它们才会被看见（此前「工件存在即 pass」把它们全盖住了）。
 
-19. **文档与配置的漂移（2026-10-28 修正）**：① 测试数三处不一致——README/design 写 137、报告写 121、实跑 130；② README 的规模拆解（wire ~1.5k、总线+journal ~1.5k）与实测（provider 2.58k、bus+journal 1.08k）不符；③ journal 的 `budget_spent` 记 `usage: 0` 却写 `usd: 0.5`，读起来像按 token 计费，实际是 `per_dispatch_usd` 的固定名义扣费——口径改为「fixture 名义停损」，真实 token 由结果铃带回并另记 `usage_reported`；④ 三份 role 的 `[budget].max_usd` 没有任何读者，删除；⑤ RD 的 `write_roots` 硬编码 `/tmp/kestrel-worktree`，改为 `$KESTREL_WORKTREE:-…`；⑥ 没有 CI，1.98 那次 clippy 破功（§9.15）只有人肉跑闸门才看得见——补 `ci.yml`（ubuntu + macOS）。数字与配置写错的代价不是难看，而是让人不再核对它们。
+19. **文档与配置的漂移（2026-10-28 修正）**：① 测试数三处不一致——README/design 写 137、报告写 121、实跑 130；② README 的规模拆解（wire ~1.5k、总线+journal ~1.5k）与实测（provider 2.58k、bus+journal 1.08k）不符；③ journal 的 `budget_spent` 记 `usage: 0` 却写 `usd: 0.5`，读起来像按 token 计费，实际是 `per_dispatch_usd` 的固定名义扣费——口径改为「fixture 名义停损」，真实 token 由结果铃带回并另记 `usage_reported`；④ 三份 role 的 `[budget].max_usd` 没有任何读者，删除；⑤ RD 的 `write_roots` 硬编码 `/tmp/kestrel-worktree`，改为 `$KESTREL_WORKTREE:-…`；⑥ 闸门只靠人记得跑（1.98 那次 clippy 破功，§9.15）——同日补过 `.github/workflows/ci.yml`（ubuntu + macOS），随后按决定移除：**这个仓库不挂 CI**，闸门回到「每次改动人工跑 fmt/clippy -D/test，跑不过不算完成」，代价是这类失真只能靠人兜。数字与配置写错的代价不是难看，而是让人不再核对它们。
 
 20. **二期开工：审批反向请求 + 证据层（2026-10-28）**：`ApproveMode::Bus` 落地（§5）。三个关键取舍：请求载荷必须带 `tool` + `args`（`approval_detail`），否则审批者只能对措辞表态；审批者自己的权力也来自一张三态前缀表（`roles/sa.approvals.json`，只有显式 Allow 放行）；`Waited::TimedOut` 与总线断开都由 worker 侧 deny——一期的 `Bus` 分支是无期限等待，一个不答的 SA 能把 worker 的回合永久挂住，这本身就是可用性缺陷。SA 判定加第三层「证据核对」（`cli/evidence.rs`）：`serve` 从结论取绝对路径（优先机器可读的 `evidence:` 行）写进工件，`verdict_from_artifact` **只在 worker 声称收敛时**核对这些路径存在且非空，FAIL 不额外举证——证据层是为了防止「把 verify 说成通过」，不是给拒绝增加文书工作。同时 `serve` 在回合结束清空在途请求，迟到的批复不会被下一个回合误读。尚未做：按文件类型核对证据（截图/测试产物）、`-p` 模式的本地审批通道。审批请求与批复都是 Notify，跨断线投递由 §9.21 负责，但迟到的批复仍被 worker 丢弃——语义停在超时 deny，不会变成静默放行。
 
