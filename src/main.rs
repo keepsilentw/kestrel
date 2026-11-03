@@ -135,12 +135,36 @@ struct DemoSaCmd {
     #[arg(long, default_value = "artifacts")]
     artifacts_dir: PathBuf,
 
-    /// Budget ceiling for the whole pipeline, in the fixture USD accounting.
-    /// It has to cover the declared retry policy, not just the happy path:
-    /// 4 stages x 3 iterations x 0.5 = 6.0 (a fail 回环 is real now — an empty
-    /// answer or a FAIL verdict re-dispatches instead of passing).
+    /// Budget ceiling for the whole pipeline.
+    ///
+    /// With a price table (`--roles-dir` together with a `cost` block for that
+    /// model in providers.toml) this is a real USD bill: the stop-loss blocks a
+    /// dispatch whose WORST-CASE cost (whole context window plus a full max_out
+    /// answer) would cross it, then settles the actual tokens. Without one the
+    /// ledger books `--nominal-usd` per dispatch, which is a fixture unit and not
+    /// a bill — the SA prints that fact at startup rather than letting it pass as
+    /// one. Either way it has to cover the retry policy, not just the happy path:
+    /// 4 stages times 3 iterations times 0.5 is 6.0 (a fail 回环 is real now — an
+    /// empty answer or a FAIL verdict re-dispatches instead of passing).
     #[arg(long, default_value_t = 6.0)]
     max_usd: f64,
+
+    /// Nominal per-dispatch charge, used only when a peer has no rate to settle
+    /// against. Kept explicit as a flag because it is the difference between
+    /// "the ceiling is a bill" and "the ceiling is a dispatch counter".
+    #[arg(long, default_value_t = 0.5)]
+    nominal_usd: f64,
+
+    /// Directory of role TOMLs. The ledger reads `[llm]` from them to learn which
+    /// peer runs on which provider/model, then prices that model from
+    /// providers.toml. Without it every dispatch stays nominal.
+    #[arg(long)]
+    roles_dir: Option<PathBuf>,
+
+    /// Rate table (USD per million tokens). Defaults to the user layer file
+    /// `~/.kestrel/providers.toml`, read only if it exists.
+    #[arg(long)]
+    prices: Option<PathBuf>,
 
     /// How long to wait for a worker's result bell before falling back to disk
     /// inspection. A resident worker can spend its whole round budget (8 tool
@@ -161,14 +185,16 @@ struct DemoSaCmd {
 
     /// Fold the journal into a checkpoint once the live file holds this many
     /// records (the older prefix moves to `<journal>.seg<from>-<to>.jsonl`, never
-    /// deleted). 0 keeps the original single-file, never-truncated behaviour.
-    #[arg(long, default_value_t = 0)]
-    rotate_after_records: usize,
+    /// deleted). Unset = the default policy (512 records); 0 turns this ceiling off
+    /// explicitly.
+    #[arg(long)]
+    rotate_after_records: Option<usize>,
 
-    /// Byte ceiling for the live journal (either ceiling triggers a rotation;
-    /// records vary in size, so a count alone can leave the file huge). 0 = off.
-    #[arg(long, default_value_t = 0)]
-    rotate_max_bytes: u64,
+    /// Byte ceiling for the live journal (either ceiling triggers a fold; records
+    /// vary in size — an approval record carries stderr — so a count alone cannot
+    /// bound the file). Unset = 1 MiB; 0 = off.
+    #[arg(long)]
+    rotate_max_bytes: Option<u64>,
 
     /// Task namespace: stamped into every journal record, every bell and every
     /// artifact name, so several `demo-sa` processes can share one hub without
@@ -235,22 +261,30 @@ async fn main() -> anyhow::Result<()> {
             .await;
         }
         Some(Command::DemoSa(d)) => {
+            // 三态：没给 = 默认策略；给 0 = 明确关闭；其余 = 自定义。两个上限各自
+            // 独立解析，「封顶了条数」不等于「字节也要无限」。
+            let (rotate_after, rotate_max_bytes) = kestrel::cli::sa_demo::resolve_rotation_policy(
+                d.rotate_after_records,
+                d.rotate_max_bytes,
+            );
             return kestrel::cli::sa_demo::run_demo_sa(kestrel::cli::sa_demo::DemoSaArgs {
                 bus_socket: shellexpand_home(&d.bus_socket),
                 task: d.task,
                 journal: d.journal,
                 artifacts: d.artifacts_dir,
-                per_dispatch_usd: 0.5,
+                per_dispatch_usd: d.nominal_usd,
                 max_usd: d.max_usd,
                 max_iterations: 3,
                 bell_timeout: Duration::from_secs(d.bell_timeout_secs),
                 worktree: d.worktree,
                 approvals: d.approvals,
-                rotate_after: d.rotate_after_records,
-                rotate_max_bytes: d.rotate_max_bytes,
+                rotate_after,
+                rotate_max_bytes,
                 task_id: d.task_id,
                 rd_peer: d.rd_peer,
                 qa_peer: d.qa_peer,
+                roles_dir: d.roles_dir,
+                prices: d.prices,
             })
             .await;
         }

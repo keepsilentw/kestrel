@@ -233,11 +233,14 @@ async fn rotation_does_not_hide_an_in_flight_bell() {
             })
             .unwrap();
         journal
-            .append(&JournalRecord::BudgetSpent {
-                peer: "harness-rd".into(),
-                usage: Default::default(),
-                usd: 0.5,
-            })
+            .append(&JournalRecord::reserved(
+                "t1",
+                "harness-rd",
+                Stage::Dev,
+                iteration,
+                0.5,
+                false,
+            ))
             .unwrap();
         if iteration < 4 {
             journal
@@ -278,6 +281,160 @@ async fn rotation_does_not_hide_an_in_flight_bell() {
     std::fs::remove_dir_all(&task_dir).ok();
 }
 
+/// 默认策略的实质承诺：**截断只搬动历史，不改变任何结论**。
+/// 两条 journal 跑完同一条 pipeline——一条走生产的 `rotate_at_boundary`（上限调小
+/// 才能在这一个测试里真的反复触顶；策略代码路径与具体数字无关），一条永不截断——
+/// 每个 stage 结算后两边的投影必须逐字段相等，轮转那条的活文件必须有界，而完整审计
+/// （`replay_all()`）折出来必须等于不截断的那份。
+#[test]
+fn the_default_rotation_policy_changes_no_conclusion() {
+    use kestrel::cli::sa_demo::rotate_at_boundary;
+    use kestrel::provider::wire::Usage;
+
+    let dir = std::env::temp_dir().join(format!("kestrel-rotate-policy-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let bounded = Journal::create(&dir.join("bounded.jsonl")).unwrap();
+    let never = Journal::create(&dir.join("never.jsonl")).unwrap();
+
+    // 只按条数封顶（字节上限交回给 0 = 关闭），这样触顶是确定的、不靠文件大小
+    let cap = 24usize;
+    let stages = [Stage::Dev, Stage::Review, Stage::Test, Stage::Build];
+    let pass = Verdict {
+        pass: true,
+        issues: vec![],
+    };
+    let mut rotations = 0;
+
+    for round in 1..=12u64 {
+        for (idx, stage) in stages.iter().enumerate() {
+            let task = format!("t{}", idx);
+            let usage = Usage {
+                input_tokens: 1_000 + idx as u64,
+                output_tokens: 200,
+                ..Usage::default()
+            };
+            // 一次完整派发：预留 → 铃 → 回铃 → 读数 → 结算 → 结账，两边写同样的记录
+            for journal in [&bounded, &never] {
+                journal
+                    .append(&JournalRecord::StageWritten {
+                        task: task.clone(),
+                        stage: *stage,
+                        iteration: round,
+                    })
+                    .unwrap();
+                journal
+                    .append(&JournalRecord::BellSent {
+                        task: task.clone(),
+                        to: "harness-rd".into(),
+                        bell: ThinBell {
+                            role: "rd".into(),
+                            stage: *stage,
+                            check: None,
+                            iteration: round,
+                            r#ref: json!({}),
+                        },
+                    })
+                    .unwrap();
+                journal
+                    .append(&JournalRecord::reserved(
+                        task.clone(),
+                        "harness-rd",
+                        *stage,
+                        round,
+                        0.2,
+                        true,
+                    ))
+                    .unwrap();
+                journal
+                    .append(&JournalRecord::BellReceived {
+                        task: task.clone(),
+                        from: "harness-rd".into(),
+                        bell: ThinBell {
+                            role: "rd".into(),
+                            stage: *stage,
+                            check: None,
+                            iteration: round,
+                            r#ref: json!({}),
+                        },
+                    })
+                    .unwrap();
+                journal
+                    .append(&JournalRecord::UsageReported {
+                        peer: "harness-rd".into(),
+                        usage,
+                    })
+                    .unwrap();
+                journal
+                    .append(&JournalRecord::settled(
+                        task.clone(),
+                        "harness-rd",
+                        *stage,
+                        round,
+                        usage,
+                        0.012,
+                        true,
+                    ))
+                    .unwrap();
+                journal
+                    .append(&JournalRecord::ResultCommitted {
+                        task: task.clone(),
+                        stage: *stage,
+                        verdict: pass.clone(),
+                    })
+                    .unwrap();
+            }
+
+            // 只有「轮转那条」执行策略，而且执行的是生产函数
+            if rotate_at_boundary(&bounded, cap, 0).unwrap().is_some() {
+                rotations += 1;
+            }
+
+            let trimmed = bounded.projection();
+            let flat = never.projection();
+            assert_eq!(
+                trimmed.state, flat.state,
+                "round {round} / {stage:?}: 截断后的投影与不截断不等"
+            );
+            assert_eq!(
+                trimmed.in_flight, flat.in_flight,
+                "round {round} / {stage:?}: 未结算的铃因截断而变了"
+            );
+            assert!(
+                bounded.live_records() <= cap,
+                "活文件越过了上限却没有折：{} > {cap}",
+                bounded.live_records()
+            );
+        }
+    }
+
+    assert!(
+        rotations >= 3,
+        "策略必须真的反复触发，否则这条测试什么都没测: {rotations}"
+    );
+    let trimmed_full = reconcile(&bounded.replay_all());
+    let flat = reconcile(&never.replay());
+    assert_eq!(
+        trimmed_full.state, flat.state,
+        "完整审计（段 + 活文件）不等于未截断的历史"
+    );
+    assert_eq!(trimmed_full.in_flight, flat.in_flight);
+    assert!(
+        bounded.replay().len() < never.replay().len(),
+        "活文件确实被截短了"
+    );
+    let segments = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().contains(".seg"))
+        .count();
+    assert!(
+        segments >= 3,
+        "每次轮转留一个归档段（段不自动清理，这是 §9.22 的「不是删除」）: {segments}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Acceptance 6: budget accumulates in the journal and trips the stop-loss.
 #[tokio::test]
 async fn budget_stop_loss_trips() {
@@ -292,11 +449,14 @@ async fn budget_stop_loss_trips() {
             break; // SA 停止派发
         }
         journal
-            .append(&JournalRecord::BudgetSpent {
-                peer: "harness-rd".into(),
-                usage: Default::default(),
-                usd: turn,
-            })
+            .append(&JournalRecord::reserved(
+                "t1",
+                "harness-rd",
+                Stage::Dev,
+                1,
+                turn,
+                false,
+            ))
             .unwrap();
         total += turn;
     }

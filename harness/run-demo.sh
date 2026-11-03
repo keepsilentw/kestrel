@@ -13,7 +13,8 @@
 #   KESTREL_TEST_KILL_AFTER   崩溃注入点：bell_sent | result_received（见 sa_demo.rs）
 #   KESTREL_DEMO_KEEP_JOURNAL 置 1 则保留上一轮 journal/工件（崩溃恢复演练用）
 #   KESTREL_DEMO_ROTATE_AFTER 活文件超过这么多条记录就折成检查点并归档旧前缀
-#   KESTREL_DEMO_ROTATE_BYTES 活文件超过这么多字节也折（两者都默认 0 = 不截断）
+#     （不设 = 走 SA 的默认策略 512 条；显式设 0 = 关闭这一条）
+#   KESTREL_DEMO_ROTATE_BYTES 活文件超过这么多字节也折（不设 = 默认 1 MiB；0 = 关闭）
 #   KESTREL_DEMO_TASK / KESTREL_DEMO_BELL_TIMEOUT / KESTREL_DEMO_MAX_USD
 #
 # 用法：./run-demo.sh
@@ -82,11 +83,22 @@ sleep 1
 # --- 2. SA：脚本化状态机，验证 write-ahead 顺序、崩溃对账、fail 回环与预算停损。
 #     --worktree 把 RD 的写入目录广播进每颗门铃的 ref，QA 才是在验同一棵树；
 #     fail 回环是真的（空结果/FAIL 结论都会回派），所以预算给到 8 次派发。
+#     --roles-dir 让账本知道每个 peer 跑在哪个 provider/model 上：providers.toml
+#     里那个 model 写了 cost，停损就是按 token 结算的账单；没写就退回 --nominal-usd
+#     的名义记账（SA 开工时把这件事印出来，不含糊过去）。
+# 轮转上限：没设环境变量就**不传 flag**，让 SA 走默认策略（512 条 / 1 MiB）；显式设 0
+# 才是关闭。写成 `${X:-0}` 会把「没设」当成「关掉」，默认策略就此变成死代码——这正是
+# 这条清单上「库不猜派发节奏」曾经的位置，现在阈值有了来历，脚本不再替它选 0。
+ROTATE_ARGS=()
+[ -z "${KESTREL_DEMO_ROTATE_AFTER+set}" ] || ROTATE_ARGS+=(--rotate-after-records "$KESTREL_DEMO_ROTATE_AFTER")
+[ -z "${KESTREL_DEMO_ROTATE_BYTES+set}" ] || ROTATE_ARGS+=(--rotate-max-bytes "$KESTREL_DEMO_ROTATE_BYTES")
+
 KESTREL_TEST_KILL_AFTER="${KESTREL_TEST_KILL_AFTER:-}" \
   "$BIN" demo-sa --bus-socket "$SOCKET" --task "${KESTREL_DEMO_TASK:-demo: 实现一个 LRU cache}" \
   --journal "$HERE/journal.jsonl" --artifacts-dir "$ARTIFACTS" \
   --worktree "$WORKTREE" \
   --approvals "$HERE/roles/sa.approvals.json" \
-  --rotate-after-records "${KESTREL_DEMO_ROTATE_AFTER:-0}" \
-  --rotate-max-bytes "${KESTREL_DEMO_ROTATE_BYTES:-0}" \
+  --roles-dir "$HERE/roles" \
+  --nominal-usd "${KESTREL_DEMO_NOMINAL:-0.5}" \
+  ${ROTATE_ARGS[@]+"${ROTATE_ARGS[@]}"} \
   --bell-timeout-secs "${KESTREL_DEMO_BELL_TIMEOUT:-300}" --max-usd "${KESTREL_DEMO_MAX_USD:-6.0}"

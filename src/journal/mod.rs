@@ -395,11 +395,14 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let j = Journal::create(&path).unwrap();
         for usd in [0.5, 0.75] {
-            j.append(&JournalRecord::BudgetSpent {
-                peer: "harness-rd".into(),
-                usage: crate::provider::wire::Usage::default(),
+            j.append(&JournalRecord::reserved(
+                "demo",
+                "harness-rd",
+                Stage::Dev,
+                1,
                 usd,
-            })
+                false,
+            ))
             .unwrap();
         }
         let records = Journal::open(&path).unwrap().replay();
@@ -441,11 +444,14 @@ mod tests {
                 })
                 .unwrap();
             journal
-                .append(&JournalRecord::BudgetSpent {
-                    peer: "harness-rd".into(),
-                    usage: Default::default(),
-                    usd: 0.5,
-                })
+                .append(&JournalRecord::reserved(
+                    "demo",
+                    "harness-rd",
+                    Stage::Dev,
+                    i,
+                    0.5,
+                    false,
+                ))
                 .unwrap();
             if i < bells {
                 journal
@@ -706,6 +712,7 @@ mod tests {
                 to: "harness-qa".into(),
                 bell: bell(3),
             }],
+            ..Checkpoint::default()
         };
         let record = JournalRecord::Snapshot {
             covers: 9,
@@ -788,11 +795,14 @@ mod tests {
                 })
                 .unwrap();
             journal
-                .append(&JournalRecord::BudgetSpent {
-                    peer: "harness-rd".into(),
-                    usage: Default::default(),
-                    usd: 0.5,
-                })
+                .append(&JournalRecord::reserved(
+                    "demo",
+                    "harness-rd",
+                    Stage::Dev,
+                    1,
+                    0.5,
+                    false,
+                ))
                 .unwrap();
         }
         let reopened = Journal::create(&path).unwrap();
