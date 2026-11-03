@@ -10,7 +10,9 @@ use anyhow::Context;
 
 use crate::bus::frame::Envelope;
 use crate::bus::rpc::BusClient;
-use crate::cli::evidence::{check_evidence, evidence_from_answer};
+use crate::cli::evidence::{
+    Evidence, EvidenceKind, check_evidence, evidence_from_answer, missing_requirements,
+};
 use crate::cli::serve::{approval_command, decision_name};
 use crate::cli::task::artifact_path;
 use crate::core::ops::ApprovalDecision;
@@ -65,6 +67,9 @@ pub struct DemoSaArgs {
     pub roles_dir: Option<PathBuf>,
     /// 费率表（`~/.kestrel/providers.toml`）。缺省 => 用用户层那个（存在才读）。
     pub prices: Option<PathBuf>,
+    /// stage 的证据要求表（JSON：`{"test": ["test_log"], ...}`）。没给 = 不要求任何
+    /// 类型，只要 worker 点名的东西在盘上成立——也就是类型化之前的语义。
+    pub evidence_spec: Option<PathBuf>,
 }
 
 /// 一个 peer 后端的定价依据：SA 用它把 token 换成钱。
@@ -202,6 +207,108 @@ impl DemoSaArgs {
     }
 }
 
+/// stage 的证据要求：这一关**必须**拿出哪些类型的证据才算收敛。
+///
+/// 表是数据（`--evidence-spec` 指向的 JSON），不是写在代码里的 if：验收标准由定
+/// 标准的人改，不该为此重新编译 harness。
+#[derive(Debug, Default)]
+pub struct EvidenceSpec {
+    per_stage: BTreeMap<String, Vec<EvidenceKind>>,
+}
+
+impl EvidenceSpec {
+    /// `{"dev": ["file"], "test": ["test_log"], "build": ["test_log", "screenshot"]}`
+    ///
+    /// 读不出来就硬失败：一份坏掉的要求表若被当成「没有要求」，验收标准会在无人
+    /// 察觉时被静默放宽——那是 fail-open，而这张表存在的理由正是防它。
+    pub fn from_json_file(path: &Path) -> anyhow::Result<Self> {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("read evidence spec {}", path.display()))?;
+        let raw: BTreeMap<String, Vec<String>> =
+            serde_json::from_str(&text).with_context(|| {
+                format!(
+                    "parse evidence spec {} (want {{\"stage\": [\"kind\"]}})",
+                    path.display()
+                )
+            })?;
+        let mut per_stage = BTreeMap::new();
+        for (stage, kinds) in raw {
+            if !["spec", "dev", "review", "test", "build", "release"].contains(&stage.as_str()) {
+                tracing::warn!("evidence spec: no such stage {stage} — ignored");
+                continue;
+            }
+            let mut parsed = Vec::with_capacity(kinds.len());
+            for kind in &kinds {
+                let k = EvidenceKind::parse(kind);
+                if k == EvidenceKind::Unknown {
+                    // 认不出的要求类型永远满足不了：留着它就是「永远回派」。
+                    // 说清楚，让人去修表，而不是让 pipeline 空转。
+                    anyhow::bail!(
+                        "evidence spec: stage {stage} requires unknown evidence kind {kind} \
+                         (file | test_log | diff | screenshot)"
+                    );
+                }
+                parsed.push(k);
+            }
+            per_stage.insert(stage, parsed);
+        }
+        Ok(Self { per_stage })
+    }
+
+    /// 该 stage 的要求（表里没这一项 = 空 = 只核存在性）。
+    pub fn required_for(&self, stage: Stage) -> &[EvidenceKind] {
+        let name = format!("{stage:?}").to_lowercase();
+        self.per_stage.get(&name).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.per_stage.is_empty()
+    }
+
+    /// 开工时该对用户讲的话：哪些关被要求了什么。
+    pub fn describe(&self) -> String {
+        if self.per_stage.is_empty() {
+            return "no kind requirements (existence-only)".to_string();
+        }
+        self.per_stage
+            .iter()
+            .map(|(stage, kinds)| {
+                let names: Vec<&str> = kinds.iter().map(EvidenceKind::as_str).collect();
+                format!("{stage}:{}", names.join("+"))
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// 工件里的 `evidence` 数组：既接受类型化对象（`{"path":..., "kind":...}`），也接受
+/// 类型化之前那份裸路径（一律按 `file`）。类型名的唯一来源是 `EvidenceKind::parse`，
+/// 所以这里手写解析而不引 serde 派生——同一组线名不该有两份定义。
+fn evidence_from_artifact(json: &serde_json::Value) -> Vec<Evidence> {
+    let Some(items) = json["evidence"].as_array() else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|v| match v {
+            serde_json::Value::String(path) => Some(Evidence::file(path.clone())),
+            serde_json::Value::Object(obj) => {
+                let path = obj.get("path").and_then(|p| p.as_str())?;
+                let kind = obj
+                    .get("kind")
+                    .and_then(|k| k.as_str())
+                    .map(EvidenceKind::parse)
+                    .unwrap_or(EvidenceKind::File);
+                Some(Evidence {
+                    path: path.to_string(),
+                    kind,
+                })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// When to fold the journal into a checkpoint: either ceiling trips it, and a
 /// zero ceiling disables that condition. Both inputs are O(1) reads (the live
 /// record count comes from the online projection, the size from metadata) —
@@ -304,6 +411,20 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
     // `--max-usd` 是账单上限。
     let prices = load_prices(args.prices.as_deref());
     let ledger = PriceLedger::discover(args.roles_dir.as_deref(), prices.as_ref());
+    // 证据要求表：坏表硬失败（读不出来就当「没有要求」是 fail-open，验收标准会被
+    // 静默放宽）。没给 = 只核存在性。
+    let requirements = match &args.evidence_spec {
+        Some(path) => {
+            let spec = EvidenceSpec::from_json_file(path)
+                .with_context(|| format!("load evidence spec {}", path.display()))?;
+            println!("[sa] evidence requirements: {}", spec.describe());
+            spec
+        }
+        None => {
+            println!("[sa] evidence requirements: none (--evidence-spec not given)");
+            EvidenceSpec::default()
+        }
+    };
     let unpriced: Vec<&str> = [args.rd_peer.as_str(), args.qa_peer.as_str()]
         .into_iter()
         .filter(|p| !ledger.is_priced(p))
@@ -495,8 +616,9 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
             }
 
             // 判定只读盘，不读铃（thin messages：铃正文只是指针）。工件存在
-            // 不等于 stage 收敛——空结果、abort、worker 侧 stop=error 都是 fail。
-            let verdict = verdict_from_artifact(&artifact);
+            // 不等于 stage 收敛——空结果、abort、worker 侧 stop=error 都是 fail，
+            // 而「有文件」也不等于「有这一关要求的证据」。
+            let verdict = verdict_from_artifact(&artifact, requirements.required_for(stage));
             journal.append(&JournalRecord::ResultCommitted {
                 task: args.task_id.clone(),
                 stage,
@@ -640,9 +762,9 @@ pub fn decide_approval(authority: Option<&PermissionEngine>, command: &str) -> A
 /// 从 worker 工件推出该 stage 的判定。契约字段由 `serve` 写入
 /// （`result` / `aborted` / `stop.*` / `evidence`），`result` 头部必须给出判定词。
 /// 三层都要过：通路层（有答案、未中断、worker 侧 stop 不是 error）、语义层
-/// （worker 自己声明的结论）、证据层（它点名的文件确实在盘上有内容）——
-/// 「工件在盘上」从来不等于「stage 通过」。
-pub fn verdict_from_artifact(path: &Path) -> Verdict {
+/// （worker 自己声明的结论）、证据层（它点名的文件在盘上成立为**它声称的那种东西**，
+/// 并且齐全到 `required` 要求的每一类）——「工件在盘上」从来不等于「stage 通过」。
+pub fn verdict_from_artifact(path: &Path, required: &[EvidenceKind]) -> Verdict {
     let Ok(text) = std::fs::read_to_string(path) else {
         return Verdict {
             pass: false,
@@ -682,26 +804,27 @@ pub fn verdict_from_artifact(path: &Path) -> Verdict {
             json["stop"]["message"].as_str().unwrap_or("error")
         ));
     }
-    // 第三层（design §10 二期「工件 + 证据文件」的最小形态）：只有 worker 声称
-    // 收敛时才核证据——判定词是声明，它点名的路径要在盘上真实存在且有内容。
-    // 「PASS 但给不出可查的文件」不是收敛；FAIL 已经是 fail，不再要求它举证。
+    // 第三层：先核「类型」再核「齐全」（design §10 从「工件 + 证据文件」再走一格）。
+    // 「这里有个文件」只证明有东西；声称 `test_log`/`diff`/`screenshot` 就多了一个
+    // 能在盘上被反驳的属性——没有测试汇总行的日志不是测试日志，改名的 txt 不是截图。
+    // stage 要求看的还是**核对通过**的类型：一份普通文件顶不出 `test_log` 那一格。
     if converged {
-        let mut evidence: Vec<String> = json["evidence"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut evidence = evidence_from_artifact(&json);
         if evidence.is_empty() {
-            // 兼容没有 evidence 字段的旧工件：从正文里提绝对路径。
+            // 兼容没有 evidence 字段的旧工件：从正文里提（裸路径按 `file` 档）。
             evidence = evidence_from_answer(&result);
         }
         if evidence.is_empty() {
             issues.push("no evidence paths to verify".to_string());
         } else {
-            issues.extend(check_evidence(&evidence));
+            let report = check_evidence(&evidence);
+            issues.extend(report.issues);
+            for kind in missing_requirements(&report.verified_kinds, required) {
+                issues.push(format!(
+                    "no verified {} evidence: this stage requires one",
+                    kind.as_str()
+                ));
+            }
         }
     }
     Verdict {
@@ -848,6 +971,7 @@ mod tests {
             qa_peer: "harness-qa".into(),
             roles_dir: None,
             prices: None,
+            evidence_spec: None,
         };
         assert_eq!(args.peer_for(Stage::Dev), "harness-rd");
         assert_eq!(args.peer_for(Stage::Build), "harness-qa");
@@ -978,7 +1102,7 @@ mod tests {
                 ev.display()
             ),
         );
-        let v = verdict_from_artifact(&p);
+        let v = verdict_from_artifact(&p, &[]);
         assert!(v.pass, "{:?}", v.issues);
     }
 
@@ -988,7 +1112,7 @@ mod tests {
             "empty.json",
             r#"{"result":"","aborted":false,"stop":{"type":"error","message":"round budget exhausted"}}"#,
         );
-        let v = verdict_from_artifact(&p);
+        let v = verdict_from_artifact(&p, &[]);
         assert!(!v.pass);
         assert!(
             v.issues.contains(&"empty result".to_string())
@@ -1006,7 +1130,7 @@ mod tests {
             "bare.json",
             r#"{"result":"PASS: 全部通过","aborted":false,"stop":{"type":"stop"}}"#,
         );
-        let v = verdict_from_artifact(&bare);
+        let v = verdict_from_artifact(&bare, &[]);
         assert!(!v.pass, "a claim with nothing to check is not a pass");
         assert!(
             v.issues
@@ -1025,7 +1149,7 @@ mod tests {
                 gone.display()
             ),
         );
-        let v = verdict_from_artifact(&p);
+        let v = verdict_from_artifact(&p, &[]);
         assert!(!v.pass);
         assert!(
             v.issues.iter().any(|i| i.starts_with("evidence missing:")),
@@ -1043,7 +1167,7 @@ mod tests {
             ),
         );
         assert!(
-            verdict_from_artifact(&p).pass,
+            verdict_from_artifact(&p, &[]).pass,
             "fallback to the answer text"
         );
     }
@@ -1097,7 +1221,7 @@ mod tests {
             "fail.json",
             r#"{"result":"FAIL: no LRU cache on disk\n细节","aborted":false,"stop":{"type":"stop"}}"#,
         );
-        let v = verdict_from_artifact(&fail);
+        let v = verdict_from_artifact(&fail, &[]);
         assert!(!v.pass, "{:?}", v.issues);
         assert_eq!(v.issues, vec!["verdict: FAIL: no LRU cache on disk"]);
 
@@ -1105,7 +1229,7 @@ mod tests {
             "ramble.json",
             r#"{"result":"收到门铃，我先看了目录","aborted":false,"stop":{"type":"stop"}}"#,
         );
-        let v = verdict_from_artifact(&rambling);
+        let v = verdict_from_artifact(&rambling, &[]);
         assert!(!v.pass, "an answer without a verdict is not a pass");
 
         for head in [
@@ -1124,7 +1248,7 @@ mod tests {
                     ev.display()
                 ),
             );
-            let pass = verdict_from_artifact(&p).pass;
+            let pass = verdict_from_artifact(&p, &[]).pass;
             assert_eq!(
                 pass,
                 !head.starts_with("FAIL") && !head.starts_with("BLOCKED"),
@@ -1172,13 +1296,153 @@ mod tests {
             r#"{"result":"partial","aborted":true,"stop":{"type":"aborted"}}"#,
         );
         assert!(
-            verdict_from_artifact(&p)
+            verdict_from_artifact(&p, &[])
                 .issues
                 .iter()
                 .any(|i| i == "worker aborted")
         );
-        let v = verdict_from_artifact(std::path::Path::new("/tmp/kestrel-no-such-artifact.json"));
+        let v = verdict_from_artifact(
+            std::path::Path::new("/tmp/kestrel-no-such-artifact.json"),
+            &[],
+        );
         assert!(!v.pass);
         assert!(v.issues[0].starts_with("artifact missing"));
+    }
+
+    /// 写一份带 evidence 数组的工件；`evidence_json` 原样插进 `evidence` 字段。
+    fn typed_artifact(name: &str, verdict_head: &str, evidence_json: &str) -> PathBuf {
+        write_artifact(
+            name,
+            &format!(
+                r#"{{"result":"{verdict_head}","evidence":{evidence_json},"aborted":false,"stop":{{"type":"stop"}}}}"#
+            ),
+        )
+    }
+
+    fn write_named(tag: &str, name: &str, body: &[u8]) -> String {
+        let dir = std::env::temp_dir().join(format!("kestrel-evspec-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        path.display().to_string()
+    }
+
+    /// 类型化的意义就在这：**「有个文件」不等于「那是它声称的那种东西」**。
+    /// worker 把一个普通文本指认成测试日志，判定层要能在盘上反驳它。
+    #[test]
+    fn a_claimed_kind_is_verified_not_trusted() {
+        let log = write_named("claim", "pytest.log", b"==== 3 passed in 0.01s ====\n");
+        let p = typed_artifact(
+            "claim-ok.json",
+            "DONE: tests green",
+            &format!(r#"[{{"path":"{log}","kind":"test_log"}}]"#),
+        );
+        assert!(
+            verdict_from_artifact(&p, &[EvidenceKind::TestLog]).pass,
+            "真日志该顶起真要求"
+        );
+
+        let fake = write_named("claim", "note.txt", b"DONE: I ran the tests, trust me\n");
+        let p = typed_artifact(
+            "claim-fake.json",
+            "DONE: tests green",
+            &format!(r#"[{{"path":"{fake}","kind":"test_log"}}]"#),
+        );
+        let v = verdict_from_artifact(&p, &[]);
+        assert!(!v.pass, "{:?}", v.issues);
+        assert!(
+            v.issues.iter().any(|i| i.contains("not a test log")),
+            "{:?}",
+            v.issues
+        );
+    }
+
+    /// 要求看的是**核对通过的**类型：一份普通文件（哪怕存在且有内容）顶不出
+    /// `test_log` 那一格——否则「按 stage 要求齐全」就退化成了措辞比赛。
+    #[test]
+    fn a_plain_file_cannot_fill_a_typed_requirement() {
+        let plain = write_named("req", "cache.rs", b"class LRUCache: pass\n");
+        let p = typed_artifact(
+            "plain-only.json",
+            "DONE: implemented",
+            &format!(r#"["{plain}"]"#),
+        );
+        let v = verdict_from_artifact(&p, &[EvidenceKind::TestLog]);
+        assert!(!v.pass, "{:?}", v.issues);
+        assert!(
+            v.issues
+                .iter()
+                .any(|i| i.contains("no verified test_log evidence")),
+            "{:?}",
+            v.issues
+        );
+        // 没有要求时，同一份工件仍然通过（类型化之前的语义不被打断）
+        assert!(verdict_from_artifact(&p, &[]).pass);
+    }
+
+    /// 老工件（裸路径数组 / 只有正文）继续按 `file` 档核对。
+    #[test]
+    fn legacy_artifact_shapes_still_parse() {
+        let file = write_named("legacy", "a.py", b"print(1)\n");
+        let bare = typed_artifact("legacy.json", "PASS: done", &format!(r#"["{file}"]"#));
+        assert!(verdict_from_artifact(&bare, &[EvidenceKind::File]).pass);
+        // 对象缺 kind 也认：按 file
+        let obj = typed_artifact(
+            "legacy-nokind.json",
+            "PASS: done",
+            &format!(r#"[{{"path":"{file}"}}]"#),
+        );
+        assert!(verdict_from_artifact(&obj, &[]).pass);
+        // 认不出的 kind 不猜：它连 file 档都不算
+        let weird = typed_artifact(
+            "legacy-unknown.json",
+            "PASS: done",
+            &format!(r#"[{{"path":"{file}","kind":"vibe"}}]"#),
+        );
+        let v = verdict_from_artifact(&weird, &[]);
+        assert!(!v.pass, "{:?}", v.issues);
+        assert!(
+            v.issues.iter().any(|i| i.contains("unknown kind")),
+            "{:?}",
+            v.issues
+        );
+    }
+
+    /// 要求表是数据：stage 名与类型名都从线名解析；**认不出的类型硬失败**——
+    /// 「永远满足不了的要求」会让 pipeline 无限回派，比报错难查得多。
+    #[test]
+    fn evidence_spec_parses_stages_and_fails_closed_on_unknown_kind() {
+        let dir = std::env::temp_dir().join(format!("kestrel-spec-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = dir.join("spec.json");
+        std::fs::write(
+            &good,
+            r#"{"dev": ["file", "diff"], "test": ["test_log"], "whatever": ["file"]}"#,
+        )
+        .unwrap();
+        let spec = EvidenceSpec::from_json_file(&good).unwrap();
+        assert_eq!(
+            spec.required_for(Stage::Dev),
+            &[EvidenceKind::File, EvidenceKind::Diff]
+        );
+        assert_eq!(spec.required_for(Stage::Test), &[EvidenceKind::TestLog]);
+        // 表里没写的 stage = 不要求（只核存在性）
+        assert!(spec.required_for(Stage::Build).is_empty());
+        assert!(!spec.is_empty());
+        let described = spec.describe();
+        assert!(described.contains("test:test_log"), "{described}");
+
+        let bogus = dir.join("bogus.json");
+        std::fs::write(&bogus, r#"{"test": ["vibes"]}"#).unwrap();
+        let err = EvidenceSpec::from_json_file(&bogus)
+            .expect_err("an unsatisfiable requirement must be a hard error");
+        assert!(err.to_string().contains("unknown evidence kind"), "{err}");
+
+        let notjson = dir.join("bad.json");
+        std::fs::write(&notjson, "dev: file").unwrap();
+        assert!(
+            EvidenceSpec::from_json_file(&notjson).is_err(),
+            "坏表不能当成没表"
+        );
     }
 }

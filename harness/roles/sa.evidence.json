@@ -1,0 +1,6 @@
+{
+  "dev": ["file"],
+  "review": ["file"],
+  "test": ["file"],
+  "build": ["file"]
+}

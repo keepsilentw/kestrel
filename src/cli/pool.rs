@@ -435,6 +435,9 @@ fn spawn_worker(
                 "aborted": aborted,
                 "stop": stop_seen,
                 "result": result_text,
+                // 证据是**带类型的声明**（`{"path":..., "kind":"test_log"}`），不是
+                // 一串路径：worker 声称那是测试日志，SA 就能在盘上反驳这句话。
+                // 正文里没有契约行时退回裸路径，按 `file` 档记。
                 "evidence": evidence_from_answer(&result_text),
                 "usage": usage,
                 "approvals": approvals,

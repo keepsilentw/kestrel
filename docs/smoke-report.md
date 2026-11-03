@@ -7,12 +7,12 @@
 
 ## 1. 自动化测试基线（cargo test）
 
-**Metrics** — src 51 files / 13867 lines · tests 9 files / 2926 lines · 205 tests (lib 156 + bin 4 + integration 45)
+**Metrics** — src 51 files / 14667 lines · tests 9 files / 2926 lines · 220 tests (lib 171 + bin 4 + integration 45)
 **Integration** — core_loop 5 / discipline 2 / m1_tools 8 / m2_session 6 / m4_bus 15 / m5_pool 3 / sandbox_e2e 4 / wire_anthropic 2
 
 | 组 | 覆盖 |
 |---|---|
-| 单测（lib） | wire 归一（含 openai-responses）/ partial_json / retry / registry / 权限矩阵 / sbpl golden / session 树 / journal 对账、轮转与在线投影 / 证据契约 / 审批授权表 / task 命名空间 / worker 池路由表 / **预算价格表与预留—结算配对**（§13） |
+| 单测（lib） | wire 归一（含 openai-responses）/ partial_json / retry / registry / 权限矩阵 / sbpl golden / session 树 / journal 对账、轮转与在线投影 / 证据契约 / 审批授权表 / task 命名空间 / worker 池路由表 / **预算价格表与预留—结算配对**（§13）、**证据类型化与 stage 要求**（§15） |
 | 单测（bin：CLI 形状） | `--tools` 三态、`--approve` 三值（none / all / bus）、`--resume` 选择子、bus 模式保留 role 期限 |
 | 集成（逐文件分组见上面的 Integration 行） | 引擎验收 / 工具并发与审批超时 / 真实 Seatbelt / golden JSONL / 总线路由、审批往返、停车补投、重连重放、多 pipeline 并存、取消安全、截断后巡检与崩溃对账 / worker 池真并发与历史隔离 / **文档数字不再靠人抄**（discipline） |
 | 合计 | 见 Metrics 行；2026-10-28 那次实跑全部通过，`fmt --check` 与 `clippy -D warnings` 干净（本仓库不挂 CI，闸门靠人工每次执行） |
@@ -317,3 +317,34 @@ design §10 第一条新边界落地：`CostPerMTok` 早在 M3 就进了 registr
 
 一处**故意没做**：归档段自身仍然不治理（不压缩、不清理）。默认策略落地后长运行会攒出很多段，
 这条被单列进 §10，因为「顺手删段」会撞上 §9.22 那条「这不是删除」的语义边界。
+
+## 15. 2026-11-03 证据的类型化（按类型核对 + stage 要求齐全）
+
+§10 最后一条新边界落地：判定层此前只问「路径在不在盘上、有没有内容」，于是 `PASS` 只要在句子里
+塞一个存在的路径就能过。现在证据有类型，类型是**能在盘上被反驳的那句话**（详见 design §9.29）。
+
+| 项 | 用例 | 结果 |
+|---|---|---|
+| 声称 `test_log` 就要有测试汇总行 | `evidence::tests::test_log_must_actually_summarize_a_test_run` | 通过；`test result: ok. 12 passed` 过，写着「trust me」的 txt 被反驳 |
+| 声称 `diff` 就要有 diff 特征 | `evidence::tests::diff_must_look_like_a_diff` | 通过；`diff --git` 或 `--- / +++ / @@` 至少一组 |
+| 截图看魔数与大小，不看扩展名 | `evidence::tests::screenshot_checks_the_magic_bytes_and_the_size` | 通过；改名 txt 被拒，带 PNG 头的 8 字节占位被拒 |
+| 认不出的类型不猜 | `evidence::tests::unverifiable_kind_is_an_issue_not_a_pass` | 通过；它连 `file` 档都不算 |
+| 类型化声明的解析 | `evidence::tests::typed_evidence_lines_carry_their_kind` / `unknown_kind_word_falls_back_to_paths_not_nothing` / `same_path_under_two_kinds_is_two_claims` | 通过；`EVIDENCE <kind> <path...>`，认不出类型名时整行仍按路径收，不丢声明 |
+| 写读同源（线名只有一份） | `evidence::tests::serialized_kind_parses_back` | 通过；`Serialize` 手写而非 derive，避免第二组线名 |
+| 判定层按类型核 + 要求齐全 | `sa_demo::tests::a_claimed_kind_is_verified_not_trusted` / `a_plain_file_cannot_fill_a_typed_requirement` | 通过；要求看的是**核对通过**的类型，普通文件顶不出 `test_log` 那一格 |
+| 老工件形状仍可用 | `sa_demo::tests::legacy_artifact_shapes_still_parse` | 通过；裸路径数组、缺 `kind` 的对象、正文提取都按 `file` 走 |
+| `file` 是下界，不是并列档（回归） | `evidence::tests::a_verified_stronger_kind_also_fills_the_file_floor` | 通过；核对通过的 `test_log` 满足 `file` 要求，反向不成立，全都没通过时下界也不满足 |
+| 要求表坏 = 硬失败 | `sa_demo::tests::evidence_spec_parses_stages_and_fails_closed_on_unknown_kind` | 通过；非 JSON、认不出的类型名都拒绝启动（当成「没有要求」就是 fail-open） |
+
+**验证状态**：`cargo fmt --check` / `cargo clippy --all-targets -- -D warnings` / `cargo test`
+本轮全部实跑，计数见 §1 的 Metrics 行（由 `tests/discipline.rs` 对照源码树校验）。
+
+**没做的事，说清楚**：`harness/roles/sa.evidence.json` 缺省四个 stage 只要 `file`，也就是
+类型化之前的语义——**默认行为不变**。把 `test`/`build` 改成 `test_log` 的价值要靠真端点联跑来验
+（模型会不会照契约写 `EVIDENCE test_log <路径>`、写的日志里有没有真汇总行），离线阶段拿 demo 默认
+为它背书就是把主张当证据。类型化本身已经生效：worker 一旦声明类型，那份声明就会被按类型核对，
+不需要等要求表收紧。
+
+另一处刻意分工：`test_log` 只证明「有一份像测试日志的东西」，**不证明测试通过**
+（`0 passed; 14 failed` 同样合格）。结论仍由判定词给，形状由类型管——要证据自带结论，
+就得再开一格（解析 runner 退出码 / 结构化输出并把过与败写进 journal），这条记在 §10。

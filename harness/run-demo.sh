@@ -86,6 +86,11 @@ sleep 1
 #     --roles-dir 让账本知道每个 peer 跑在哪个 provider/model 上：providers.toml
 #     里那个 model 写了 cost，停损就是按 token 结算的账单；没写就退回 --nominal-usd
 #     的名义记账（SA 开工时把这件事印出来，不含糊过去）。
+#     --evidence-spec 是「每个 stage 必须拿出哪类证据」的表（`roles/sa.evidence.json`）。
+#     缺省那份只要求 `file`，也就是类型化之前的语义；把某一格改成 `test_log` / `diff` /
+#     `screenshot` 之后，worker 光说「跑过了」不管用——那份文件必须真经得起按类型核对。
+#     用 KESTREL_DEMO_EVIDENCE_SPEC 换表，设为空串则不传（回到「不要求任何类型」）。
+# 轮转上限：没设环境变量就**不传 flag**，让 SA 走默认策略（512 条 / 1 MiB）；显式设 0
 # 轮转上限：没设环境变量就**不传 flag**，让 SA 走默认策略（512 条 / 1 MiB）；显式设 0
 # 才是关闭。写成 `${X:-0}` 会把「没设」当成「关掉」，默认策略就此变成死代码——这正是
 # 这条清单上「库不猜派发节奏」曾经的位置，现在阈值有了来历，脚本不再替它选 0。
@@ -93,11 +98,20 @@ ROTATE_ARGS=()
 [ -z "${KESTREL_DEMO_ROTATE_AFTER+set}" ] || ROTATE_ARGS+=(--rotate-after-records "$KESTREL_DEMO_ROTATE_AFTER")
 [ -z "${KESTREL_DEMO_ROTATE_BYTES+set}" ] || ROTATE_ARGS+=(--rotate-max-bytes "$KESTREL_DEMO_ROTATE_BYTES")
 
+# 证据要求表：默认用 roles/sa.evidence.json；显式设成空串 = 不传（无类型要求）。
+# 写成 `[ -n ... ] && arr+=(...)` 在 set -e 下会在空值时把脚本带走，所以用 if。
+EVIDENCE_SPEC="${KESTREL_DEMO_EVIDENCE_SPEC-$HERE/roles/sa.evidence.json}"
+EVIDENCE_ARGS=()
+if [ -n "$EVIDENCE_SPEC" ]; then
+  EVIDENCE_ARGS+=(--evidence-spec "$EVIDENCE_SPEC")
+fi
+
 KESTREL_TEST_KILL_AFTER="${KESTREL_TEST_KILL_AFTER:-}" \
   "$BIN" demo-sa --bus-socket "$SOCKET" --task "${KESTREL_DEMO_TASK:-demo: 实现一个 LRU cache}" \
   --journal "$HERE/journal.jsonl" --artifacts-dir "$ARTIFACTS" \
   --worktree "$WORKTREE" \
   --approvals "$HERE/roles/sa.approvals.json" \
+  ${EVIDENCE_ARGS[@]+"${EVIDENCE_ARGS[@]}"} \
   --roles-dir "$HERE/roles" \
   --nominal-usd "${KESTREL_DEMO_NOMINAL:-0.5}" \
   ${ROTATE_ARGS[@]+"${ROTATE_ARGS[@]}"} \

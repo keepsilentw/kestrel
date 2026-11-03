@@ -2,9 +2,9 @@
 
 为星型多 Agent harness 写的 Rust harness kernel：引擎 + wire 层 + 工具/权限/沙箱 + 会话 + 总线/journal + CLI/配置。设计文档（中文）见本仓库 `docs/design.md`。
 
-**Metrics** — src 51 files / 13867 lines · tests 9 files / 2926 lines · 205 tests (lib 156 + bin 4 + integration 45)
+**Metrics** — src 51 files / 14667 lines · tests 9 files / 2926 lines · 220 tests (lib 171 + bin 4 + integration 45)
 
-Status: M0-M4 complete + 二期开工（`ApproveMode::Bus`、SA 判定含证据核对、bus 停车补投与自动重连、journal 快照/截断与在线投影、多任务 task 命名空间、openai-responses wire、worker 池、预算按 token 结算的价格表）——fmt / clippy `-D warnings` / test 三闸门全绿（人工执行：本仓库不挂 CI）。上面那行数字由 `tests/discipline.rs` 与源码树对照校验：改完代码不更新它，闸门就红。
+Status: M0-M4 complete + 二期开工（`ApproveMode::Bus`、SA 判定含证据核对、bus 停车补投与自动重连、journal 快照/截断与在线投影、多任务 task 命名空间、openai-responses wire、worker 池、预算按 token 结算的价格表、journal 轮转的默认策略、按类型核对的证据与 stage 要求表）——fmt / clippy `-D warnings` / test 三闸门全绿（人工执行：本仓库不挂 CI）。上面那行数字由 `tests/discipline.rs` 与源码树对照校验：改完代码不更新它，闸门就红。
 
 ## Quick start
 
@@ -47,6 +47,7 @@ cargo build && ./harness/run-demo.sh      # hub + RD + QA + demo-sa 四进程
 
 可调项（env 或 `demo-sa` flag）：`--bell-timeout-secs`（等回铃，默认 300）、
 `--max-usd`（停损上限，默认 6.0）、`--roles-dir`/`--prices`（预算价格表，见下）、
+`--evidence-spec`（每个 stage 要哪类证据，见下）、
 `--worktree`（RD 的写入目录，广播进每颗门铃的 `ref`，QA 据此取证；`KESTREL_WORKTREE`
 同时喂给 role 的 `write_roots`）、`--approvals`（SA 的审批授权表，见下）。
 
@@ -65,6 +66,21 @@ cargo build && ./harness/run-demo.sh      # hub + RD + QA + demo-sa 四进程
 SA 的判定只读盘，且分三层：通路（有答案、未 abort、worker 侧 stop 非 error）→
 语义（文字结论里的 `PASS`/`DONE`）→ **证据**（工件 `evidence` 数组点名的绝对路径必须
 在盘上存在且有内容）。`FAIL`/空答案/无判定词/给不出可查文件，一律回派。
+
+### 证据的类型化
+
+「有个文件」只证明有东西。worker 可以按类型声明证据：`EVIDENCE test_log /abs/path/pytest.log`
+（可用类型 `file` / `test_log` / `diff` / `screenshot`，缺省 `file`），而类型是 **SA 能在盘上
+反驳的那句话**：`test_log` 里要能找到测试汇总行（`test result:` / `passed` / `Tests:` …），
+`diff` 要有 `diff --git` 或 `--- / +++ / @@`，`screenshot` 的文件头要真是 PNG/JPEG/GIF/WebP
+且不小于 1 KiB。认不出的类型名不猜——它连 `file` 档都不算。
+
+`--evidence-spec` 指向的表把「这一关要哪类证据」变成数据：`{"test": ["test_log"], "dev": ["file"]}`。
+要求看的是**核对通过**的类型，所以一份普通文件顶不出 `test_log` 那一格。表读不出来或要求了
+认不出的类型 => **启动即失败**（坏表当成「没有要求」就是 fail-open；永远满足不了的要求会让
+pipeline 无限回派）。`harness/roles/sa.evidence.json` 缺省四个 stage 都只要 `file`，也就是
+类型化之前的语义——收紧哪一格是定标准的人的决定，不由 demo 替它默认。QA 写范围为零这条纪律
+没动：它指认盘上已有的那份，不需要为了「声明过」而先造一个文件。
 
 ## Configuration
 
@@ -144,7 +160,7 @@ src/
               + snapshot 检查点与归档段轮转（截断不丢未结算的铃）
   cli/        -p 单发 / serve 常驻 worker / demo-sa 脚本化 SA / hub 总线进程
               + pool.rs（worker 池：按 task 路由，一 task 一引擎一树）
-              + evidence.rs（证据契约：从结论提路径 + 盘上核对）
+              + evidence.rs（证据契约：类型化声明 + 按类型在盘上核对 + stage 要求齐全）
               + task.rs（task 命名空间：工件名契约 + slug 防路径穿越）
   config/     角色加载（含 $VAR 路径展开）+ KESTREL_HOME
 harness/      三角色 demo：roles/*.toml + roles/sa.approvals.json + systems/*.md + run-demo.sh

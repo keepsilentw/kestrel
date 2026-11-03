@@ -166,6 +166,14 @@ struct DemoSaCmd {
     #[arg(long)]
     prices: Option<PathBuf>,
 
+    /// Per-stage evidence requirements, as JSON: `{"dev": ["diff"], "test":
+    /// ["test_log"]}`. A required kind must be claimed by the worker AND verify
+    /// as that kind on disk — a plain file cannot fill a `test_log` slot. Absent
+    /// means existence-only checks (the pre-typing semantics); a malformed table
+    /// is a start-up failure, never a silent "no requirements".
+    #[arg(long)]
+    evidence_spec: Option<PathBuf>,
+
     /// How long to wait for a worker's result bell before falling back to disk
     /// inspection. A resident worker can spend its whole round budget (8 tool
     /// rounds) on one bell, so this is not a 30s knob.
@@ -285,6 +293,7 @@ async fn main() -> anyhow::Result<()> {
                 qa_peer: d.qa_peer,
                 roles_dir: d.roles_dir,
                 prices: d.prices,
+                evidence_spec: d.evidence_spec,
             })
             .await;
         }

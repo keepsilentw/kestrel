@@ -1,12 +1,13 @@
 # kestrel 设计文档：Rust harness kernel
 
-> 状态：M0-M4 已实现并通过测试；§10 二期已落地九项——`ApproveMode::Bus`、
+> 状态：M0-M4 已实现并通过测试；§10 二期已落地十一项——`ApproveMode::Bus`、
 > 「判定 = 工件 + 证据文件」、bus 重连重放（停车补投 + 客户端重连）、journal 快照/截断语义、
 > 多任务并行（task 命名空间 + 前缀寻址）、openai-responses wire（**真端点未实测**，§9.24）、
 > journal 投影增量化与轮转触发（§9.25）、worker 池（一 task 一引擎一树，§9.26）、
-> 预算价格表（usd 按 token 结算，§9.27）。
+> 预算价格表（usd 按 token 结算，§9.27）、journal 轮转的默认策略（活文件有界，§9.28）、
+> 证据的类型化（按类型核对 + stage 要求齐全，§9.29）。
 > 质量闸门保持人工执行（本仓库不挂 CI，见 §9.19⑥）。
-> **Metrics** — src 51 files / 13867 lines · tests 9 files / 2926 lines · 205 tests (lib 156 + bin 4 + integration 45)
+> **Metrics** — src 51 files / 14667 lines · tests 9 files / 2926 lines · 220 tests (lib 171 + bin 4 + integration 45)
 > **Integration** — core_loop 5 / discipline 2 / m1_tools 8 / m2_session 6 / m4_bus 15 / m5_pool 3 / sandbox_e2e 4 / wire_anthropic 2
 > 规模已过 plan 预算（10-13k）的上沿：多出来的部分几乎都花在「取消安全」与「对账」这两条纪律上。
 > 上面两行数字由 `tests/discipline.rs::metrics_lines_match_the_tree` 对照源码树重算校验——
@@ -214,10 +215,18 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
     ④ 生产与测试走同一个函数 `rotate_at_boundary(journal, cap_records, cap_bytes)`。这一步是刻意的：`tests/m4_bus.rs::the_default_rotation_policy_changes_no_conclusion` 让两条 journal 跑完同一条 12 轮 × 4 stage 的 pipeline（一条走这个生产函数、一条永不截断），每个 stage 结算后断言投影逐字段相等、未结算的铃相等、活文件不越过上限，最后断言 `replay_all()` 折出来 == 不截断的那份。测试若自己重写一遍触发条件，它能通过而生产照样不轮转——那种测试是假的。
     ⑤ 折叠把活文件降到上限的一半附近，于是长期在 1/2~1 倍上限之间浮动；段文件按覆盖区间命名、不自动清理（审计资产，不是缓存）。「段本身也该压缩/归档」是另一格，仍留在 §10。
 
+29. **证据的类型化（2026-11-03）**：§10 最后一条新边界。判定层原本只问「worker 点名的路径在不在盘上、有没有内容」，于是 `PASS` 只要在句子里塞一个存在的路径就能过——文件里有东西，不等于那是它声称的那种东西。
+    ① 类型是**能在盘上被反驳的那句话**，不是修饰词。`file` 保持原语义（存在 + 非空）；`test_log` 要求尾部一段里出现可识别的测试汇总行（`test result:` / `passed` / `Tests:` / `BUILD SUCCESS` …）；`diff` 要求 `diff --git` 或 `--- / +++ / @@` 的组合；`screenshot` 要求文件头真是 PNG/JPEG/GIF/WebP 的魔数且不小于 1 KiB（改了名字的 txt 不是截图，带 PNG 头的 20 字节占位也不是）。认不出的类型名不猜：它连 `file` 档都不算，直接一条 issue。
+    ② 要求表是数据不是代码：`--evidence-spec` 指一份 `{"test": ["test_log"], "dev": ["file"]}`。`EvidenceSpec::from_json_file` 读不出来就**硬失败**——坏表若被当成「没有要求」，验收标准会在无人察觉时被静默放宽，那是 fail-open，而这张表存在的理由正是防它；表里出现认不出的类型名同样硬失败（那是一条永远满足不了的要求，会让 pipeline 无限回派，报错比空转好查）。
+    ③ stage 要求看的是**核对通过**的类型集合（`EvidenceReport.verified_kinds`），不是「声明过的类型」：一份普通文件顶不出 `test_log` 那一格，否则要求又退化成措辞比赛。反过来 `file` 是**下界**而不是并列的一档：任何通过更强类型核对的证据都已经过了「在盘上、有内容」那关（那段检查在类型分派之前就跑完了），所以它必须能满足 `file` 要求。这一条不是理论洁癖——demo 的表写 `file`、提示词教 worker 写 `EVIDENCE test_log`，把 `file` 当并列档的话这两件好事凑一起就足以把 pipeline 打进无限回派。钉住它的测试：`a_verified_stronger_kind_also_fills_the_file_floor`。
+    ④ 兼容不做成两份真相：工件的 `evidence` 数组既收对象（`{"path","kind"}`）也收老的裸路径字符串（按 `file`）；正文里没有契约行时仍从答案里提绝对路径。类型线名只有一份定义（`EvidenceKind::as_str` / `parse`），所以写侧手写 `Serialize` 而不是 derive——derive 会造出第二组线名，而 `serialized_kind_parses_back` 钉住写读同源。
+    ⑤ 声明通道：worker 用 `EVIDENCE <kind> <path...>` 行声明（`harness/systems/{rd,qa}.md` 已写进契约），worker **只报它看到的东西**，判定仍然只读盘（不变式：铃正文与声明都是主张）。QA 写范围为零这一条没动：它不需要为了能声明类型而获得写权限，指认盘上已有的那份即可。
+    ⑥ demo 缺省表要**行为不变**：`harness/roles/sa.evidence.json` 四个 stage 都只要求 `file`，等于类型化之前的语义；把某一格改成 `test_log` 是运营者的决定，不改默认、不静默改沙箱。这也是这份文档里唯一一处「能力落地但策略保守」的取舍： stricter 要求的价值要靠真端点联跑来验，不能拿 demo 默认为它背书。
+
 ## 10 二期清单
 
-已落地（2026-10-28 起）：~~`ApproveMode::Bus`~~（授权表 + 超时 fail-closed + journal 审计，§9.20）、~~SA 判定升级到「工件 + 证据文件」~~（绝对路径存在性/非空核对，§9.20）、~~bus 重连重放~~（离线 session 停车补投 + 客户端自动重连；RPC 与「写入即死」的帧不重放，§9.21）、~~journal 快照/截断语义~~（检查点 + 归档段 + 崩溃安全轮转，§9.22）、~~多任务并行~~（task 命名空间三处同源 + 前缀寻址，§9.23）、~~openai-responses wire~~（第三条 v1 wire，金身 + fixture 验证，**真端点未实测**，§9.24）、~~journal 投影增量化与轮转触发~~（在线投影 = 全量重放 + 条数/字节双上限，§9.25）、~~一个引擎内真正并发地服务多个 task~~（改为「一 task 一引擎」的 worker 池，单活跃槽不动，§9.26）、~~`BudgetSpent` 的价格表~~（预留 → 结算两段式、按 token 换账单、无价退回名义值并报出来，§9.27；2026-11-03）。
+已落地（2026-10-28 起）：~~`ApproveMode::Bus`~~（授权表 + 超时 fail-closed + journal 审计，§9.20）、~~SA 判定升级到「工件 + 证据文件」~~（绝对路径存在性/非空核对，§9.20）、~~bus 重连重放~~（离线 session 停车补投 + 客户端自动重连；RPC 与「写入即死」的帧不重放，§9.21）、~~journal 快照/截断语义~~（检查点 + 归档段 + 崩溃安全轮转，§9.22）、~~多任务并行~~（task 命名空间三处同源 + 前缀寻址，§9.23）、~~openai-responses wire~~（第三条 v1 wire，金身 + fixture 验证，**真端点未实测**，§9.24）、~~journal 投影增量化与轮转触发~~（在线投影 = 全量重放 + 条数/字节双上限，§9.25）、~~一个引擎内真正并发地服务多个 task~~（改为「一 task 一引擎」的 worker 池，单活跃槽不动，§9.26）、~~`BudgetSpent` 的价格表~~（预留 → 结算两段式、按 token 换账单、无价退回名义值并报出来，§9.27；2026-11-03）、~~journal 轮转的**默认策略**~~（活文件 512 条 / 1 MiB 双上限、三态 CLI、生产与测试同一条 `rotate_at_boundary`，§9.28；2026-11-03）、~~证据的类型化~~（`file` / `test_log` / `diff` / `screenshot` 各自可在盘上反驳 + `--evidence-spec` 的 stage 要求，坏表硬失败，§9.29；2026-11-03）。
 
 仍在清单上：tree-sitter-bash 命令解析、execpolicy DSL（Starlark）、landlock/bwrap（Linux 沙箱）、TUI（行级 diff 形制，pi-tui 蓝本）、MCP 客户端、model-in-the-loop evals（含 openai-responses 的真端点实测，§9.24）、审批批复的可靠投递（请求与批复都是 Notify：§9.21 的停车补投已覆盖「审批者当时不在线」，剩下的缺口是批复迟到——回合结束即丢弃，语义停在超时 deny；跨进程重启的可靠投递要等 ack 语义）、worker 池的资源护栏（`--max-tasks` 只挡 task 数，不挡每 task 的内存与并发 HTTP；真·多进程编排属于 harness 上层）、**归档段自身的治理**（默认策略落地后，长运行会攒出很多段；段按覆盖区间命名、永不自动清理，所以「段也该压缩或离线归档」是新的一格——不能靠默认轮转顺手做删除，那会撞上「这不是删除」那条语义边界）。
 
-新划出的边界：证据的类型化（`evidence` 从「路径存在」升级到「测试产物/截图按 stage 要求齐全」）；价格表之后的下一步——`nominal_usd` 的占比应当随 `providers.toml` 填写完整率下降，这条曲线本身值得盯（单价填全之后，`--max-usd` 才是真正的账单上限，名义值只作为「说不清价」的兜底存在）。
+新划出的边界：`nominal_usd` 的占比应当随 `providers.toml` 填写完整率下降，这条曲线本身值得盯（单价填全之后 `--max-usd` 才是真正的账单上限，名义值只作为「说不清价」的兜底存在）；证据类型化之后的下一步是**要求的强度**——`test_log` 只证明「有一份像测试日志的东西」，不证明「测试通过」（`0 passed; 14 failed` 同样合格）。把结论判定交给判定词、把形状交给类型，是刻意的分工；要让证据自己携带结论，就得再开一格：解析 runner 的退出码或结构化输出，并把「过了几条、failed 几条」写进 journal。
