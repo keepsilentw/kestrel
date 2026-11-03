@@ -23,7 +23,9 @@ use tokio_util::task::AbortOnDropHandle;
 use crate::bus::frame::{Envelope, FrameKind};
 use crate::bus::rpc::BusClient;
 use crate::cli::evidence::evidence_from_answer;
-use crate::cli::serve::{approval_request_frame, bell_prompt, decision_from_frame, decision_name};
+use crate::cli::serve::{
+    approval_receipt_frame, approval_request_frame, bell_prompt, decision_from_frame, decision_name,
+};
 use crate::cli::task::{artifact_name, task_of};
 use crate::core::actor::AgentHandle;
 use crate::core::events::{Event, EventMsg, MessageItem};
@@ -245,7 +247,23 @@ pub async fn run_pool(
                                 None => tracing::warn!("approval reply for a dead task {task}"),
                             }
                         }
-                        Action::Drop(reason) => tracing::warn!("pump: dropping approval reply: {reason}"),
+                        // 一份没有归属的批复（重复投递，或那颗请求已经关掉了）不能
+                        // 只是被静默丢掉：回执要说回给审批者「收到了，但没生效」，
+                        // 否则「批复丢了」和「批了但没人听」在对方的账上长得一样。
+                        Action::Drop(reason) => {
+                            tracing::warn!("pump: dropping approval reply: {reason}");
+                            let req = frame.payload["req"].as_str().unwrap_or_default();
+                            client.notify(
+                                &frame.sender,
+                                approval_receipt_frame(
+                                    &cfg.session,
+                                    req,
+                                    decision_from_frame(&frame.payload),
+                                    false,
+                                    &reason,
+                                ),
+                            );
+                        }
                         other => tracing::warn!("pump: unexpected routing {other:?}"),
                     }
                     continue;
@@ -378,17 +396,39 @@ fn spawn_worker(
                                 aborted = matches!(stop, StopReason::Aborted);
                                 usage = seen;
                                 // 回合结束了，还在途的请求一律关掉：路由表必须有界
-                                // （§9.26②），批复再迟到也没有人要了
-                                for (req, _) in std::mem::take(&mut open) {
-                                    let _ = out_tx.send(Outbound::ApprovalClosed { req });
+                                // （§9.26②），批复再迟到也没有人要了。关掉的同时要
+                                // 回执——这一格现在是「没人听了」，审批者不必再猜
+                                // 自己那份批复去了哪里。
+                                for (req, waiting) in std::mem::take(&mut open) {
+                                    let _ = out_tx.send(Outbound::ApprovalClosed { req: req.clone() });
+                                    let _ = out_tx.send(Outbound::Notify {
+                                        session: waiting.to,
+                                        payload: approval_receipt_frame(
+                                            &cfg.session,
+                                            &req,
+                                            ApprovalDecision::Deny,
+                                            false,
+                                            "the turn ended",
+                                        ),
+                                    });
                                 }
                                 stop_seen = Some(stop);
                                 break;
                             }
                             EventMsg::Fatal { error } => {
                                 result_text = format!("fatal: {error}");
-                                for (req, _) in std::mem::take(&mut open) {
-                                    let _ = out_tx.send(Outbound::ApprovalClosed { req });
+                                for (req, waiting) in std::mem::take(&mut open) {
+                                    let _ = out_tx.send(Outbound::ApprovalClosed { req: req.clone() });
+                                    let _ = out_tx.send(Outbound::Notify {
+                                        session: waiting.to,
+                                        payload: approval_receipt_frame(
+                                            &cfg.session,
+                                            &req,
+                                            ApprovalDecision::Deny,
+                                            false,
+                                            "the turn failed",
+                                        ),
+                                    });
                                 }
                                 stop_seen = Some(StopReason::error(error, true));
                                 break;
@@ -397,6 +437,33 @@ fn spawn_worker(
                                 item: MessageItem::AssistantText { text },
                             } => {
                                 result_text = text;
+                            }
+                            // 等待者已经撤摊（到点或被中断）：停止重发、回执一句
+                            // 「没生效」，并把它记进工件。不记的话，后来那份重复的
+                            // 批复就会在账上伪装成「曾经生效过」。
+                            EventMsg::ApprovalExpired { req, reason } => {
+                                let target = open
+                                    .remove(&req)
+                                    .map(|waiting| waiting.to)
+                                    .unwrap_or_else(|| approver.clone());
+                                let _ = out_tx.send(Outbound::ApprovalClosed { req: req.clone() });
+                                approvals.push(serde_json::json!({
+                                    "req": req,
+                                    "decision": "expired",
+                                    "by": target,
+                                    "applied": false,
+                                    "reason": reason,
+                                }));
+                                let _ = out_tx.send(Outbound::Notify {
+                                    session: target,
+                                    payload: approval_receipt_frame(
+                                        &cfg.session,
+                                        &req,
+                                        ApprovalDecision::Deny,
+                                        false,
+                                        &reason,
+                                    ),
+                                });
                             }
                             EventMsg::ApprovalRequest { req, prompt, detail } => {
                                 let frame = approval_request_frame(
@@ -463,8 +530,21 @@ fn spawn_worker(
                                         "req": req,
                                         "decision": decision_name(decision),
                                         "by": by,
+                                        "applied": true,
                                     }));
-                                    let _ = out_tx.send(Outbound::ApprovalClosed { req });
+                                    let _ = out_tx.send(Outbound::ApprovalClosed { req: req.clone() });
+                                    // 生效了也要回执：审批者那条「谁放宽了沙箱」的记录
+                                    // 只有拿到这句话才算闭环
+                                    let _ = out_tx.send(Outbound::Notify {
+                                        session: by,
+                                        payload: approval_receipt_frame(
+                                            &cfg.session,
+                                            &req,
+                                            decision,
+                                            true,
+                                            "the waiting tool was woken",
+                                        ),
+                                    });
                                 } else {
                                     // 已经答过，或回合结束时就关掉了：同一个 req 的
                                     // 第二份 allow 绝不能再把工具跑一遍

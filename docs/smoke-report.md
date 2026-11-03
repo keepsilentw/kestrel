@@ -7,8 +7,8 @@
 
 ## 1. 自动化测试基线（cargo test）
 
-**Metrics** — src 51 files / 14968 lines · tests 9 files / 3077 lines · 224 tests (lib 174 + bin 4 + integration 46)
-**Integration** — core_loop 5 / discipline 2 / m1_tools 8 / m2_session 6 / m4_bus 15 / m5_pool 4 / sandbox_e2e 4 / wire_anthropic 2
+**Metrics** — src 51 files / 15374 lines · tests 9 files / 3204 lines · 228 tests (lib 177 + bin 4 + integration 47)
+**Integration** — core_loop 5 / discipline 2 / m1_tools 8 / m2_session 6 / m4_bus 15 / m5_pool 5 / sandbox_e2e 4 / wire_anthropic 2
 
 | 组 | 覆盖 |
 |---|---|
@@ -374,3 +374,29 @@ ack + 跨回合的审批槽位，那条留在 §10。播种只解决 req 的幂�
 **验证状态**：`cargo fmt --check` / `cargo clippy --all-targets -- -D warnings` / `cargo test`
 本轮全部实跑（计数见 §1 的 Metrics 行）。沙箱内 UDS `bind` 会以 `EPERM` 失败，`m4_bus` /
 `m5_pool` 需要在真机跑（§1 已注明）。
+
+## 17. 2026-11-03 批复的回执：没生效的批准不许记成生效
+
+§9.30 让请求送得到，这一格回答「批复到底生效了没有」。此前 SA 答完就忘、worker 回合结束就关单，
+于是「批复丢了」与「批了但没人听」在账上无法区分（详见 design §9.31）。
+
+| 项 | 用例 | 结果 |
+|---|---|---|
+| 到点撤摊：后来的批复不能算生效 | `core::approvals::tests::abandon_makes_a_late_reply_report_no_waiter` | 通过；`abandon` 返回真值即「当时还有等待者」，撤摊后 `complete` 只能说 no |
+| 到点要广播「这一格已过期」 | `m1_tools::bus_approval_without_answer_denies_on_deadline`（扩展） | 通过；`ApprovalExpired{req, reason}` 发出、台账里不再有等待者、重复批复不再被当作生效 |
+| 工件不谎报生效（真 worker 池 + 真总线） | `m5_pool::an_expired_approval_is_never_booked_as_applied` | 通过；窗口 400ms 内问了 ≥2 次，SA 全程不答：回执 `applied:false` 且 reason 含 timed out，工件记 `decision:"expired"` / `applied:false`，回合照常收敛 |
+| 生效与重复各回一份回执 | `m5_pool::an_unanswered_approval_request_is_resent_and_answered_once`（扩展） | 通过；两份 `allow` 换回两张回执，一张 applied=true、一张 applied=false（pump 找不到在途请求也要回执，不静默丢） |
+| 回执线形严格 | `serve::tests::approval_receipt_wire_shape_roundtrips` / `unreadable_receipts_are_not_applied_or_recorded` | 通过；少 `req` 或少 `applied` 都不当回执——要落审计链的东西不能靠猜 |
+| 回执落账 + 未回执的补投集合 | `sa_demo::tests::approval_ledger_dedups_by_req_and_survives_a_restart`（扩展） | 通过；`unacked()` 找得出来、回执一到就离开集合、重启读回 `acked` 且不再补投 |
+| 审计记录不动状态 | `journal::records::tests::approval_and_usage_records_are_audit_only`（含新记录） | 通过；`ApprovalAcked` 序列化往返 + 不结算任何铃 |
+
+**顺带修掉的缺陷**（这才是这一格的主要价值）：`ApproveMode::Bus` 到点时只返回错误、**等待者仍留在台账里**。
+后来那份批复于是「发送成功」，CLI 就把一次从未生效的批准记成 `{"decision":"allow"}` 写进工件——
+journal 与工件会互相印证一个假结论。现在到点即撤摊并广播过期事件，工件写 `expired/applied:false`。
+
+**验证状态**：`cargo fmt --check` / `cargo clippy --all-targets -- -D warnings` / `cargo test` 本轮实跑。
+`m4_bus` / `m5_pool` 需要真 UDS `bind`（沙箱内 EPERM，§1 已注明）。
+
+**没做**：`applied:false` 的迟到批复不会在下一次同样调用上被重新兑现（那等于把一次 allow 变成长期
+通行证；要放宽只能改 `sa.approvals.json` 那一格）。跨回合挂起的审批槽位（「SA 下班、明早再批」）
+仍在 §10。

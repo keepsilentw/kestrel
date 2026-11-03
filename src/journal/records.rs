@@ -112,6 +112,16 @@ pub enum JournalRecord {
         decision: String,
         by: String,
     },
+    /// worker 对那份批复的回执（design §10「批复的可靠投递」剩下的那一半）：
+    /// `applied = false` 意思是「我收到了，但已经没有等待者可唤醒了」——到点撤摊或
+    /// 回合结束。审批者只有拿到这句话，才能区分「批复丢了」与「批了但没人听」：
+    /// 没有它，这两种在账上长得一模一样。审计记录，不参与状态折叠。
+    ApprovalAcked {
+        req: String,
+        /// 回执来自哪条 session（worker 侧）
+        by: String,
+        applied: bool,
+    },
     /// The worker's own token measurement, straight off its result bell. It is
     /// the raw reading; the money is derived from it by the ledger (`BudgetSettled`)
     /// at the rate the registry declares, never by the worker itself. Kept as an
@@ -368,6 +378,7 @@ impl Folder {
             // projection, and a replay must not count them as bells.
             JournalRecord::ApprovalRequested { .. }
             | JournalRecord::ApprovalDecided { .. }
+            | JournalRecord::ApprovalAcked { .. }
             | JournalRecord::UsageReported { .. } => {}
             JournalRecord::Snapshot { checkpoint, .. } => {
                 // hard reset of the fold: the prefix is already inside the
@@ -538,6 +549,11 @@ mod tests {
                 req: "a-1".into(),
                 decision: "allow".into(),
                 by: "harness-sa".into(),
+            },
+            JournalRecord::ApprovalAcked {
+                req: "a-1".into(),
+                by: "harness-rd".into(),
+                applied: true,
             },
             JournalRecord::UsageReported {
                 peer: "rd".into(),

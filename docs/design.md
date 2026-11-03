@@ -1,14 +1,14 @@
 # kestrel 设计文档：Rust harness kernel
 
-> 状态：M0-M4 已实现并通过测试；§10 二期已落地十二项——`ApproveMode::Bus`、
+> 状态：M0-M4 已实现并通过测试；§10 二期已落地十三项——`ApproveMode::Bus`、
 > 「判定 = 工件 + 证据文件」、bus 重连重放（停车补投 + 客户端重连）、journal 快照/截断语义、
 > 多任务并行（task 命名空间 + 前缀寻址）、openai-responses wire（**真端点未实测**，§9.24）、
 > journal 投影增量化与轮转触发（§9.25）、worker 池（一 task 一引擎一树，§9.26）、
 > 预算价格表（usd 按 token 结算，§9.27）、journal 轮转的默认策略（活文件有界，§9.28）、
-> 证据的类型化（按类型核对 + stage 要求齐全，§9.29）、审批批复的可靠投递（at-least-once + 幂等，§9.30）。
+> 证据的类型化（按类型核对 + stage 要求齐全，§9.29）、审批批复的可靠投递（at-least-once + 幂等，§9.30）、批复回执与过期审批不谎报生效（§9.31）。
 > 质量闸门保持人工执行（本仓库不挂 CI，见 §9.19⑥）。
-> **Metrics** — src 51 files / 14968 lines · tests 9 files / 3077 lines · 224 tests (lib 174 + bin 4 + integration 46)
-> **Integration** — core_loop 5 / discipline 2 / m1_tools 8 / m2_session 6 / m4_bus 15 / m5_pool 4 / sandbox_e2e 4 / wire_anthropic 2
+> **Metrics** — src 51 files / 15374 lines · tests 9 files / 3204 lines · 228 tests (lib 177 + bin 4 + integration 47)
+> **Integration** — core_loop 5 / discipline 2 / m1_tools 8 / m2_session 6 / m4_bus 15 / m5_pool 5 / sandbox_e2e 4 / wire_anthropic 2
 > 规模已过 plan 预算（10-13k）的上沿：多出来的部分几乎都花在「取消安全」与「对账」这两条纪律上。
 > 上面两行数字由 `tests/discipline.rs::metrics_lines_match_the_tree` 对照源码树重算校验——
 > 这些计数此前在三处文档里手抄过三次、漂移过三次（§9.19），现在它是闸门不是仪式。
@@ -232,10 +232,17 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
     ⑥ 重发用的是**同一份帧**（`OpenApproval.frame` 存着原件），不是重新拼一遍：审批者判的是 `tool + args + command`，重发的载荷若可能与第一次不同，去重就退化成「拿第二份措辞再判一次」。
     ⑦ 仍没做的事，说清楚：这是 at-least-once，不是 exactly-once，也不是跨进程重启的可靠投递。回合结束即关闭在途请求（§9.26② 的路由表有界），所以**批复迟到**的语义仍停在超时 deny；「SA 下班了、明早上班再批」需要 ack + 跨回合的审批槽位，那是新的一格，仍留在 §10。播种只解决 `req` 的幂等，不做「重启后主动重答所有未决请求」——那等于把审批改成 pull 模式，与 §9.21「总线不猜」是两种取舍。
 
+31. **批复的回执，以及「不许谎报生效」（2026-11-03）**：§9.30 收的是「请求送得到」，这一格收的是「批复到底有没有生效，谁说了算」。此前请求与批复都是单向 Notify：SA 答完就忘，worker 回合结束就把在途请求关掉——于是「批复丢了」和「批了但没人听」在 SA 那本账上长得一模一样。
+    ① 新增回执帧 `approval_receipt{req, decision, applied, reason}`：worker 对**每一份**批复都回一句。`applied=true` 是「唤醒了还在等的工具」；`applied=false` 是「收到了，但这格已经过期」。读侧严格：少 `req` 或少 `applied` 一律不认——回执要落进 journal，读不准的东西不能记。
+    ② 顺着这条抓住一个真缺陷：`ApproveMode::Bus` 到点时只返回一个错误，**等待者还留在 `ApprovalBoard` 里**。后来那份于是「发送成功」，CLI 层就把一次从未生效的批准记成 `{"decision":"allow"}` 落进工件——比不记更糟，因为 journal 与工件会互相印证一个假结论。修法是到点即 `abandon(req)` 撤摊并广播 `EventMsg::ApprovalExpired{req, reason}`：CLI 层据此停止重发、在工件里记 `decision:"expired", applied:false`、并回执一句没生效。`abandon` 的返回值本身就是「当时还有没有人等」，`abandon_makes_a_late_reply_report_no_waiter` 钉住它。
+    ③ 回执落 journal 为新记录 `ApprovalAcked{req, by, applied}`：纯审计记录，不参与状态折叠（与 `ApprovalRequested` / `ApprovalDecided` 同一档，`approval_and_usage_records_are_audit_only` 把它一起验）。台账据此分出 `unacked()`——判过但没有回执的批复；SA 重启时对每条**各补投一次**（不循环补投，闭环靠回执本身）。补投落到 worker 那边要么唤醒还在等的工具，要么换回一张 `applied:false`，两种都会留下记录。
+    ④ 台账仍只从**活文件**播种（`replay()`，长度由 §9.28 的上限管住），不读归档段。理由不是省事：`unacked()` 只关心「判了却没回执」，而回执一到就永久离开这个集合；判了没回执又活过一整轮轮发的请求，早随回合结束被关掉并回执成 `applied:false` 了。去读段只会把已经闭环的历史再扫一遍。这一条我先前写错过（先声称 `replay_all()` 的读「有界」，理由站不住），改正的经过留在 §9.30④。
+    ⑤ 刻意不做的两件事：其一，`applied:false` 的迟到批复**不会**在下一次同样的调用上被重新兑现——那等于把一次 allow 变成一张长期通行证，正是 §5 fail-closed 要防的；要放宽只有把 `sa.approvals.json` 那一格显式改成 allow 这一条路（数据，可审计）。其二，不做「跨回合挂起的审批槽位」（SA 下班、明早再批）：那需要未决请求的第二份真相与新的取消语义，仍在 §10。
+
 ## 10 二期清单
 
-已落地（2026-10-28 起）：~~`ApproveMode::Bus`~~（授权表 + 超时 fail-closed + journal 审计，§9.20）、~~SA 判定升级到「工件 + 证据文件」~~（绝对路径存在性/非空核对，§9.20）、~~bus 重连重放~~（离线 session 停车补投 + 客户端自动重连；RPC 与「写入即死」的帧不重放，§9.21）、~~journal 快照/截断语义~~（检查点 + 归档段 + 崩溃安全轮转，§9.22）、~~多任务并行~~（task 命名空间三处同源 + 前缀寻址，§9.23）、~~openai-responses wire~~（第三条 v1 wire，金身 + fixture 验证，**真端点未实测**，§9.24）、~~journal 投影增量化与轮转触发~~（在线投影 = 全量重放 + 条数/字节双上限，§9.25）、~~一个引擎内真正并发地服务多个 task~~（改为「一 task 一引擎」的 worker 池，单活跃槽不动，§9.26）、~~`BudgetSpent` 的价格表~~（预留 → 结算两段式、按 token 换账单、无价退回名义值并报出来，§9.27；2026-11-03）、~~journal 轮转的**默认策略**~~（活文件 512 条 / 1 MiB 双上限、三态 CLI、生产与测试同一条 `rotate_at_boundary`，§9.28；2026-11-03）、~~证据的类型化~~（`file` / `test_log` / `diff` / `screenshot` 各自可在盘上反驳 + `--evidence-spec` 的 stage 要求，坏表硬失败，§9.29；2026-11-03）、~~审批批复的可靠投递~~（请求 at-least-once + 按 req 幂等 + 台账从 journal 播种，判定仍只一次，§9.30；2026-11-03）。
+已落地（2026-10-28 起）：~~`ApproveMode::Bus`~~（授权表 + 超时 fail-closed + journal 审计，§9.20）、~~SA 判定升级到「工件 + 证据文件」~~（绝对路径存在性/非空核对，§9.20）、~~bus 重连重放~~（离线 session 停车补投 + 客户端自动重连；RPC 与「写入即死」的帧不重放，§9.21）、~~journal 快照/截断语义~~（检查点 + 归档段 + 崩溃安全轮转，§9.22）、~~多任务并行~~（task 命名空间三处同源 + 前缀寻址，§9.23）、~~openai-responses wire~~（第三条 v1 wire，金身 + fixture 验证，**真端点未实测**，§9.24）、~~journal 投影增量化与轮转触发~~（在线投影 = 全量重放 + 条数/字节双上限，§9.25）、~~一个引擎内真正并发地服务多个 task~~（改为「一 task 一引擎」的 worker 池，单活跃槽不动，§9.26）、~~`BudgetSpent` 的价格表~~（预留 → 结算两段式、按 token 换账单、无价退回名义值并报出来，§9.27；2026-11-03）、~~journal 轮转的**默认策略**~~（活文件 512 条 / 1 MiB 双上限、三态 CLI、生产与测试同一条 `rotate_at_boundary`，§9.28；2026-11-03）、~~证据的类型化~~（`file` / `test_log` / `diff` / `screenshot` 各自可在盘上反驳 + `--evidence-spec` 的 stage 要求，坏表硬失败，§9.29；2026-11-03）、~~审批批复的可靠投递~~（请求 at-least-once + 按 req 幂等 + 台账从 journal 播种，判定仍只一次，§9.30；2026-11-03）、~~批复到底有没有生效~~（回执 `approval_receipt` + `ApprovalAcked` 落账 + 到点撤摊，**没生效的批准不许记成生效**，§9.31；2026-11-03）。
 
-仍在清单上（审批的 at-least-once 已收口；**批复迟到/跨重启的 ack** 仍是缺口，见 §9.30⑦）：tree-sitter-bash 命令解析、execpolicy DSL（Starlark）、landlock/bwrap（Linux 沙箱）、TUI（行级 diff 形制，pi-tui 蓝本）、MCP 客户端、model-in-the-loop evals（含 openai-responses 的真端点实测，§9.24）、worker 池的资源护栏（`--max-tasks` 只挡 task 数，不挡每 task 的内存与并发 HTTP；真·多进程编排属于 harness 上层）、**归档段自身的治理**（默认策略落地后，长运行会攒出很多段；段按覆盖区间命名、永不自动清理，所以「段也该压缩或离线归档」是新的一格——不能靠默认轮转顺手做删除，那会撞上「这不是删除」那条语义边界）。
+仍在清单上（审批已闭环到「有没有生效」这一层：请求 at-least-once、批复有回执、未回执的批复重启后补投一次。剩下的是**跨回合挂起的审批槽位**——「SA 下班、明早再批」需要未决请求的第二份真相与新的取消语义，见 §9.31⑤）：tree-sitter-bash 命令解析、execpolicy DSL（Starlark）、landlock/bwrap（Linux 沙箱）、TUI（行级 diff 形制，pi-tui 蓝本）、MCP 客户端、model-in-the-loop evals（含 openai-responses 的真端点实测，§9.24）、worker 池的资源护栏（`--max-tasks` 只挡 task 数，不挡每 task 的内存与并发 HTTP；真·多进程编排属于 harness 上层）、**归档段自身的治理**（默认策略落地后，长运行会攒出很多段；段按覆盖区间命名、永不自动清理，所以「段也该压缩或离线归档」是新的一格——不能靠默认轮转顺手做删除，那会撞上「这不是删除」那条语义边界）。
 
 新划出的边界：`nominal_usd` 的占比应当随 `providers.toml` 填写完整率下降，这条曲线本身值得盯（单价填全之后 `--max-usd` 才是真正的账单上限，名义值只作为「说不清价」的兜底存在）；证据类型化之后的下一步是**要求的强度**——`test_log` 只证明「有一份像测试日志的东西」，不证明「测试通过」（`0 passed; 14 failed` 同样合格）。把结论判定交给判定词、把形状交给类型，是刻意的分工；要让证据自己携带结论，就得再开一格：解析 runner 的退出码或结构化输出，并把「过了几条、failed 几条」写进 journal。

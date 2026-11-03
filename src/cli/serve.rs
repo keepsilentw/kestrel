@@ -193,6 +193,51 @@ pub fn decision_from_frame(payload: &Value) -> ApprovalDecision {
     }
 }
 
+/// 回执的线形（design §10「批复的可靠投递」剩下的那一半）：worker 对**每一份**批复都
+/// 要回一句「收到，生效了」或「收到，没生效（为什么）」。审批者只有拿到这句话，才知道
+/// 自己那次放宽到底有没有被执行——否则「批复丢了」和「批了但没人听」在账上长得一样。
+pub fn approval_receipt_frame(
+    session: &str,
+    req: &str,
+    decision: ApprovalDecision,
+    applied: bool,
+    reason: &str,
+) -> Value {
+    serde_json::json!({
+        "type": "approval_receipt",
+        "session": session,
+        "req": req,
+        "decision": decision_name(decision),
+        "applied": applied,
+        "reason": reason,
+    })
+}
+
+/// 一张回执：`applied` 说这句话有没有真的唤醒一个等待者。
+#[derive(Clone, Debug, PartialEq)]
+pub struct ApprovalReceipt {
+    pub req: String,
+    pub decision: ApprovalDecision,
+    pub applied: bool,
+    pub reason: String,
+}
+
+/// 读侧。少 `req` 或少 `applied` 就不当回执处理（不猜它说的是哪一颗请求，也不猜
+/// 有没有生效）——回执是要落审计链的，读不准就不能记。
+pub fn approval_receipt_from_frame(payload: &Value) -> Option<ApprovalReceipt> {
+    if payload["type"].as_str() != Some("approval_receipt") {
+        return None;
+    }
+    let req = payload["req"].as_str().filter(|r| !r.trim().is_empty())?;
+    let applied = payload["applied"].as_bool()?;
+    Some(ApprovalReceipt {
+        req: req.to_string(),
+        decision: decision_from_frame(payload),
+        applied,
+        reason: payload["reason"].as_str().unwrap_or_default().to_string(),
+    })
+}
+
 /// Wire spelling of a decision.
 pub fn decision_name(decision: ApprovalDecision) -> &'static str {
     match decision {
@@ -233,8 +278,8 @@ pub fn bell_prompt(payload: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ApprovalDecision, approval_command, approval_request_frame, bell_prompt,
-        decision_from_frame, decision_name,
+        ApprovalDecision, approval_command, approval_receipt_frame, approval_receipt_from_frame,
+        approval_request_frame, bell_prompt, decision_from_frame, decision_name,
     };
     use serde_json::json;
 
@@ -306,5 +351,70 @@ mod tests {
         assert_eq!(text, "only task");
         let fallback = bell_prompt(&json!({ "ref": { "task": "task inside ref" } }));
         assert!(fallback.starts_with("task inside ref"), "{fallback}");
+    }
+
+    /// 回执是审批账的闭环，所以它的读侧要严格：少 `req` 或少 `applied` 都不当回执
+    /// 处理——落进 journal 的东西不能靠猜。
+    #[test]
+    fn approval_receipt_wire_shape_roundtrips() {
+        use super::ApprovalReceipt;
+
+        let frame = approval_receipt_frame(
+            "harness-rd",
+            "req-9",
+            ApprovalDecision::AllowOnce,
+            true,
+            "the waiting tool was woken",
+        );
+        assert_eq!(frame["type"], "approval_receipt");
+        assert_eq!(frame["decision"], "allow");
+        assert_eq!(
+            approval_receipt_from_frame(&frame),
+            Some(ApprovalReceipt {
+                req: "req-9".into(),
+                decision: ApprovalDecision::AllowOnce,
+                applied: true,
+                reason: "the waiting tool was woken".into(),
+            })
+        );
+        // applied=false 是这一项存在的理由：批了，但没人听了
+        let stale = approval_receipt_frame(
+            "harness-rd",
+            "req-9",
+            ApprovalDecision::Deny,
+            false,
+            "timed out after 60s",
+        );
+        let got = approval_receipt_from_frame(&stale).expect("a stale receipt parses");
+        assert!(!got.applied);
+        assert!(got.reason.contains("timed out"), "{got:?}");
+    }
+
+    #[test]
+    fn unreadable_receipts_are_not_applied_or_recorded() {
+        // 不是回执类型 / 少了 req / 少了 applied —— 三种都不认
+        assert!(approval_receipt_from_frame(&json!({ "type": "approval_decision" })).is_none());
+        assert!(
+            approval_receipt_from_frame(&json!({ "type": "approval_receipt", "applied": true }))
+                .is_none(),
+            "没有 req 就不能猜它说的是哪一颗请求"
+        );
+        assert!(
+            approval_receipt_from_frame(&json!({
+                "type": "approval_receipt",
+                "req": "  ",
+                "applied": true
+            }))
+            .is_none(),
+            "空白 req 同样不认"
+        );
+        assert!(
+            approval_receipt_from_frame(&json!({
+                "type": "approval_receipt",
+                "req": "r-1"
+            }))
+            .is_none(),
+            "没有 applied 就不能当成「生效」或「没生效」记进账本"
+        );
     }
 }

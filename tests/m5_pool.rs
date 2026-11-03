@@ -1,8 +1,10 @@
 //! Worker pool acceptance (§10 多任务并行): one `serve` process hosting one
 //! engine per task, driven through the real bus with faux wires.
 //!
-//! 三条断言是这一项的实质：两个 task 各自落自己的工件、各自只看见自己的历史、
-//! 超过上限时被显式拒绝（而不是排在一个看不见的队列里）。
+//! 这一项的实质断言：两个 task 各自落自己的工件、各自只看见自己的历史、超过上限时
+//! 被显式拒绝（而不是排在一个看不见的队列里）。审批那两条属于 §10 的「批复的可靠
+//! 投递」：同一个进程里的 worker 要能把没人应答的审批请求问第二遍、要能给每一份
+//! 批复发回执，并且**窗口到点时不许把没生效的批准记成生效**。
 
 mod common;
 
@@ -12,7 +14,9 @@ use std::time::Duration;
 
 use kestrel::bus::rpc::{BusClient, BusHub};
 use kestrel::cli::pool::{EngineFactory, PoolConfig, PooledEngine, run_pool};
-use kestrel::provider::faux::{FauxWire, stop_script};
+use kestrel::permissions::{Decision, PermissionEngine, PolicyTable};
+use kestrel::provider::faux::{FauxWire, stop_script, tool_use_script};
+use kestrel::tools::ApproveMode;
 use serde_json::{Value, json};
 
 fn temp(tag: &str) -> std::path::PathBuf {
@@ -97,6 +101,42 @@ fn answer_factory() -> (EngineFactory, Wires) {
             .unwrap()
             .insert(task.to_string(), Arc::clone(&wire));
         let (handle, events) = common::spawn_engine(wire, common::EngineSpec::default());
+        Ok(PooledEngine { handle, events })
+    });
+    (factory, wires)
+}
+
+/// 一台真的会走反向审批请求的引擎：策略 default ask + bash 工具，第一轮请求跑一条
+/// 命令，第二轮收尾。`timeout` 是审批窗口——两条测试分别用它来验「重发拿到批复」与
+/// 「窗口到点不许谎报生效」。
+fn approval_factory(timeout: Duration) -> (EngineFactory, Wires) {
+    let wires: Wires = Arc::new(Mutex::new(HashMap::new()));
+    let seen = Arc::clone(&wires);
+    let factory: EngineFactory = Arc::new(move |task: &str| {
+        let wire = Arc::new(FauxWire::new());
+        wire.push_turn_script(tool_use_script(
+            "need to run this",
+            "call-1",
+            "bash",
+            json!({"command": "echo approval-probe"}),
+        ));
+        wire.push_turn_script(stop_script("DONE: turn finished after the approval window"));
+        seen.lock()
+            .unwrap()
+            .insert(task.to_string(), Arc::clone(&wire));
+        let (handle, events) = common::spawn_engine(
+            wire,
+            common::EngineSpec {
+                tools: vec![Arc::new(kestrel::tools::bash::Bash)],
+                approve: ApproveMode::Bus { timeout },
+                policy: Arc::new(PermissionEngine::new(PolicyTable {
+                    default: Decision::Ask,
+                    rules: vec![],
+                    forbidden_prefixes: vec![],
+                })),
+                ..Default::default()
+            },
+        );
         Ok(PooledEngine { handle, events })
     });
     (factory, wires)
@@ -265,42 +305,7 @@ async fn a_bell_without_a_task_id_uses_the_default_namespace() {
 /// 而批复**重复投递**时只能生效一次：同一个 req 的第二份 `allow` 不能再把工具跑一遍。
 #[tokio::test]
 async fn an_unanswered_approval_request_is_resent_and_answered_once() {
-    use kestrel::permissions::{Decision, PermissionEngine, PolicyTable};
-    use kestrel::provider::faux::tool_use_script;
-    use kestrel::tools::ApproveMode;
-
-    let wires: Wires = Arc::new(Mutex::new(HashMap::new()));
-    let seen = Arc::clone(&wires);
-    let factory: EngineFactory = Arc::new(move |task: &str| {
-        let wire = Arc::new(FauxWire::new());
-        // 第一轮要跑一条命令（策略是 default ask，于是走反向请求），第二轮收尾
-        wire.push_turn_script(tool_use_script(
-            "need to run this",
-            "call-1",
-            "bash",
-            json!({"command": "echo resent-ok"}),
-        ));
-        wire.push_turn_script(stop_script("DONE: ran after the retry"));
-        seen.lock()
-            .unwrap()
-            .insert(task.to_string(), Arc::clone(&wire));
-        let (handle, events) = common::spawn_engine(
-            wire,
-            common::EngineSpec {
-                tools: vec![Arc::new(kestrel::tools::bash::Bash)],
-                approve: ApproveMode::Bus {
-                    timeout: Duration::from_secs(10),
-                },
-                policy: Arc::new(PermissionEngine::new(PolicyTable {
-                    default: Decision::Ask,
-                    rules: vec![],
-                    forbidden_prefixes: vec![],
-                })),
-                ..Default::default()
-            },
-        );
-        Ok(PooledEngine { handle, events })
-    });
+    let (factory, wires) = approval_factory(Duration::from_secs(10));
 
     let h = harness_with(
         "approval-resent",
@@ -320,7 +325,7 @@ async fn an_unanswered_approval_request_is_resent_and_answered_once() {
         .unwrap();
     assert_eq!(first.payload["type"], "approval_request");
     assert_eq!(
-        first.payload["command"], "echo resent-ok",
+        first.payload["command"], "echo approval-probe",
         "重发的必须还是那份可判定的载荷: {}",
         first.payload
     );
@@ -354,6 +359,32 @@ async fn an_unanswered_approval_request_is_resent_and_answered_once() {
         );
     }
 
+    // 两份批复都要有回执：一份说「生效了」，一份说「没生效（已经没有这颗在途请求）」
+    let mut receipts = Vec::new();
+    while receipts.len() < 2 {
+        let frame = tokio::time::timeout(Duration::from_secs(10), h.sa.recv_notify())
+            .await
+            .expect("the approval decisions were never receipted")
+            .unwrap();
+        if let Some(r) = kestrel::cli::serve::approval_receipt_from_frame(&frame.payload) {
+            receipts.push(r);
+        } else {
+            strays.push(frame);
+        }
+    }
+    assert!(
+        receipts.iter().any(|r| r.applied),
+        "生效的那一份必须回执: {receipts:?}"
+    );
+    assert!(
+        receipts.iter().any(|r| !r.applied),
+        "重复的那一份也必须回执「没生效」，不能静默丢掉: {receipts:?}"
+    );
+    assert!(
+        receipts.iter().all(|r| r.req == req),
+        "回执认的是同一颗请求: {receipts:?}"
+    );
+
     let done = match strays
         .iter()
         .find(|f| f.payload["result_ref"].is_string())
@@ -372,8 +403,8 @@ async fn an_unanswered_approval_request_is_resent_and_answered_once() {
     );
     let artifact = read_artifact(&h.artifacts, "harness-rd-t1-dev-iter1.json").await;
     assert_eq!(
-        artifact["result"], "DONE: ran after the retry",
-        "{artifact}"
+        artifact["result"], "DONE: turn finished after the approval window",
+        "批复换回来后回合要照常收尾: {artifact}"
     );
     let recorded = artifact["approvals"]
         .as_array()
@@ -389,8 +420,87 @@ async fn an_unanswered_approval_request_is_resent_and_answered_once() {
     let wires = h.wires.lock().unwrap();
     let text = serde_json::to_string(&wires["t1"].recorded_requests()).unwrap();
     assert!(
-        text.contains("resent-ok"),
+        text.contains("approval-probe"),
         "the tool ran after the retry: {text}"
+    );
+    h.pool.abort();
+}
+
+/// 回执会说谎就不能叫回执（design §9.31）：审批窗口到点而无人应答时，工件里那一格
+/// 必须是「expired / applied:false」。少了这条，一份后来飘到的批复就能把从未生效的
+/// 批准记成生效过——比不记更糟，因为 journal 与工件会互相印证一个假的结论。
+/// 同一条测试也钉住三件事：窗口内确实问了不止一次、到点回执说了没生效、以及被 deny
+/// 的工具不会把回合挂死（错误是给模型看的，不是把人叫来）。
+#[tokio::test]
+async fn an_expired_approval_is_never_booked_as_applied() {
+    let (factory, wires) = approval_factory(Duration::from_millis(400));
+    let h = harness_with(
+        "approval-expired",
+        1,
+        Duration::from_millis(120),
+        Some("harness-sa"),
+        factory,
+        wires,
+    )
+    .await;
+    h.sa.notify("harness-rd", bell("t1", "dev", "run it, nobody answers"));
+
+    let mut requests = 0usize;
+    let mut receipts = Vec::new();
+    let mut done = None;
+    for _ in 0..40 {
+        let Ok(Ok(frame)) = tokio::time::timeout(Duration::from_secs(5), h.sa.recv_notify()).await
+        else {
+            break;
+        };
+        match frame.payload["type"].as_str() {
+            Some("approval_request") => requests += 1,
+            Some("approval_receipt") => {
+                if let Some(receipt) =
+                    kestrel::cli::serve::approval_receipt_from_frame(&frame.payload)
+                {
+                    receipts.push(receipt);
+                }
+            }
+            _ => {
+                if frame.payload["result_ref"].is_string() {
+                    done = Some(frame);
+                    break;
+                }
+            }
+        }
+    }
+
+    assert!(requests >= 2, "窗口内问了不止一次: {requests}");
+    let stale = receipts
+        .iter()
+        .find(|r| !r.applied)
+        .expect("到点必须回执一句 applied:false");
+    assert!(
+        stale.reason.contains("timed out"),
+        "回执要说清为什么没生效: {stale:?}"
+    );
+    let done = done.expect("a denied tool must not hang the turn");
+    assert!(
+        done.payload["result_ref"].is_string(),
+        "结果铃照常回来: {}",
+        done.payload
+    );
+
+    let artifact = read_artifact(&h.artifacts, "harness-rd-t1-dev-iter1.json").await;
+    let recorded = artifact["approvals"]
+        .as_array()
+        .expect("the artifact records its approvals");
+    assert_eq!(recorded.len(), 1, "{recorded:?}");
+    assert_eq!(recorded[0]["decision"], "expired", "{recorded:?}");
+    assert_eq!(
+        recorded[0]["applied"], false,
+        "没生效的批准不能记成生效: {recorded:?}"
+    );
+    assert_eq!(
+        artifact["result"], "DONE: turn finished after the approval window",
+        "deny 要以错误结果回到模型手里并让它收尾: {}",
+        artifact["result"]
     );
     h.pool.abort();
 }

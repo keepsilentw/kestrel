@@ -371,6 +371,9 @@ async fn bus_approval_without_answer_denies_on_deadline() {
     let emit: kestrel::tools::orchestrator::EmitFn = Arc::new(move |m| {
         let _ = seen_tx.send(m);
     });
+    // 等待者要看得见：到点之后台账里必须已经没有这颗请求。留着它，后来那份批复就会
+    // 「发送成功」，CLI 层据此把一次从未生效的批准记成生效了（design §9.31）。
+    let board = kestrel::core::approvals::ApprovalBoard::default();
     let started = Instant::now();
     let outcome = dispatch_batch(
         &registry,
@@ -382,7 +385,7 @@ async fn bus_approval_without_answer_denies_on_deadline() {
         &ctx,
         &tokio_util::sync::CancellationToken::new(),
         &emit,
-        &kestrel::core::approvals::ApprovalBoard::default(),
+        &board,
         &(Arc::new(kestrel::core::id::SeqGen::new()) as Arc<dyn kestrel::core::id::IdGen>),
     )
     .await
@@ -402,17 +405,31 @@ async fn bus_approval_without_answer_denies_on_deadline() {
     );
 
     let mut judged = false;
+    let mut expired = None;
     while let Ok(msg) = seen_rx.try_recv() {
-        if let EventMsg::ApprovalRequest { detail, .. } = msg {
-            assert_eq!(detail["tool"], "bash", "approver sees the tool");
-            assert_eq!(
-                detail["args"]["command"], "echo silent-approver",
-                "approver sees the command"
-            );
-            judged = true;
+        match msg {
+            EventMsg::ApprovalRequest { detail, .. } => {
+                assert_eq!(detail["tool"], "bash", "approver sees the tool");
+                assert_eq!(
+                    detail["args"]["command"], "echo silent-approver",
+                    "approver sees the command"
+                );
+                judged = true;
+            }
+            EventMsg::ApprovalExpired { req, reason } => {
+                expired = Some((req, reason));
+            }
+            _ => {}
         }
     }
     assert!(judged, "an ApprovalRequest was emitted with tool + args");
+    let (req, reason) = expired.expect("the timeout must say this request is dead");
+    assert!(reason.contains("timed out"), "{reason}");
+    assert!(!board.has_waiter(&req), "到点之后台账里不能还挂着等待者");
+    assert!(
+        !board.complete(&req, kestrel::core::ops::ApprovalDecision::AllowOnce),
+        "撤摊之后来的批复不能算生效"
+    );
 }
 
 /// One call through the real orchestrator, returning its outcome.

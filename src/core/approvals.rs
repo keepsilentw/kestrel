@@ -38,6 +38,20 @@ impl ApprovalBoard {
             .is_some()
     }
 
+    /// Drop a waiter WITHOUT sending: the approval window elapsed, so nobody is
+    /// listening any more. Without this the timed-out oneshot stays in the map
+    /// and a late `complete` reports success — which the CLI layer then books as
+    /// an applied approval in the artifact, while the tool already returned an
+    /// error to the model. A receipt that lies is worse than no receipt.
+    pub fn abandon(&self, req: &str) -> bool {
+        self.waiters.lock().unwrap().remove(req).is_some()
+    }
+
+    /// Is anyone still waiting on this request?
+    pub fn has_waiter(&self, req: &str) -> bool {
+        self.waiters.lock().unwrap().contains_key(req)
+    }
+
     /// Called when a turn ends so stale waiters never leak.
     pub fn drop_pending(&self) {
         self.waiters.lock().unwrap().clear();
@@ -60,5 +74,22 @@ mod tests {
     async fn complete_unknown_is_false() {
         let board = ApprovalBoard::default();
         assert!(!board.complete("nope", ApprovalDecision::Deny));
+    }
+
+    /// 到点之后没人听：`abandon` 必须让后来的批复变成「没有生效」，而不是
+    /// 假装唤醒了一个已经消失的等待者。
+    #[tokio::test]
+    async fn abandon_makes_a_late_reply_report_no_waiter() {
+        let board = ApprovalBoard::default();
+        let (req, _rx) = board.open();
+        assert!(board.has_waiter(&req));
+        // 模拟丢弃 rx（等待者消失）+ 到点撤摊：真实路径是 timeout 那一条
+        assert!(board.abandon(&req), "撤摊要说成功撤了一个");
+        assert!(!board.has_waiter(&req));
+        assert!(
+            !board.complete(&req, ApprovalDecision::AllowOnce),
+            "撤摊之后的批复不能算生效"
+        );
+        assert!(!board.abandon(&req), "撤两次是假的：第二次没有等待者");
     }
 }

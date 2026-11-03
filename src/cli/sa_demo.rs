@@ -13,7 +13,7 @@ use crate::bus::rpc::BusClient;
 use crate::cli::evidence::{
     Evidence, EvidenceKind, check_evidence, evidence_from_answer, missing_requirements,
 };
-use crate::cli::serve::{approval_command, decision_name};
+use crate::cli::serve::{approval_command, approval_receipt_from_frame, decision_name};
 use crate::cli::task::artifact_path;
 use crate::core::ops::ApprovalDecision;
 use crate::journal::Journal;
@@ -395,6 +395,21 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
         );
     }
     let sa = BusClient::connect(&args.bus_socket, "harness-sa", None).await?;
+    // 判过却没拿到回执的批复：各补投一次。这里不循环补投——闭环靠 worker 的回执，
+    // 这一步只保证「SA 重启不等于失忆」。补投落到 worker 那边要么唤醒还在等的工具，
+    // 要么换回一张 `applied: false` 的回执，两种都会留下记录。
+    for (peer, req, decision) in approvals.unacked() {
+        println!("[sa] re-sending unreceipted approval {decision} for {req} to {peer}");
+        sa.notify(
+            &peer,
+            serde_json::json!({
+                "type": "approval_decision",
+                "req": req,
+                "decision": decision,
+                "by": "harness-sa",
+            }),
+        );
+    }
     let authority = match &args.approvals {
         Some(path) => Some(
             PermissionEngine::from_json_file(path)
@@ -541,6 +556,11 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
                     break None;
                 }
                 match tokio::time::timeout(deadline - now, sa.recv_notify()).await {
+                    // 回执必须先认：它是 worker 发来的普通帧，若落到下面那一条，
+                    // 就会被当成「这一 stage 的结果铃」，于是 stage 拿着一条回执结了账
+                    Ok(Ok(env)) if env.payload["type"].as_str() == Some("approval_receipt") => {
+                        record_receipt(&journal, &env, &mut approvals)?;
+                    }
                     Ok(Ok(env)) if env.payload["type"].as_str() == Some("approval_request") => {
                         answer_approval(
                             &journal,
@@ -740,7 +760,9 @@ fn answer_approval(
                 "by": "harness-sa",
             }),
         );
-        println!("[sa] approval {prior} for {worker}: {req} re-sent (duplicate request)");
+        println!(
+            "[sa] approval {prior} for {worker}: {req} re-sent (duplicate request; waiting for the receipt)"
+        );
         return Ok(());
     }
     // The frame carries the command at the top level; fall back to the detail
@@ -749,7 +771,7 @@ fn answer_approval(
         Some(c) => c.to_string(),
         None => approval_command(&env.payload["detail"]),
     };
-    if ledger.note_request(&req) {
+    if ledger.note_request(&req, &worker) {
         journal.append(&JournalRecord::ApprovalRequested {
             task: task.into(),
             peer: worker.clone(),
@@ -788,8 +810,11 @@ fn answer_approval(
 /// 更早的记录在归档段里，`replay_all()` 一并读到。
 #[derive(Debug, Default)]
 pub struct ApprovalLedger {
-    requests: std::collections::BTreeSet<String>,
+    /// req -> 请求它的那条 session（重启后要把未回执的批复送回去，得知道送给谁）
+    requests: BTreeMap<String, String>,
     decisions: BTreeMap<String, String>,
+    /// 已经拿到回执的 req：回执是唯一能区分「批复丢了」与「批了但没人听」的东西
+    acked: std::collections::BTreeSet<String>,
 }
 
 impl ApprovalLedger {
@@ -802,11 +827,14 @@ impl ApprovalLedger {
         let mut ledger = Self::default();
         for record in journal.replay() {
             match record {
-                JournalRecord::ApprovalRequested { req, .. } => {
-                    ledger.requests.insert(req);
+                JournalRecord::ApprovalRequested { req, peer, .. } => {
+                    ledger.requests.insert(req, peer);
                 }
                 JournalRecord::ApprovalDecided { req, decision, .. } => {
                     ledger.decisions.insert(req, decision);
+                }
+                JournalRecord::ApprovalAcked { req, .. } => {
+                    ledger.acked.insert(req);
                 }
                 _ => {}
             }
@@ -814,14 +842,42 @@ impl ApprovalLedger {
         ledger
     }
 
+    /// 判过但没有回执的批复：**这是「我不知道它到底生没生效」的那一格**。SA 重启后
+    /// 各补投一次（不循环补投——真正的可靠投递靠 worker 的回执闭环，不靠这里猛发）。
+    /// 迟到的那份到了 worker 那边要么唤醒还在等的工具，要么换回一张
+    /// `applied: false` 的回执，两种都会有记录。
+    pub fn unacked(&self) -> Vec<(String, String, String)> {
+        self.decisions
+            .iter()
+            .filter(|(req, _)| !self.acked.contains(req.as_str()))
+            .filter_map(|(req, decision)| {
+                self.requests
+                    .get(req)
+                    .map(|peer| (peer.clone(), req.clone(), decision.clone()))
+            })
+            .collect()
+    }
+
+    /// 记一张回执。返回 false = 这个 req 已经回执过了（重复投递），不再落第二张。
+    pub fn note_ack(&mut self, req: &str) -> bool {
+        self.acked.insert(req.to_string())
+    }
+
+    pub fn acked_len(&self) -> usize {
+        self.acked.len()
+    }
+
     /// 已经判过的批复；没有则 `None`（调用方去判）。
     pub fn decision_for(&self, req: &str) -> Option<&str> {
         self.decisions.get(req).map(String::as_str)
     }
 
-    /// 记下「这颗请求已经落过盘了」。返回 false = 之前就记过，别再写第二遍。
-    pub fn note_request(&mut self, req: &str) -> bool {
-        self.requests.insert(req.to_string())
+    /// 记下「这颗请求已经落过盘了」，并记住是谁请求的。返回 false = 之前就记过，
+    /// 别再写第二遍。
+    pub fn note_request(&mut self, req: &str, peer: &str) -> bool {
+        self.requests
+            .insert(req.to_string(), peer.to_string())
+            .is_none()
     }
 
     pub fn record_decision(&mut self, req: String, decision: String) {
@@ -831,6 +887,46 @@ impl ApprovalLedger {
     pub fn decided_len(&self) -> usize {
         self.decisions.len()
     }
+}
+
+/// worker 的回执落进 journal。这是唯一能区分「批复丢了」与「批了但没人听」的东西：
+/// 没有回执，SA 那本账上这两种情形长得一模一样，而它们的处置完全不同（前者该重发，
+/// 后者该记住「这一格已经过期」）。读不懂的回执不记（不猜它说哪颗请求、有没有生效）。
+fn record_receipt(
+    journal: &Journal,
+    env: &Envelope,
+    ledger: &mut ApprovalLedger,
+) -> anyhow::Result<()> {
+    let Some(receipt) = approval_receipt_from_frame(&env.payload) else {
+        println!(
+            "[sa] ignoring an unreadable approval receipt from {}",
+            env.sender
+        );
+        return Ok(());
+    };
+    if !ledger.note_ack(&receipt.req) {
+        println!(
+            "[sa] approval receipt for {} already recorded (duplicate)",
+            receipt.req
+        );
+        return Ok(());
+    }
+    journal.append(&JournalRecord::ApprovalAcked {
+        req: receipt.req.clone(),
+        by: env.sender.clone(),
+        applied: receipt.applied,
+    })?;
+    println!(
+        "[sa] approval receipt {}: applied={}{}",
+        receipt.req,
+        receipt.applied,
+        if receipt.reason.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", receipt.reason)
+        }
+    );
+    Ok(())
 }
 
 /// SA 的授权是一张表，不是一种心情：只有显式 Allow 才放行。没有表、没有可判定的
@@ -1183,7 +1279,7 @@ mod tests {
             let j = Journal::create(&path).unwrap();
             let mut ledger = ApprovalLedger::seed(&j);
             assert!(
-                ledger.note_request("r-1"),
+                ledger.note_request("r-1", "harness-rd"),
                 "第一次见到这颗请求，该落审计记录"
             );
             j.append(&JournalRecord::ApprovalRequested {
@@ -1203,7 +1299,7 @@ mod tests {
 
             // worker 的重发：同一个 req 不再算新请求，答案原样重发
             assert!(
-                !ledger.note_request("r-1"),
+                !ledger.note_request("r-1", "harness-rd"),
                 "重发的请求不该再落第二份 approval_requested"
             );
             assert_eq!(ledger.decision_for("r-1"), Some("allow"));
@@ -1214,7 +1310,10 @@ mod tests {
         let mut seeded = ApprovalLedger::seed(&reopened);
         assert_eq!(seeded.decision_for("r-1"), Some("allow"), "重启不重判");
         assert_eq!(seeded.decided_len(), 1);
-        assert!(!seeded.note_request("r-1"), "请求记录也已经在盘上了");
+        assert!(
+            !seeded.note_request("r-1", "harness-rd"),
+            "请求记录也已经在盘上了"
+        );
 
         // 崩溃点：请求落了盘、批复还没落 —— 重启后不能再记一次请求，但必须去判
         let half = dir.join("half.jsonl");
@@ -1227,8 +1326,51 @@ mod tests {
         })
         .unwrap();
         let mut ledger2 = ApprovalLedger::seed(&j2);
-        assert!(!ledger2.note_request("r-2"), "请求已经记过了");
+        assert!(!ledger2.note_request("r-2", "harness-rd"), "请求已经记过了");
         assert_eq!(ledger2.decision_for("r-2"), None, "但答案还没有，得去判");
+
+        // 回执闭环：判了但没回执的那一格必须被列出来补投；回执到了就不再补
+        let acked_path = dir.join("acked.jsonl");
+        let j3 = Journal::create(&acked_path).unwrap();
+        j3.append(&JournalRecord::ApprovalRequested {
+            task: "demo".into(),
+            peer: "harness-rd".into(),
+            req: "r-3".into(),
+            command: "cargo build".into(),
+        })
+        .unwrap();
+        j3.append(&JournalRecord::ApprovalDecided {
+            req: "r-3".into(),
+            decision: "deny".into(),
+            by: "harness-sa".into(),
+        })
+        .unwrap();
+        let mut ledger3 = ApprovalLedger::seed(&j3);
+        assert_eq!(
+            ledger3.unacked(),
+            vec![(
+                "harness-rd".to_string(),
+                "r-3".to_string(),
+                "deny".to_string()
+            )],
+            "判过没回执的批复要能被找出来补投"
+        );
+        assert!(ledger3.note_ack("r-3"), "第一张回执");
+        j3.append(&JournalRecord::ApprovalAcked {
+            req: "r-3".into(),
+            by: "harness-rd".into(),
+            applied: false,
+        })
+        .unwrap();
+        assert!(!ledger3.note_ack("r-3"), "重复回执不再记第二张");
+        assert!(
+            ledger3.unacked().is_empty(),
+            "回执到过就不该再补投（applied=false 也是回执）"
+        );
+        // 重启后仍然认得这张回执
+        let reseeded = ApprovalLedger::seed(&Journal::open(&acked_path).unwrap());
+        assert_eq!(reseeded.acked_len(), 1, "回执从活文件里读回来");
+        assert!(reseeded.unacked().is_empty(), "重启后不该再补投一次");
         std::fs::remove_dir_all(&dir).ok();
     }
 

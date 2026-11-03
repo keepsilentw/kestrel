@@ -2,7 +2,7 @@
 
 为星型多 Agent harness 写的 Rust harness kernel：引擎 + wire 层 + 工具/权限/沙箱 + 会话 + 总线/journal + CLI/配置。设计文档（中文）见本仓库 `docs/design.md`。
 
-**Metrics** — src 51 files / 14968 lines · tests 9 files / 3077 lines · 224 tests (lib 174 + bin 4 + integration 46)
+**Metrics** — src 51 files / 15374 lines · tests 9 files / 3204 lines · 228 tests (lib 177 + bin 4 + integration 47)
 
 Status: M0-M4 complete + 二期开工（`ApproveMode::Bus`、SA 判定含证据核对、bus 停车补投与自动重连、journal 快照/截断与在线投影、多任务 task 命名空间、openai-responses wire、worker 池、预算按 token 结算的价格表、journal 轮转的默认策略、按类型核对的证据与 stage 要求表、审批请求的 at-least-once 投递与按 req 幂等）——fmt / clippy `-D warnings` / test 三闸门全绿（人工执行：本仓库不挂 CI）。上面那行数字由 `tests/discipline.rs` 与源码树对照校验：改完代码不更新它，闸门就红。
 
@@ -103,6 +103,15 @@ pipeline 无限回派）。`harness/roles/sa.evidence.json` 缺省四个 stage �
 播种，仍然认得「这个 req 我答过了」。worker 也去重：同一个 `req` 的第二份 `allow` 只记一次、
 只唤醒一次工具。语义没动——到点仍是 deny，只是那现在意味着「问了三次都没人答」。也没假装做全：
 批复**迟到**（回合结束即关闭在途请求）仍停在超时 deny，跨进程重启的 ack 仍是 §10 上的一格。
+
+回执把最后那段模糊消掉（design.md §9.31）：worker 对**每一份**批复都回一句
+`approval_receipt{req, applied, reason}`——`applied: true` 是「唤醒了还在等的工具」，
+`applied: false` 是「收到了，但这格已经过期」。回执落 journal（`approval_acked`），台账因此
+能分出「判过却没有回执」的批复，SA 重启时对它们各补投一次。顺带修掉一个会谎报的缺陷：
+审批窗口到点时等待者曾留在台账里，后来那份批复「发送成功」，工件就把一次从未生效的批准
+记成 `allow`；现在到点即撤摊、工件写 `expired / applied:false`。**没生效的批准不许记成生效**，
+因为 journal 与工件会互相印证一个假结论。仍不做的事：迟到批复不会在下一次同样调用上重新
+兑现（那等于把一次 allow 变成长期通行证，要放宽只能改授权表）；跨回合挂起的审批槽位仍在 §10。
 
 `api` 三值：`anthropic-messages` / `openai-completions` / `openai-responses`。第三条是 §10 二期补上的 wire（`/v1/responses` + `response.*` 事件族），只有 fixture 级验证，**尚未真端点实测**（见 design.md §9.24）。`--base-url` 直连模式仍固定用 anthropic wire。
 

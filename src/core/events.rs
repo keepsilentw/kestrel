@@ -116,6 +116,15 @@ pub enum EventMsg {
         prompt: String,
         detail: Value,
     },
+    /// The approval window elapsed (or its wait was cancelled): **nobody is
+    /// listening for this `req` any more**. The CLI layer needs this to stop
+    /// re-sending a request that can no longer be acted on, and to answer the
+    /// approver with a receipt that says `applied: false` — otherwise a late
+    /// `allow` would be booked as if it had run the tool (design §9.31).
+    ApprovalExpired {
+        req: ReqId,
+        reason: String,
+    },
     Compacted {
         first_kept: String,
         tokens_before: u32,
