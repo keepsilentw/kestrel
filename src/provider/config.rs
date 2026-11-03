@@ -72,15 +72,30 @@ impl Registry {
             max_out: configured.and_then(|m| m.max_out).unwrap_or(16_384),
             input_image: configured.map(|m| m.input_image).unwrap_or(false),
             reasoning: configured.map(|m| m.reasoning).unwrap_or(false),
-            cost: Some(configured.and_then(|m| m.cost).unwrap_or(CostPerMTok {
-                input: 0.0,
-                output: 0.0,
-            })),
+            // Absent rate stays `None`: "nobody declared a price" is not the
+            // same claim as "this model is free", and the budget ledger bills
+            // differently for the two.
+            cost: configured.and_then(|m| m.cost),
             compat: configured
                 .and_then(|m| m.compat.clone())
                 .unwrap_or_default(),
         };
         Ok(meta)
+    }
+
+    /// The declared rate for (provider, model), if the user layer has one.
+    /// Unknown provider / undeclared model / an all-zero table all come back as
+    /// `None` — the ledger then books a nominal charge instead of `0.00`, so a
+    /// missing price can never silently disarm the budget stop-loss.
+    pub fn model_cost(&self, provider_id: &str, model_id: &str) -> Option<CostPerMTok> {
+        let cost = self
+            .providers
+            .get(provider_id)?
+            .models
+            .iter()
+            .find(|m| m.id == model_id)
+            .and_then(|m| m.cost)?;
+        cost.is_declared().then_some(cost)
     }
 
     pub fn headers(&self, provider_id: &str) -> Vec<(String, String)> {
@@ -210,6 +225,19 @@ key = "sk-resp"
 
 [[providers.oai-responses.models]]
 id = "resp-model"
+
+# a rate that is present but empty: "nobody filled this in", not "free"
+[providers.free-loader]
+base_url = "https://example.invalid"
+api = "openai-completions"
+key = "sk-none"
+
+[[providers.free-loader.models]]
+id = "free-model"
+
+[providers.free-loader.models.cost]
+input = 0.0
+output = 0.0
 "#
     }
 
@@ -236,23 +264,12 @@ id = "resp-model"
             .unwrap();
         assert_eq!(m2.context_window, 128_000);
         assert_eq!(m2.max_out, 16_384);
-        assert_eq!(
-            m2.cost,
-            Some(CostPerMTok {
-                input: 0.0,
-                output: 0.0
-            })
-        );
+        // no rate declared => no rate, not a claim of "free"
+        assert_eq!(m2.cost, None);
         // cost + compat from config
         let g = r.model_meta("zhipu-anthropic", "glm-5.3-flash").unwrap();
         assert!(g.input_image && g.reasoning);
-        assert_eq!(
-            g.cost,
-            Some(CostPerMTok {
-                input: 0.5,
-                output: 1.0
-            })
-        );
+        assert_eq!(g.cost, Some(CostPerMTok::simple(0.5, 1.0)));
         let l = r.model_meta("local-llama", "llama-x").unwrap();
         assert_eq!(l.wire, WireId::OpenAiCompletions);
         assert_eq!(
@@ -267,6 +284,27 @@ id = "resp-model"
         assert_eq!(rr.wire, WireId::OpenAiResponses);
         assert_eq!(rr.wire_id_str(), "openai-responses");
         assert_eq!(rr.base_url, "https://api.openai.com");
+    }
+
+    /// The ledger asks one question: what does this model cost? A model with no
+    /// rate, a provider that does not exist, and a rate filled in as zeros all
+    /// answer `None` — the three cases where booking `0.00` would quietly turn
+    /// the budget stop-loss into a no-op.
+    #[test]
+    fn model_cost_only_answers_for_declared_rates() {
+        let r = registry_named("cost");
+        assert_eq!(
+            r.model_cost("zhipu-anthropic", "glm-5.3-flash"),
+            Some(CostPerMTok::simple(0.5, 1.0))
+        );
+        assert_eq!(
+            r.model_cost("deepseek-anthropic", "deepseek-v4-flash"),
+            None
+        );
+        assert_eq!(r.model_cost("zhipu-anthropic", "undeclared"), None);
+        assert_eq!(r.model_cost("no-such-provider", "glm-5.3-flash"), None);
+        // an explicit but empty table is still "no rate"
+        assert_eq!(r.model_cost("free-loader", "free-model"), None);
     }
 
     #[test]

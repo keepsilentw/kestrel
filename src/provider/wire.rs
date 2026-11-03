@@ -26,11 +26,43 @@ pub enum WireId {
     OpenAiResponses,
 }
 
-/// Price per million tokens (USD). Budget math lands in M4.
+/// Price per million tokens (USD), declared in the user layer
+/// (`~/.kestrel/providers.toml`) — the one place money rates may be written
+/// down, exactly like keys. `cache_read` / `cache_write` are optional because
+/// not every gateway bills them separately; when absent, cached input is billed
+/// at the plain `input` rate (see `Usage::cost_usd`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct CostPerMTok {
     pub input: f64,
     pub output: f64,
+    /// Reading the prompt cache. Unset => billed as ordinary input.
+    #[serde(default)]
+    pub cache_read: Option<f64>,
+    /// Writing the prompt cache. Unset => billed as ordinary input.
+    #[serde(default)]
+    pub cache_write: Option<f64>,
+}
+
+impl CostPerMTok {
+    /// A two-rate table with no separate cache pricing.
+    pub const fn simple(input: f64, output: f64) -> Self {
+        Self {
+            input,
+            output,
+            cache_read: None,
+            cache_write: None,
+        }
+    }
+
+    /// Whether this table says anything at all. An all-zero table is NOT "free":
+    /// it is "nobody filled this in", and treating it as a bill would silently
+    /// disable a budget stop-loss. Callers price only when this is true.
+    pub fn is_declared(&self) -> bool {
+        self.input > 0.0
+            || self.output > 0.0
+            || self.cache_read.unwrap_or(0.0) > 0.0
+            || self.cache_write.unwrap_or(0.0) > 0.0
+    }
 }
 
 /// OpenAI-family is NOT one wire: these flags absorb per-gateway deviations
@@ -125,7 +157,7 @@ pub struct ToolSpec {
 }
 
 /// Token usage as reported by the API. The loop trusts these numbers (codex discipline).
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -145,6 +177,40 @@ impl Usage {
         self.output_tokens += other.output_tokens;
         self.cache_read_tokens += other.cache_read_tokens;
         self.cache_write_tokens += other.cache_write_tokens;
+    }
+
+    /// The bill for this usage at `price`, in USD. The arithmetic lives next to
+    /// the two types it combines; the AUTHORITY to bill lives in the ledger (the
+    /// SA resolves the rate from the registry and applies it — a worker reports
+    /// measurements, it does not set its own prices).
+    ///
+    /// Cached tokens are never dropped from the math: they are billed at their
+    /// own rate when the table declares one, otherwise at the plain input rate.
+    /// Cache reads are usually cheaper than that (so this overstates a little)
+    /// and cache writes a bit dearer (so this understates the write premium);
+    /// declare `cache_read` / `cache_write` when the difference matters.
+    pub fn cost_usd(&self, price: &CostPerMTok) -> f64 {
+        const M: f64 = 1_000_000.0;
+        let cache_read = price.cache_read.unwrap_or(price.input);
+        let cache_write = price.cache_write.unwrap_or(price.input);
+        (self.input_tokens as f64) * price.input / M
+            + (self.output_tokens as f64) * price.output / M
+            + (self.cache_read_tokens as f64) * cache_read / M
+            + (self.cache_write_tokens as f64) * cache_write / M
+    }
+
+    /// The worst-case bill a dispatch to this model can produce: the whole
+    /// context window re-sent as input plus a full `max_out` of output. Used as
+    /// a budget RESERVATION before the work is dispatched, so a pipeline that
+    /// crashes mid-dispatch cannot re-burn the ceiling forever.
+    pub fn worst_case_usd(price: &CostPerMTok, context_window: u32, max_out: u32) -> f64 {
+        let billed = Usage {
+            input_tokens: context_window as u64,
+            output_tokens: max_out as u64,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+        };
+        billed.cost_usd(price)
     }
 }
 
@@ -491,5 +557,58 @@ mod tests {
         assert!(e.is_retryable());
         assert!(e.retry_after().is_none());
         assert!(!StopReason::Length.is_retryable());
+    }
+
+    /// Money math: per-million rates over all four token buckets. A declared
+    /// cache rate wins; an undeclared one bills at the input rate, so cached
+    /// tokens can never fall out of the total.
+    #[test]
+    fn usage_cost_uses_every_bucket() {
+        let u = Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 500_000,
+            cache_read_tokens: 2_000_000,
+            cache_write_tokens: 100_000,
+        };
+        let flat = CostPerMTok::simple(2.0, 8.0);
+        // 2 + 4 + 4 + 0.2 (reads and writes both at the input rate)
+        assert!(
+            (u.cost_usd(&flat) - 10.2).abs() < 1e-9,
+            "{}",
+            u.cost_usd(&flat)
+        );
+        let cached = CostPerMTok {
+            input: 2.0,
+            output: 8.0,
+            cache_read: Some(0.2),
+            cache_write: Some(2.5),
+        };
+        // 2 + 4 + 0.4 + 0.25
+        assert!((u.cost_usd(&cached) - 6.65).abs() < 1e-9);
+    }
+
+    #[test]
+    fn reservation_is_the_context_window_plus_one_full_answer() {
+        let price = CostPerMTok::simple(1.0, 4.0);
+        let worst = Usage::worst_case_usd(&price, 128_000, 8_192);
+        assert!((worst - (0.128 + 0.032768)).abs() < 1e-9, "{worst}");
+    }
+
+    /// An empty table is not a free pass: `is_declared` is what keeps the
+    /// ledger from reading "nobody wrote a rate" as "this costs nothing".
+    #[test]
+    fn zero_rate_is_not_a_declared_price() {
+        assert!(!CostPerMTok::default().is_declared());
+        assert!(!CostPerMTok::simple(0.0, 0.0).is_declared());
+        assert!(CostPerMTok::simple(0.0, 0.5).is_declared());
+        assert!(
+            CostPerMTok {
+                input: 0.0,
+                output: 0.0,
+                cache_read: None,
+                cache_write: Some(0.1),
+            }
+            .is_declared()
+        );
     }
 }
