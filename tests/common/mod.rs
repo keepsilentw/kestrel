@@ -25,6 +25,9 @@ pub struct EngineSpec {
     pub tools: Vec<Arc<dyn kestrel::tools::Tool>>,
     pub fs: FsPolicy,
     pub approve: ApproveMode,
+    /// 策略表：默认是空表（`deny`/`ask` 走 PermissionEngine 的缺省），审批测试会
+    /// 换成「default: ask」以便真的走到反向请求那条路。
+    pub policy: Arc<PermissionEngine>,
 }
 
 impl Default for EngineSpec {
@@ -34,6 +37,7 @@ impl Default for EngineSpec {
             tools: vec![],
             fs: FsPolicy::default(),
             approve: ApproveMode::HeadlessDeny,
+            policy: Arc::new(PermissionEngine::new(Default::default())),
         }
     }
 }
@@ -47,6 +51,7 @@ pub fn spawn_engine(
         tools,
         fs,
         approve,
+        policy,
     } = spec;
     let sandbox: Arc<dyn kestrel::sandbox::Sandbox> = Arc::new(Unsandboxed);
     let handle = AgentHandle::spawn(EngineConfig {
@@ -66,7 +71,7 @@ pub fn spawn_engine(
         idgen: Arc::new(SeqGen::new()),
         fs,
         sandbox,
-        engine: Arc::new(PermissionEngine::new(Default::default())),
+        engine: policy,
         approve,
         session: None,
     });

@@ -1,14 +1,14 @@
 # kestrel 设计文档：Rust harness kernel
 
-> 状态：M0-M4 已实现并通过测试；§10 二期已落地十一项——`ApproveMode::Bus`、
+> 状态：M0-M4 已实现并通过测试；§10 二期已落地十二项——`ApproveMode::Bus`、
 > 「判定 = 工件 + 证据文件」、bus 重连重放（停车补投 + 客户端重连）、journal 快照/截断语义、
 > 多任务并行（task 命名空间 + 前缀寻址）、openai-responses wire（**真端点未实测**，§9.24）、
 > journal 投影增量化与轮转触发（§9.25）、worker 池（一 task 一引擎一树，§9.26）、
 > 预算价格表（usd 按 token 结算，§9.27）、journal 轮转的默认策略（活文件有界，§9.28）、
-> 证据的类型化（按类型核对 + stage 要求齐全，§9.29）。
+> 证据的类型化（按类型核对 + stage 要求齐全，§9.29）、审批批复的可靠投递（at-least-once + 幂等，§9.30）。
 > 质量闸门保持人工执行（本仓库不挂 CI，见 §9.19⑥）。
-> **Metrics** — src 51 files / 14667 lines · tests 9 files / 2926 lines · 220 tests (lib 171 + bin 4 + integration 45)
-> **Integration** — core_loop 5 / discipline 2 / m1_tools 8 / m2_session 6 / m4_bus 15 / m5_pool 3 / sandbox_e2e 4 / wire_anthropic 2
+> **Metrics** — src 51 files / 14968 lines · tests 9 files / 3077 lines · 224 tests (lib 174 + bin 4 + integration 46)
+> **Integration** — core_loop 5 / discipline 2 / m1_tools 8 / m2_session 6 / m4_bus 15 / m5_pool 4 / sandbox_e2e 4 / wire_anthropic 2
 > 规模已过 plan 预算（10-13k）的上沿：多出来的部分几乎都花在「取消安全」与「对账」这两条纪律上。
 > 上面两行数字由 `tests/discipline.rs::metrics_lines_match_the_tree` 对照源码树重算校验——
 > 这些计数此前在三处文档里手抄过三次、漂移过三次（§9.19），现在它是闸门不是仪式。
@@ -84,7 +84,7 @@ flowchart TD
 
 1. **请求带数据不带心情**：`approval_request` 帧携带 `tool` + `args` + 可判定的 `command`（`approval_detail` 把工具名与参数折进载荷），审批者判的是命令行本身，不是一段措辞。
 2. **审批者的权力也是一张表**：SA 用 `roles/sa.approvals.json`（与 role policy 同格式的三态前缀表）判定，只有显式 Allow 放行；Ask/Deny/命令为空/没有表 → deny。协调者不能放宽角色策略里没写过的东西。
-3. **沉默 = 拒绝**：`approve_timeout_secs`（默认 120s）到点由 worker 自己 deny，审批不会把回合挂死；总线断开时立刻 deny 全部在途请求，不在死 socket 上空转。
+3. **沉默 = 拒绝**：`approve_timeout_secs`（默认 120s）到点由 worker 自己 deny，审批不会把回合挂死；总线断开时立刻 deny 全部在途请求，不在死 socket 上空转。**沉默**与**没送到**现在是两件事：请求按 at-least-once 重发（§9.30），窗口内仍无人应答才叫沉默。
 
 `-p` 单发模式没有总线可问，声明 `approve = "bus"` 启动即报错（不静默降级成 none）。审批的两个动作都进 journal（`approval_requested` → `approval_decided`，先写盘再回铃），所以「谁把沙箱放宽了」在崩溃后仍可复现——不变式 5 对安全事件的延伸。
 
@@ -223,10 +223,19 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
     ⑤ 声明通道：worker 用 `EVIDENCE <kind> <path...>` 行声明（`harness/systems/{rd,qa}.md` 已写进契约），worker **只报它看到的东西**，判定仍然只读盘（不变式：铃正文与声明都是主张）。QA 写范围为零这一条没动：它不需要为了能声明类型而获得写权限，指认盘上已有的那份即可。
     ⑥ demo 缺省表要**行为不变**：`harness/roles/sa.evidence.json` 四个 stage 都只要求 `file`，等于类型化之前的语义；把某一格改成 `test_log` 是运营者的决定，不改默认、不静默改沙箱。这也是这份文档里唯一一处「能力落地但策略保守」的取舍： stricter 要求的价值要靠真端点联跑来验，不能拿 demo 默认为它背书。
 
+30. **审批批复的可靠投递（2026-11-03）**：§9.21 划的那条线仍然成立——总线不猜「大概没送到」，RPC 与「已经写进随后死掉的 socket」的帧都不重放。这一项不是把总线改成可靠投递，而是在**应用层**把代价不对称这件事做完：重发一份帧的代价，远小于一件工具被静默 deny 之后整次回派的代价。
+    ① 方向：**请求 at-least-once，批复可重复，判定只一次**。worker 把在途请求连同帧本体一起留着（`cli::pool::OpenApproval`），按 `ApproveMode::approval_retry_period()` 的节拍重发**同一个 `req` id**；审批者按 `req` 去重。语义一点没动：窗口到点仍是 deny，只是「沉默」现在意味着「问了三次都没人答」，而不是「问了一次，可能压根没送到」。
+    ② 节奏属于窗口，所以定义在拥有窗口的类型上：`approval_retry_period()` 挂在 `ApproveMode::Bus { timeout }` 上，取窗口的三分之一，夹在 50ms~30s。测试断言的是不变式本身——**最后一次重发必须早于 deny 的时刻**（`approval_retries_land_before_the_deny`），否则那次重发只是发给自己的安慰。
+    ③ 重发次数有界（`ApproveMode::MAX_APPROVAL_SENDS = 3`）：hub 的停车窗按 session 计数（每 session 32 帧、drop-oldest 并 warn），对着一个不在线的审批者猛发同一颗请求，会把**别人的**帧挤出去。上限与节奏同源，不在两层各写一份数。
+    ④ 审批者按 `req` 幂等（`sa_demo::ApprovalLedger`）：已答过的请求**原样重发上次那个批复**，不重判、也不再落一对 `approval_requested` / `approval_decided`——否则重发这个机制自己就把审计链写脏了。台账从 journal 播种（`ApprovalLedger::seed`），SA 重启后仍然认得「这个 req 我答过了」；「请求已落盘、批复还没落」这个崩溃点单独断言：不再记一次请求，但必须去判。播种**只读活文件**（`replay()`，长度由 §9.28 的上限管住），不读归档段——这不是省事：一颗请求最多在它自己的窗口里被重发 `MAX_APPROVAL_SENDS` 次，回合结束就在途表里关掉，比活文件还老的 req 不可能再被重发；真收到那种迟到副本，最坏也只是多一条批复记录，而 worker 按在途表去重，**工具不会被唤醒第二次**（`m5_pool` 那条测试钉的就是这个）。
+    ⑤ worker 侧同样去重：批复到达时若在途表里已经没有了（答过两次，或回合结束时被关掉），**只记一次** `approvals`、只唤醒一次工具——同一个 `allow` 把工具跑两遍是权限绕过的新变体。
+    ⑥ 重发用的是**同一份帧**（`OpenApproval.frame` 存着原件），不是重新拼一遍：审批者判的是 `tool + args + command`，重发的载荷若可能与第一次不同，去重就退化成「拿第二份措辞再判一次」。
+    ⑦ 仍没做的事，说清楚：这是 at-least-once，不是 exactly-once，也不是跨进程重启的可靠投递。回合结束即关闭在途请求（§9.26② 的路由表有界），所以**批复迟到**的语义仍停在超时 deny；「SA 下班了、明早上班再批」需要 ack + 跨回合的审批槽位，那是新的一格，仍留在 §10。播种只解决 `req` 的幂等，不做「重启后主动重答所有未决请求」——那等于把审批改成 pull 模式，与 §9.21「总线不猜」是两种取舍。
+
 ## 10 二期清单
 
-已落地（2026-10-28 起）：~~`ApproveMode::Bus`~~（授权表 + 超时 fail-closed + journal 审计，§9.20）、~~SA 判定升级到「工件 + 证据文件」~~（绝对路径存在性/非空核对，§9.20）、~~bus 重连重放~~（离线 session 停车补投 + 客户端自动重连；RPC 与「写入即死」的帧不重放，§9.21）、~~journal 快照/截断语义~~（检查点 + 归档段 + 崩溃安全轮转，§9.22）、~~多任务并行~~（task 命名空间三处同源 + 前缀寻址，§9.23）、~~openai-responses wire~~（第三条 v1 wire，金身 + fixture 验证，**真端点未实测**，§9.24）、~~journal 投影增量化与轮转触发~~（在线投影 = 全量重放 + 条数/字节双上限，§9.25）、~~一个引擎内真正并发地服务多个 task~~（改为「一 task 一引擎」的 worker 池，单活跃槽不动，§9.26）、~~`BudgetSpent` 的价格表~~（预留 → 结算两段式、按 token 换账单、无价退回名义值并报出来，§9.27；2026-11-03）、~~journal 轮转的**默认策略**~~（活文件 512 条 / 1 MiB 双上限、三态 CLI、生产与测试同一条 `rotate_at_boundary`，§9.28；2026-11-03）、~~证据的类型化~~（`file` / `test_log` / `diff` / `screenshot` 各自可在盘上反驳 + `--evidence-spec` 的 stage 要求，坏表硬失败，§9.29；2026-11-03）。
+已落地（2026-10-28 起）：~~`ApproveMode::Bus`~~（授权表 + 超时 fail-closed + journal 审计，§9.20）、~~SA 判定升级到「工件 + 证据文件」~~（绝对路径存在性/非空核对，§9.20）、~~bus 重连重放~~（离线 session 停车补投 + 客户端自动重连；RPC 与「写入即死」的帧不重放，§9.21）、~~journal 快照/截断语义~~（检查点 + 归档段 + 崩溃安全轮转，§9.22）、~~多任务并行~~（task 命名空间三处同源 + 前缀寻址，§9.23）、~~openai-responses wire~~（第三条 v1 wire，金身 + fixture 验证，**真端点未实测**，§9.24）、~~journal 投影增量化与轮转触发~~（在线投影 = 全量重放 + 条数/字节双上限，§9.25）、~~一个引擎内真正并发地服务多个 task~~（改为「一 task 一引擎」的 worker 池，单活跃槽不动，§9.26）、~~`BudgetSpent` 的价格表~~（预留 → 结算两段式、按 token 换账单、无价退回名义值并报出来，§9.27；2026-11-03）、~~journal 轮转的**默认策略**~~（活文件 512 条 / 1 MiB 双上限、三态 CLI、生产与测试同一条 `rotate_at_boundary`，§9.28；2026-11-03）、~~证据的类型化~~（`file` / `test_log` / `diff` / `screenshot` 各自可在盘上反驳 + `--evidence-spec` 的 stage 要求，坏表硬失败，§9.29；2026-11-03）、~~审批批复的可靠投递~~（请求 at-least-once + 按 req 幂等 + 台账从 journal 播种，判定仍只一次，§9.30；2026-11-03）。
 
-仍在清单上：tree-sitter-bash 命令解析、execpolicy DSL（Starlark）、landlock/bwrap（Linux 沙箱）、TUI（行级 diff 形制，pi-tui 蓝本）、MCP 客户端、model-in-the-loop evals（含 openai-responses 的真端点实测，§9.24）、审批批复的可靠投递（请求与批复都是 Notify：§9.21 的停车补投已覆盖「审批者当时不在线」，剩下的缺口是批复迟到——回合结束即丢弃，语义停在超时 deny；跨进程重启的可靠投递要等 ack 语义）、worker 池的资源护栏（`--max-tasks` 只挡 task 数，不挡每 task 的内存与并发 HTTP；真·多进程编排属于 harness 上层）、**归档段自身的治理**（默认策略落地后，长运行会攒出很多段；段按覆盖区间命名、永不自动清理，所以「段也该压缩或离线归档」是新的一格——不能靠默认轮转顺手做删除，那会撞上「这不是删除」那条语义边界）。
+仍在清单上（审批的 at-least-once 已收口；**批复迟到/跨重启的 ack** 仍是缺口，见 §9.30⑦）：tree-sitter-bash 命令解析、execpolicy DSL（Starlark）、landlock/bwrap（Linux 沙箱）、TUI（行级 diff 形制，pi-tui 蓝本）、MCP 客户端、model-in-the-loop evals（含 openai-responses 的真端点实测，§9.24）、worker 池的资源护栏（`--max-tasks` 只挡 task 数，不挡每 task 的内存与并发 HTTP；真·多进程编排属于 harness 上层）、**归档段自身的治理**（默认策略落地后，长运行会攒出很多段；段按覆盖区间命名、永不自动清理，所以「段也该压缩或离线归档」是新的一格——不能靠默认轮转顺手做删除，那会撞上「这不是删除」那条语义边界）。
 
 新划出的边界：`nominal_usd` 的占比应当随 `providers.toml` 填写完整率下降，这条曲线本身值得盯（单价填全之后 `--max-usd` 才是真正的账单上限，名义值只作为「说不清价」的兜底存在）；证据类型化之后的下一步是**要求的强度**——`test_log` 只证明「有一份像测试日志的东西」，不证明「测试通过」（`0 passed; 14 failed` 同样合格）。把结论判定交给判定词、把形状交给类型，是刻意的分工；要让证据自己携带结论，就得再开一格：解析 runner 的退出码或结构化输出，并把「过了几条、failed 几条」写进 journal。

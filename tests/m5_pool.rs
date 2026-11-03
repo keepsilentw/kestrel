@@ -12,11 +12,7 @@ use std::time::Duration;
 
 use kestrel::bus::rpc::{BusClient, BusHub};
 use kestrel::cli::pool::{EngineFactory, PoolConfig, PooledEngine, run_pool};
-use kestrel::core::actor::{AgentHandle, EngineConfig};
-use kestrel::core::id::SeqGen;
 use kestrel::provider::faux::{FauxWire, stop_script};
-use kestrel::provider::wire::{ModelMeta, NullTransport, ResolvedAuth, WireId};
-use kestrel::sandbox::{FsPolicy, Unsandboxed};
 use serde_json::{Value, json};
 
 fn temp(tag: &str) -> std::path::PathBuf {
@@ -26,14 +22,29 @@ fn temp(tag: &str) -> std::path::PathBuf {
     dir
 }
 
+/// The faux wires this pool spun up, keyed by task id: the tests read them to see
+/// what each engine was actually shown (history isolation is a reverse assertion).
+type Wires = Arc<Mutex<HashMap<String, Arc<FauxWire>>>>;
+
 struct Harness {
     sa: BusClient,
     artifacts: std::path::PathBuf,
-    wires: Arc<Mutex<HashMap<String, Arc<FauxWire>>>>,
+    wires: Wires,
     pool: tokio::task::JoinHandle<()>,
 }
 
-async fn harness(max_tasks: usize, tag: &str) -> Harness {
+/// The pool under test: a hub, one worker process, and the SA-side client.
+/// The engine factory is a parameter because the routing tests and the approval
+/// tests need different engines — and the second copy of this wiring nobody
+/// wants is the reason `harness` used to build its engine inline.
+async fn harness_with(
+    tag: &str,
+    max_tasks: usize,
+    approval_retry: Duration,
+    approver: Option<&str>,
+    factory: EngineFactory,
+    wires: Wires,
+) -> Harness {
     let dir = temp(tag);
     let socket = dir.join("bus.sock");
     let artifacts = dir.join("artifacts");
@@ -50,44 +61,13 @@ async fn harness(max_tasks: usize, tag: &str) -> Harness {
         .await
         .unwrap();
 
-    let wires: Arc<Mutex<HashMap<String, Arc<FauxWire>>>> = Arc::new(Mutex::new(HashMap::new()));
-    let seen = Arc::clone(&wires);
-    let factory: EngineFactory = Arc::new(move |task: &str| {
-        let wire = Arc::new(FauxWire::new());
-        // every task answers with its own name, so a crossed history is visible
-        wire.push_turn_script(stop_script(&format!("answer for {task}")));
-        seen.lock()
-            .unwrap()
-            .insert(task.to_string(), Arc::clone(&wire));
-        let handle = AgentHandle::spawn(EngineConfig {
-            provider: wire,
-            model: ModelMeta::minimal("faux", WireId::AnthropicMessages, "faux://unused"),
-            auth: ResolvedAuth::key("test"),
-            transport: Arc::new(NullTransport),
-            system: "role".into(),
-            tools: vec![],
-            max_rounds: 8,
-            cwd: std::env::temp_dir(),
-            role: "rd".into(),
-            idgen: Arc::new(SeqGen::new()),
-            fs: FsPolicy::default(),
-            sandbox: Arc::new(Unsandboxed),
-            engine: Arc::new(kestrel::permissions::PermissionEngine::new(
-                Default::default(),
-            )),
-            approve: kestrel::tools::ApproveMode::HeadlessDeny,
-            session: None,
-        });
-        let events = handle.take_event_rx().expect("single consumer");
-        Ok(PooledEngine { handle, events })
-    });
-
     let cfg = Arc::new(PoolConfig {
         session: "harness-rd".into(),
         role: "rd".into(),
         artifacts_dir: artifacts.clone(),
-        approver: None,
+        approver: approver.map(str::to_string),
         max_tasks,
+        approval_retry,
     });
     let pool = tokio::spawn(async move {
         if let Err(e) = run_pool(worker, cfg, factory).await {
@@ -102,6 +82,37 @@ async fn harness(max_tasks: usize, tag: &str) -> Harness {
         wires,
         pool,
     }
+}
+
+/// An engine that answers every task with its own text, so a crossed history is
+/// visible in `recorded_requests()`.
+fn answer_factory() -> (EngineFactory, Wires) {
+    let wires: Wires = Arc::new(Mutex::new(HashMap::new()));
+    let seen = Arc::clone(&wires);
+    let factory: EngineFactory = Arc::new(move |task: &str| {
+        let wire = Arc::new(FauxWire::new());
+        // every task answers with its own name, so a crossed history is visible
+        wire.push_turn_script(stop_script(&format!("answer for {task}")));
+        seen.lock()
+            .unwrap()
+            .insert(task.to_string(), Arc::clone(&wire));
+        let (handle, events) = common::spawn_engine(wire, common::EngineSpec::default());
+        Ok(PooledEngine { handle, events })
+    });
+    (factory, wires)
+}
+
+async fn harness(max_tasks: usize, tag: &str) -> Harness {
+    let (factory, wires) = answer_factory();
+    harness_with(
+        tag,
+        max_tasks,
+        Duration::from_millis(40),
+        None,
+        factory,
+        wires,
+    )
+    .await
 }
 
 fn bell(task: &str, stage: &str, text: &str) -> Value {
@@ -246,5 +257,140 @@ async fn a_bell_without_a_task_id_uses_the_default_namespace() {
     assert_eq!(done.payload["task_id"], "default");
     let artifact = read_artifact(&h.artifacts, "harness-rd-default-dev-iter1.json").await;
     assert_eq!(artifact["result"], "answer for default");
+    h.pool.abort();
+}
+
+/// §10 批复的可靠投递：第一份审批请求「丢了」（测试侧故意不答它，等价于帧写进了
+/// 随后死掉的 socket——§9.21 明确说这种帧总线不会重放），worker 必须自己再问一次；
+/// 而批复**重复投递**时只能生效一次：同一个 req 的第二份 `allow` 不能再把工具跑一遍。
+#[tokio::test]
+async fn an_unanswered_approval_request_is_resent_and_answered_once() {
+    use kestrel::permissions::{Decision, PermissionEngine, PolicyTable};
+    use kestrel::provider::faux::tool_use_script;
+    use kestrel::tools::ApproveMode;
+
+    let wires: Wires = Arc::new(Mutex::new(HashMap::new()));
+    let seen = Arc::clone(&wires);
+    let factory: EngineFactory = Arc::new(move |task: &str| {
+        let wire = Arc::new(FauxWire::new());
+        // 第一轮要跑一条命令（策略是 default ask，于是走反向请求），第二轮收尾
+        wire.push_turn_script(tool_use_script(
+            "need to run this",
+            "call-1",
+            "bash",
+            json!({"command": "echo resent-ok"}),
+        ));
+        wire.push_turn_script(stop_script("DONE: ran after the retry"));
+        seen.lock()
+            .unwrap()
+            .insert(task.to_string(), Arc::clone(&wire));
+        let (handle, events) = common::spawn_engine(
+            wire,
+            common::EngineSpec {
+                tools: vec![Arc::new(kestrel::tools::bash::Bash)],
+                approve: ApproveMode::Bus {
+                    timeout: Duration::from_secs(10),
+                },
+                policy: Arc::new(PermissionEngine::new(PolicyTable {
+                    default: Decision::Ask,
+                    rules: vec![],
+                    forbidden_prefixes: vec![],
+                })),
+                ..Default::default()
+            },
+        );
+        Ok(PooledEngine { handle, events })
+    });
+
+    let h = harness_with(
+        "approval-resent",
+        2,
+        Duration::from_millis(150),
+        Some("harness-sa"),
+        factory,
+        wires,
+    )
+    .await;
+    h.sa.notify("harness-rd", bell("t1", "dev", "run the command"));
+
+    // 第一份请求：收到但不答——没有重发机制的话，这一格只会等到超时 deny
+    let first = tokio::time::timeout(Duration::from_secs(5), h.sa.recv_notify())
+        .await
+        .expect("no approval request at all")
+        .unwrap();
+    assert_eq!(first.payload["type"], "approval_request");
+    assert_eq!(
+        first.payload["command"], "echo resent-ok",
+        "重发的必须还是那份可判定的载荷: {}",
+        first.payload
+    );
+    let req = first.payload["req"].as_str().unwrap().to_string();
+
+    let mut strays = Vec::new();
+    let mut resent = None;
+    for _ in 0..50 {
+        let frame = tokio::time::timeout(Duration::from_secs(5), h.sa.recv_notify())
+            .await
+            .expect("the approval request was never re-sent")
+            .unwrap();
+        if frame.payload["type"].as_str() == Some("approval_request") {
+            resent = Some(frame);
+            break;
+        }
+        strays.push(frame);
+    }
+    let resent = resent.expect("a re-sent approval request");
+    assert_eq!(
+        resent.payload["req"].as_str(),
+        Some(req.as_str()),
+        "重发用的是同一个 req id，审批者才去得了重"
+    );
+
+    // 这次答它，而且答两遍
+    for _ in 0..2 {
+        h.sa.notify(
+            "harness-rd",
+            json!({"type": "approval_decision", "req": req, "decision": "allow", "by": "harness-sa"}),
+        );
+    }
+
+    let done = match strays
+        .iter()
+        .find(|f| f.payload["result_ref"].is_string())
+        .cloned()
+    {
+        Some(bell) => bell,
+        None => tokio::time::timeout(Duration::from_secs(10), h.sa.recv_notify())
+            .await
+            .expect("no result bell after the retry")
+            .unwrap(),
+    };
+    assert!(
+        done.payload["result_ref"].is_string(),
+        "a result bell must point at the artifact: {}",
+        done.payload
+    );
+    let artifact = read_artifact(&h.artifacts, "harness-rd-t1-dev-iter1.json").await;
+    assert_eq!(
+        artifact["result"], "DONE: ran after the retry",
+        "{artifact}"
+    );
+    let recorded = artifact["approvals"]
+        .as_array()
+        .expect("the artifact records its approvals");
+    assert_eq!(
+        recorded.len(),
+        1,
+        "重复批复只生效一次，工具不会被跑两遍: {recorded:?}"
+    );
+    assert_eq!(recorded[0]["decision"], "allow");
+
+    // 工具真的跑成了：第二轮请求里带着那条 echo 的输出
+    let wires = h.wires.lock().unwrap();
+    let text = serde_json::to_string(&wires["t1"].recorded_requests()).unwrap();
+    assert!(
+        text.contains("resent-ok"),
+        "the tool ran after the retry: {text}"
+    );
     h.pool.abort();
 }

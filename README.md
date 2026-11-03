@@ -2,9 +2,9 @@
 
 为星型多 Agent harness 写的 Rust harness kernel：引擎 + wire 层 + 工具/权限/沙箱 + 会话 + 总线/journal + CLI/配置。设计文档（中文）见本仓库 `docs/design.md`。
 
-**Metrics** — src 51 files / 14667 lines · tests 9 files / 2926 lines · 220 tests (lib 171 + bin 4 + integration 45)
+**Metrics** — src 51 files / 14968 lines · tests 9 files / 3077 lines · 224 tests (lib 174 + bin 4 + integration 46)
 
-Status: M0-M4 complete + 二期开工（`ApproveMode::Bus`、SA 判定含证据核对、bus 停车补投与自动重连、journal 快照/截断与在线投影、多任务 task 命名空间、openai-responses wire、worker 池、预算按 token 结算的价格表、journal 轮转的默认策略、按类型核对的证据与 stage 要求表）——fmt / clippy `-D warnings` / test 三闸门全绿（人工执行：本仓库不挂 CI）。上面那行数字由 `tests/discipline.rs` 与源码树对照校验：改完代码不更新它，闸门就红。
+Status: M0-M4 complete + 二期开工（`ApproveMode::Bus`、SA 判定含证据核对、bus 停车补投与自动重连、journal 快照/截断与在线投影、多任务 task 命名空间、openai-responses wire、worker 池、预算按 token 结算的价格表、journal 轮转的默认策略、按类型核对的证据与 stage 要求表、审批请求的 at-least-once 投递与按 req 幂等）——fmt / clippy `-D warnings` / test 三闸门全绿（人工执行：本仓库不挂 CI）。上面那行数字由 `tests/discipline.rs` 与源码树对照校验：改完代码不更新它，闸门就红。
 
 ## Quick start
 
@@ -95,6 +95,15 @@ pipeline 无限回派）。`harness/roles/sa.evidence.json` 缺省四个 stage �
 （`approval_requested` / `approval_decided`），「谁放宽了沙箱」崩溃后可复现。
 `-p` 单发模式没有总线可问：`approve = "bus"` 在启动时直接报错，不静默降级。
 
+**沉默**和**没送到**是两件事（design.md §9.30）。总线故意不重放「写进随后死掉的 socket」的帧
+（§9.21），所以审批请求在应用层按 at-least-once 投递：worker 把在途请求连同帧本体一起留着，
+按窗口的三分之一重发**同一个 `req` id**（节奏在 `ApproveMode::approval_retry_period()`，上限
+`MAX_APPROVAL_SENDS = 3`——hub 的停车窗按 session 计数，猛发会把别人的帧挤掉）。审批者按 `req`
+幂等：答过的请求原样重发上次那个批复，不重判、也不再落第二对记录；SA 重启后台账从 journal
+播种，仍然认得「这个 req 我答过了」。worker 也去重：同一个 `req` 的第二份 `allow` 只记一次、
+只唤醒一次工具。语义没动——到点仍是 deny，只是那现在意味着「问了三次都没人答」。也没假装做全：
+批复**迟到**（回合结束即关闭在途请求）仍停在超时 deny，跨进程重启的 ack 仍是 §10 上的一格。
+
 `api` 三值：`anthropic-messages` / `openai-completions` / `openai-responses`。第三条是 §10 二期补上的 wire（`/v1/responses` + `response.*` 事件族），只有 fixture 级验证，**尚未真端点实测**（见 design.md §9.24）。`--base-url` 直连模式仍固定用 anthropic wire。
 
 ## Sessions
@@ -150,7 +159,7 @@ src/
   core/       actor(Op/Event) + run_turn + steering + 取消树        # 引擎
   provider/   wire trait + anthropic / openai_chat / openai_responses + compat + partial_json
               + retry + registry
-  tools/      bash/read/write/edit + orchestrator(并行门闸 + 审批反向请求/超时)
+  tools/      bash/read/write/edit + orchestrator(并行门闸 + 审批反向请求/超时/重发节奏)
   permissions/ 三态前缀表 + word-only tokenizer（fail-closed）
   sandbox/    Seatbelt 包裹（4 sbpl 模板）+ denial 检测 + 升级循环
   session/    append-only 树 JSONL + 无损 compaction（firstKeptEntryId）
@@ -159,7 +168,8 @@ src/
   journal/    write-ahead 真相源 + 崩溃对账 + 在线投影 + 预算/用量/审批账本
               + snapshot 检查点与归档段轮转（截断不丢未结算的铃）
   cli/        -p 单发 / serve 常驻 worker / demo-sa 脚本化 SA / hub 总线进程
-              + pool.rs（worker 池：按 task 路由，一 task 一引擎一树）
+              + pool.rs（worker 池：按 task 路由，一 task 一引擎一树；在途审批请求的
+                at-least-once 重发也在这层：按 req 去重、重发的是同一份帧）
               + evidence.rs（证据契约：类型化声明 + 按类型在盘上核对 + stage 要求齐全）
               + task.rs（task 命名空间：工件名契约 + slug 防路径穿越）
   config/     角色加载（含 $VAR 路径展开）+ KESTREL_HOME

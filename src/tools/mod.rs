@@ -140,6 +140,91 @@ pub enum ApproveMode {
 impl ApproveMode {
     /// Fallback wait for a bus approver when the role stays silent.
     pub const DEFAULT_BUS_TIMEOUT: Duration = Duration::from_secs(120);
+
+    /// 一个审批请求最多投递几次（首发 + 两次重发）。有界是刻意的：hub 的停车窗是按
+    /// session 计数的（§9.21：每 session 32 帧、drop-oldest 并 warn），在不在线的
+    /// 审批者面前猛发同一颗请求，会把别人的帧挤掉。
+    pub const MAX_APPROVAL_SENDS: u32 = 3;
+
+    /// 审批请求的重发节奏（design §10「批复的可靠投递」）：一个窗口里放得下
+    /// `MAX_APPROVAL_SENDS` 次投递，所以取窗口的三分之一。
+    ///
+    /// 太密会坏事：hub 的停车窗是按 session 计的（§9.21：每 session 32 帧、
+    /// drop-oldest 并 warn），一个不在线的审批者面前猛发同一颗请求，会把别的
+    /// 帧挤出去。太疏也白搭：窗尾才发出的重发来不及在 deny 之前回来。
+    /// 节奏属于这个窗口，所以它在拥有窗口的类型上，而不是在调用方各算一遍。
+    pub fn approval_retry_period(&self) -> Duration {
+        match self {
+            ApproveMode::Bus { timeout } => {
+                let third = *timeout / Self::MAX_APPROVAL_SENDS;
+                if third < Duration::from_millis(50) {
+                    Duration::from_millis(50)
+                } else if third > Duration::from_secs(30) {
+                    Duration::from_secs(30)
+                } else {
+                    third
+                }
+            }
+            // headless 两种模式都不上总线，也就没有重发这回事
+            ApproveMode::HeadlessDeny | ApproveMode::HeadlessAllow => Duration::from_secs(30),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 可靠投递的全部意义：**最后一次重发要早于 deny 的时刻**。否则那次重发只是
+    /// 发给自己的安慰，窗口照样等满、批复照样丢。
+    #[test]
+    fn approval_retries_land_before_the_deny() {
+        for secs in [5u64, 60, 120] {
+            let period = ApproveMode::Bus {
+                timeout: Duration::from_secs(secs),
+            }
+            .approval_retry_period();
+            let last_send = period * (ApproveMode::MAX_APPROVAL_SENDS - 1);
+            assert!(
+                last_send < Duration::from_secs(secs),
+                "{secs}s 窗口里第三次投递落在 {last_send:?}，已经过了 deny 的时刻"
+            );
+        }
+    }
+
+    /// 两端都有夹子：太密会挤占 hub 的停车窗，太疏则慢端点等不到第三次投递。
+    /// 窗口小于 `3 × 50ms` 时下限会赢——那是「窗口本来就短到没法可靠投递」的情形，
+    /// 语义仍然停在超时 deny，不会变成无限等待。
+    #[test]
+    fn approval_retry_period_is_clamped_at_both_ends() {
+        assert_eq!(
+            ApproveMode::Bus {
+                timeout: Duration::from_millis(60)
+            }
+            .approval_retry_period(),
+            Duration::from_millis(50)
+        );
+        assert_eq!(
+            ApproveMode::Bus {
+                timeout: Duration::from_secs(3600)
+            }
+            .approval_retry_period(),
+            Duration::from_secs(30)
+        );
+        // demo 的 60s 窗口：20s 一次，三次投递都赶得上
+        assert_eq!(
+            ApproveMode::Bus {
+                timeout: Duration::from_secs(60)
+            }
+            .approval_retry_period(),
+            Duration::from_secs(20)
+        );
+        // headless 不上总线：给一个不会真被使用的缺省值
+        assert_eq!(
+            ApproveMode::HeadlessDeny.approval_retry_period(),
+            Duration::from_secs(30)
+        );
+    }
 }
 
 /// Per-call context: role profile + sandbox + permission engine.

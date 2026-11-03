@@ -385,6 +385,15 @@ enum StageOutcome {
 /// dispatch → wait bell → reconcile（读盘为准）→ 推进/回派，直至 release。
 pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
     let journal = Journal::create(&args.journal)?;
+    // 审批台账从 journal 播种：SA 重启后仍然认得「这个 req 我已经答过了」，
+    // 于是 worker 的重发只会拿到同一份批复，而不是第二次判定 + 第二对审计记录。
+    let mut approvals = ApprovalLedger::seed(&journal);
+    if approvals.decided_len() > 0 {
+        println!(
+            "[sa] approval ledger: {} decision(s) re-read from the journal",
+            approvals.decided_len()
+        );
+    }
     let sa = BusClient::connect(&args.bus_socket, "harness-sa", None).await?;
     let authority = match &args.approvals {
         Some(path) => Some(
@@ -533,7 +542,14 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
                 }
                 match tokio::time::timeout(deadline - now, sa.recv_notify()).await {
                     Ok(Ok(env)) if env.payload["type"].as_str() == Some("approval_request") => {
-                        answer_approval(&journal, &sa, authority.as_ref(), &env, &args.task_id)?;
+                        answer_approval(
+                            &journal,
+                            &sa,
+                            authority.as_ref(),
+                            &env,
+                            &args.task_id,
+                            &mut approvals,
+                        )?;
                     }
                     Ok(Ok(env)) => break Some(env),
                     Ok(Err(e)) => {
@@ -704,30 +720,50 @@ fn answer_approval(
     authority: Option<&PermissionEngine>,
     env: &Envelope,
     task: &str,
+    ledger: &mut ApprovalLedger,
 ) -> anyhow::Result<()> {
     let req = env.payload["req"].as_str().unwrap_or_default().to_string();
     let worker = env.payload["session"]
         .as_str()
         .unwrap_or(env.sender.as_str())
         .to_string();
+    // 重复投递（worker 的重发，或停车补投送来的一份旧帧）：原样重发上次那个批复。
+    // 不重判、不再落一对记录——审计链上「谁放宽了沙箱」必须一个 req 只有一答，
+    // 否则重发这个机制自己就把 journal 写脏了。
+    if let Some(prior) = ledger.decision_for(&req).map(str::to_string) {
+        sa.notify(
+            &worker,
+            serde_json::json!({
+                "type": "approval_decision",
+                "req": req,
+                "decision": prior,
+                "by": "harness-sa",
+            }),
+        );
+        println!("[sa] approval {prior} for {worker}: {req} re-sent (duplicate request)");
+        return Ok(());
+    }
     // The frame carries the command at the top level; fall back to the detail
     // blob so an older worker is still judged on something real.
     let command = match env.payload["command"].as_str() {
         Some(c) => c.to_string(),
         None => approval_command(&env.payload["detail"]),
     };
-    journal.append(&JournalRecord::ApprovalRequested {
-        task: task.into(),
-        peer: worker.clone(),
-        req: req.clone(),
-        command: command.clone(),
-    })?;
+    if ledger.note_request(&req) {
+        journal.append(&JournalRecord::ApprovalRequested {
+            task: task.into(),
+            peer: worker.clone(),
+            req: req.clone(),
+            command: command.clone(),
+        })?;
+    }
     let decision = decide_approval(authority, &command);
     journal.append(&JournalRecord::ApprovalDecided {
         req: req.clone(),
         decision: decision_name(decision).to_string(),
         by: "harness-sa".into(),
     })?;
+    ledger.record_decision(req.clone(), decision_name(decision).to_string());
     sa.notify(
         &worker,
         serde_json::json!({
@@ -742,6 +778,59 @@ fn answer_approval(
         decision_name(decision)
     );
     Ok(())
+}
+
+/// 审批的幂等台账：`req` -> 已给出的批复，外加「哪些 req 已经落过请求记录」。
+///
+/// 投递是 at-least-once（worker 会重发同一颗请求，§10 批复的可靠投递），所以审批者
+/// 必须按 `req` 去重：重发不该再判一次，也不该在 journal 里多出第二对记录。
+/// 重启后从 journal 播种——这一次读是有界的：活文件的长度由 §9.28 的默认策略管住，
+/// 更早的记录在归档段里，`replay_all()` 一并读到。
+#[derive(Debug, Default)]
+pub struct ApprovalLedger {
+    requests: std::collections::BTreeSet<String>,
+    decisions: BTreeMap<String, String>,
+}
+
+impl ApprovalLedger {
+    /// 只播种**活文件**：它的长度由 §9.28 的默认上限管住，这一次读因此有界。
+    /// 为什么不读归档段（`replay_all()`）：一颗请求最多在它的窗口里被重发
+    /// `MAX_APPROVAL_SENDS` 次，回合结束就在途表里关掉了——比活文件还老的请求
+    /// 不可能再被重发。真出现「极老 req 的迟到副本」，最坏的后果也只是多一条批复
+    /// 记录，而 worker 那边按在途表去重，**工具不会被唤醒第二次**。
+    pub fn seed(journal: &Journal) -> Self {
+        let mut ledger = Self::default();
+        for record in journal.replay() {
+            match record {
+                JournalRecord::ApprovalRequested { req, .. } => {
+                    ledger.requests.insert(req);
+                }
+                JournalRecord::ApprovalDecided { req, decision, .. } => {
+                    ledger.decisions.insert(req, decision);
+                }
+                _ => {}
+            }
+        }
+        ledger
+    }
+
+    /// 已经判过的批复；没有则 `None`（调用方去判）。
+    pub fn decision_for(&self, req: &str) -> Option<&str> {
+        self.decisions.get(req).map(String::as_str)
+    }
+
+    /// 记下「这颗请求已经落过盘了」。返回 false = 之前就记过，别再写第二遍。
+    pub fn note_request(&mut self, req: &str) -> bool {
+        self.requests.insert(req.to_string())
+    }
+
+    pub fn record_decision(&mut self, req: String, decision: String) {
+        self.decisions.insert(req, decision);
+    }
+
+    pub fn decided_len(&self) -> usize {
+        self.decisions.len()
+    }
 }
 
 /// SA 的授权是一张表，不是一种心情：只有显式 Allow 才放行。没有表、没有可判定的
@@ -1080,6 +1169,67 @@ mod tests {
         let nothing = PriceLedger::discover(None, None);
         assert_eq!(nothing.reservation("harness-rd", 0.25), (0.25, false));
         assert!(nothing.known_peers().is_empty());
+    }
+
+    /// 投递是 at-least-once，所以审批者必须按 `req` 去重：重发不该再判一次，也不该
+    /// 在 journal 里留下第二对记录——否则「谁放宽了沙箱」这条审计链自己就先被重发
+    /// 写脏了。重启之后台账从 journal 播种，同一个 req 仍然只有一份答案。
+    #[test]
+    fn approval_ledger_dedups_by_req_and_survives_a_restart() {
+        let dir = std::env::temp_dir().join(format!("kestrel-apledger-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("journal.jsonl");
+        {
+            let j = Journal::create(&path).unwrap();
+            let mut ledger = ApprovalLedger::seed(&j);
+            assert!(
+                ledger.note_request("r-1"),
+                "第一次见到这颗请求，该落审计记录"
+            );
+            j.append(&JournalRecord::ApprovalRequested {
+                task: "demo".into(),
+                peer: "harness-rd".into(),
+                req: "r-1".into(),
+                command: "cargo test".into(),
+            })
+            .unwrap();
+            j.append(&JournalRecord::ApprovalDecided {
+                req: "r-1".into(),
+                decision: "allow".into(),
+                by: "harness-sa".into(),
+            })
+            .unwrap();
+            ledger.record_decision("r-1".into(), "allow".into());
+
+            // worker 的重发：同一个 req 不再算新请求，答案原样重发
+            assert!(
+                !ledger.note_request("r-1"),
+                "重发的请求不该再落第二份 approval_requested"
+            );
+            assert_eq!(ledger.decision_for("r-1"), Some("allow"));
+        }
+
+        // 重启：台账从盘上播种，同一个 req 仍然只有那一个答案
+        let reopened = Journal::open(&path).unwrap();
+        let mut seeded = ApprovalLedger::seed(&reopened);
+        assert_eq!(seeded.decision_for("r-1"), Some("allow"), "重启不重判");
+        assert_eq!(seeded.decided_len(), 1);
+        assert!(!seeded.note_request("r-1"), "请求记录也已经在盘上了");
+
+        // 崩溃点：请求落了盘、批复还没落 —— 重启后不能再记一次请求，但必须去判
+        let half = dir.join("half.jsonl");
+        let j2 = Journal::create(&half).unwrap();
+        j2.append(&JournalRecord::ApprovalRequested {
+            task: "demo".into(),
+            peer: "harness-rd".into(),
+            req: "r-2".into(),
+            command: "rm -rf /tmp/x".into(),
+        })
+        .unwrap();
+        let mut ledger2 = ApprovalLedger::seed(&j2);
+        assert!(!ledger2.note_request("r-2"), "请求已经记过了");
+        assert_eq!(ledger2.decision_for("r-2"), None, "但答案还没有，得去判");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A real file an artifact can point at: a converged verdict now has to be

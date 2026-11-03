@@ -9,13 +9,15 @@
 //! 反向请求的**归属**必须有人统一记账：批复要送给打开它的那个 task，绝不能广播——
 //! 一次 `allow` 被另一个 task 消费就是权限绕过（design §5）。
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use serde_json::Value;
 use tokio::sync::mpsc;
+use tokio::time::sleep;
 use tokio_util::task::AbortOnDropHandle;
 
 use crate::bus::frame::{Envelope, FrameKind};
@@ -27,6 +29,7 @@ use crate::core::actor::AgentHandle;
 use crate::core::events::{Event, EventMsg, MessageItem};
 use crate::core::ops::{ApprovalDecision, Op};
 use crate::provider::wire::{StopReason, Usage};
+use crate::tools::ApproveMode;
 
 /// One unit of work handed to a task's engine.
 pub enum TaskMsg {
@@ -161,7 +164,22 @@ pub struct PoolConfig {
     /// `approve = "bus"`: the peer that answers; `None` means "whoever rang".
     pub approver: Option<String>,
     pub max_tasks: usize,
+    /// How often an unanswered approval request is re-sent (§10 批复的可靠投递).
+    /// `serve` folds it out of the role's `approve_timeout_secs` so the retries
+    /// land *inside* the window that ends in a deny.
+    pub approval_retry: Duration,
 }
+
+/// An approval request that is still in flight: the frame itself (so a retry is
+/// byte-identical), who it went to, and how many times it has been sent.
+struct OpenApproval {
+    frame: Value,
+    to: String,
+    sends: u32,
+}
+
+// 投递上限不在这层定义：它属于审批窗口本身（`ApproveMode::MAX_APPROVAL_SENDS`），
+// 与重发节奏同一个来源，免得两处各写一个数然后对不上。
 
 /// The pump: single bus reader + single bus writer + per-task routing.
 pub async fn run_pool(
@@ -311,6 +329,10 @@ fn spawn_worker(
     // managed: joined when the pump stops (dropping the sender ends the loop)
     AbortOnDropHandle::new(tokio::spawn(async move {
         let mut pending: VecDeque<(String, Value)> = VecDeque::new();
+        // The retransmit clock lives outside the select: a timer future created
+        // inside a `select!` arm is rebuilt on every iteration, and one that is
+        // always rebuilt never elapses. This one is re-armed only when it fires.
+        let mut retry = Box::pin(sleep(cfg.approval_retry));
         loop {
             let (sender, payload) = match pending.pop_front() {
                 Some(b) => b,
@@ -339,7 +361,7 @@ fn spawn_worker(
             let mut aborted = false;
             let mut usage = Usage::default();
             let mut approvals: Vec<Value> = Vec::new();
-            let mut open: HashSet<String> = HashSet::new();
+            let mut open: BTreeMap<String, OpenApproval> = BTreeMap::new();
             let stop_seen: Option<StopReason>;
             loop {
                 tokio::select! {
@@ -355,7 +377,9 @@ fn spawn_worker(
                             EventMsg::TurnComplete { stop, usage: seen } => {
                                 aborted = matches!(stop, StopReason::Aborted);
                                 usage = seen;
-                                for req in open.drain() {
+                                // 回合结束了，还在途的请求一律关掉：路由表必须有界
+                                // （§9.26②），批复再迟到也没有人要了
+                                for (req, _) in std::mem::take(&mut open) {
                                     let _ = out_tx.send(Outbound::ApprovalClosed { req });
                                 }
                                 stop_seen = Some(stop);
@@ -363,7 +387,7 @@ fn spawn_worker(
                             }
                             EventMsg::Fatal { error } => {
                                 result_text = format!("fatal: {error}");
-                                for req in open.drain() {
+                                for (req, _) in std::mem::take(&mut open) {
                                     let _ = out_tx.send(Outbound::ApprovalClosed { req });
                                 }
                                 stop_seen = Some(StopReason::error(error, true));
@@ -390,17 +414,50 @@ fn spawn_worker(
                                 });
                                 let _ = out_tx.send(Outbound::Notify {
                                     session: approver.clone(),
-                                    payload: frame,
+                                    payload: frame.clone(),
                                 });
-                                open.insert(req);
+                                open.insert(
+                                    req,
+                                    OpenApproval {
+                                        frame,
+                                        to: approver.clone(),
+                                        sends: 1,
+                                    },
+                                );
                             }
                             _ => {}
+                        }
+                    }
+                    // at-least-once delivery (§10 批复的可靠投递): a frame written
+                    // into a socket that then died is NOT replayed — §9.21 draws
+                    // that line deliberately — so an unanswered request has to ask
+                    // again. The approver dedups by req id, so a duplicate cannot
+                    // decide twice nor book a second audit pair; the send count is
+                    // capped so one lost request cannot evict other sessions from
+                    // the hub's parking lot.
+                    _ = retry.as_mut(), if !open.is_empty() => {
+                        retry = Box::pin(sleep(cfg.approval_retry));
+                        for (id, waiting) in open.iter_mut() {
+                            if waiting.sends >= ApproveMode::MAX_APPROVAL_SENDS {
+                                continue;
+                            }
+                            waiting.sends += 1;
+                            tracing::warn!(
+                                "task {task}: approval request {id} is unanswered, re-sending \
+                                 ({} of {})",
+                                ApproveMode::MAX_APPROVAL_SENDS,
+                                waiting.sends
+                            );
+                            let _ = out_tx.send(Outbound::Notify {
+                                session: waiting.to.clone(),
+                                payload: waiting.frame.clone(),
+                            });
                         }
                     }
                     msg = inbox.recv(), if !open.is_empty() => {
                         match msg {
                             Some(TaskMsg::Approval { req, decision, by }) => {
-                                if open.remove(&req) {
+                                if open.remove(&req).is_some() {
                                     handle.submit(Op::Approval { req: req.clone(), decision });
                                     approvals.push(serde_json::json!({
                                         "req": req,
@@ -408,6 +465,12 @@ fn spawn_worker(
                                         "by": by,
                                     }));
                                     let _ = out_tx.send(Outbound::ApprovalClosed { req });
+                                } else {
+                                    // 已经答过，或回合结束时就关掉了：同一个 req 的
+                                    // 第二份 allow 绝不能再把工具跑一遍
+                                    tracing::debug!(
+                                        "task {task}: duplicate or stale approval reply {req} ignored"
+                                    );
                                 }
                             }
                             Some(TaskMsg::Bell { sender, payload }) => {

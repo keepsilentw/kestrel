@@ -91,6 +91,9 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         // whoever rang this bell", which in the star topology is the SA.
         approver: role.approver().map(str::to_string),
         max_tasks: args.max_tasks,
+        // 审批请求的重发节奏跟着这个 worker 的审批窗口走（runtime > role，
+        // 与 approve 模式同一份来源，不在这里再读一次 role）
+        approval_retry: approve.approval_retry_period(),
     });
 
     let model = args.model.clone();

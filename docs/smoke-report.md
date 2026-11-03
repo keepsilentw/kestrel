@@ -7,8 +7,8 @@
 
 ## 1. 自动化测试基线（cargo test）
 
-**Metrics** — src 51 files / 14667 lines · tests 9 files / 2926 lines · 220 tests (lib 171 + bin 4 + integration 45)
-**Integration** — core_loop 5 / discipline 2 / m1_tools 8 / m2_session 6 / m4_bus 15 / m5_pool 3 / sandbox_e2e 4 / wire_anthropic 2
+**Metrics** — src 51 files / 14968 lines · tests 9 files / 3077 lines · 224 tests (lib 174 + bin 4 + integration 46)
+**Integration** — core_loop 5 / discipline 2 / m1_tools 8 / m2_session 6 / m4_bus 15 / m5_pool 4 / sandbox_e2e 4 / wire_anthropic 2
 
 | 组 | 覆盖 |
 |---|---|
@@ -348,3 +348,29 @@ design §10 第一条新边界落地：`CostPerMTok` 早在 M3 就进了 registr
 另一处刻意分工：`test_log` 只证明「有一份像测试日志的东西」，**不证明测试通过**
 （`0 passed; 14 failed` 同样合格）。结论仍由判定词给，形状由类型管——要证据自带结论，
 就得再开一格（解析 runner 退出码 / 结构化输出并把过与败写进 journal），这条记在 §10。
+
+## 16. 2026-11-03 审批批复的可靠投递（at-least-once + 按 req 幂等）
+
+§10 上「批复的可靠投递」这一格收口了一半：总线仍然不猜「大概没送到」（§9.21 那条线不动），
+但审批改由应用层按 at-least-once 投递——代价不对称这件事得做完（重发一份帧 vs 一次静默 deny
+之后整次回派）。详见 design §9.30。
+
+| 项 | 用例 | 结果 |
+|---|---|---|
+| 重发把批复拿回来（真总线 + 真 worker 池） | `m5_pool::an_unanswered_approval_request_is_resent_and_answered_once` | 通过；测试侧故意不答第一份请求，worker 重发后拿到批复，工具跑成、结果铃回来 |
+| 重发的是同一颗请求 | 同上（断言两份 `approval_request` 的 `req` 与 `command` 完全相同） | 通过；发的是存着的原件，不是重新拼一遍 |
+| 重复批复只生效一次 | 同上（SA 连答两遍 `allow`，工件 `approvals` 长度为 1） | 通过；同一个 req 的第二份 allow 不再唤醒工具 |
+| 最后一次重发必须早于 deny | `tools::tests::approval_retries_land_before_the_deny` | 通过；对 5s / 60s / 120s 三种窗口断言 `2 × period < timeout` |
+| 节奏两端有夹子 | `tools::tests::approval_retry_period_is_clamped_at_both_ends` | 通过；60ms 窗口 → 50ms 下限，1h → 30s 上限，demo 的 60s → 20s |
+| 审批者按 req 幂等 | `sa_demo::tests::approval_ledger_dedups_by_req_and_survives_a_restart` | 通过；重发不再落第二对 `approval_requested`/`approval_decided`，答案原样重发；重启后从 journal 播种仍认得该 req |
+| 播种的读法有界 | `sa_demo::tests::approval_ledger_dedups_by_req_and_survives_a_restart`（`seed` 走 `replay()`） | 通过；只读活文件。比活文件更老的 req 不可能再被重发；真收到迟到副本也只是多一条记录，第二次唤醒由 worker 的在途表挡住 |
+| 「请求已落盘、批复未落」的崩溃点 | 同上（半写 journal） | 通过；不再记一次请求，但必须去判 |
+
+**没做的事**：这不是 exactly-once，也不是跨进程重启的可靠投递。回合结束即关闭在途请求
+（§9.26② 的路由表有界），所以**批复迟到**的语义仍停在超时 deny；「SA 下班、明早再批」需要
+ack + 跨回合的审批槽位，那条留在 §10。播种只解决 req 的幂等，不做「重启后主动重答所有未决
+请求」——那等于把审批改成 pull 模式，与 §9.21「总线不猜」是两种取舍。
+
+**验证状态**：`cargo fmt --check` / `cargo clippy --all-targets -- -D warnings` / `cargo test`
+本轮全部实跑（计数见 §1 的 Metrics 行）。沙箱内 UDS `bind` 会以 `EPERM` 失败，`m4_bus` /
+`m5_pool` 需要在真机跑（§1 已注明）。
