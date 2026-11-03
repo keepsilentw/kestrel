@@ -1,8 +1,10 @@
 # kestrel
 
-为星型多 Agent harness 写的 Rust harness kernel：引擎 1.1k 行 + wire 层 2.6k + 工具/权限/沙箱 2.3k + 会话 0.9k + 总线/journal 1.9k + CLI/配置 2.7k（`src` 49 文件 11.4k 行，`tests` 8 文件 2.3k 行）。设计文档（中文）见本仓库 `docs/design.md`。
+为星型多 Agent harness 写的 Rust harness kernel：引擎 + wire 层 + 工具/权限/沙箱 + 会话 + 总线/journal + CLI/配置。设计文档（中文）见本仓库 `docs/design.md`。
 
-Status: M0-M4 complete + 二期开工（`ApproveMode::Bus`、SA 判定含证据核对、bus 停车补投与自动重连、journal 快照/截断与在线投影、多任务 task 命名空间、openai-responses wire、worker 池）——188 tests，fmt / clippy `-D warnings` / test 三闸门全绿（人工执行：本仓库不挂 CI）
+**Metrics** — src 51 files / 13867 lines · tests 9 files / 2926 lines · 205 tests (lib 156 + bin 4 + integration 45)
+
+Status: M0-M4 complete + 二期开工（`ApproveMode::Bus`、SA 判定含证据核对、bus 停车补投与自动重连、journal 快照/截断与在线投影、多任务 task 命名空间、openai-responses wire、worker 池、预算按 token 结算的价格表）——fmt / clippy `-D warnings` / test 三闸门全绿（人工执行：本仓库不挂 CI）。上面那行数字由 `tests/discipline.rs` 与源码树对照校验：改完代码不更新它，闸门就红。
 
 ## Quick start
 
@@ -30,7 +32,7 @@ cargo run -p kestrel -- -p "continue the previous task" \
 ## Build & test
 
 ```bash
-cargo test          # 188 项；沙箱 e2e 需 macOS（真实 /usr/bin/sandbox-exec）
+cargo test          # 数量见上方 Metrics 行；沙箱 e2e 需 macOS（真实 /usr/bin/sandbox-exec）
 cargo fmt --check && cargo clippy --all-targets -- -D warnings   # 质量闸门
 ```
 
@@ -44,10 +46,21 @@ cargo build && ./harness/run-demo.sh      # hub + RD + QA + demo-sa 四进程
 ```
 
 可调项（env 或 `demo-sa` flag）：`--bell-timeout-secs`（等回铃，默认 300）、
-`--max-usd`（停损上限，默认 6.0 = 4 stage × 3 iter × 0.5；`usd` 是本 fixture 的**名义**
-计费单位，每次派发固定 0.5，与 token 无关——真实 token 另记进 `usage_reported`）、
+`--max-usd`（停损上限，默认 6.0）、`--roles-dir`/`--prices`（预算价格表，见下）、
 `--worktree`（RD 的写入目录，广播进每颗门铃的 `ref`，QA 据此取证；`KESTREL_WORKTREE`
 同时喂给 role 的 `write_roots`）、`--approvals`（SA 的审批授权表，见下）。
+
+### 预算：账单还是名义值
+
+`--max-usd` 管的是钱，但钱从哪来要说得出口。账本查两张表：`--roles-dir` 里的 role
+文件给出「哪个 peer 跑在哪个 provider/model 上」，`providers.toml` 的
+`[[providers.<id>.models]] cost` 给出「那个 model 每百万 token 多少钱」。**两端都有**
+=> 派发前先按该模型的最坏情况（整窗输入 + 满 `max_out` 输出）预留额度做停损，结果铃
+回来后按实际 token 结算换掉预留；**任何一端缺席** => 每次派发记 `--nominal-usd`
+（默认 0.5）的名义值，SA 开工即印出哪些 peer 没有价，绝不把「没人填价」记成「这次免费」。
+`priced` 标记与金额一起落 journal，所以事后能复现「这笔钱当时按什么算」——这是不变式 5
+（journal 是真相）对钱的延伸。把 `cost` 写成 `{input = 0.0, output = 0.0}` 不算「免费」，
+等同没填：按 0 记账的停损等于没有停损。
 
 SA 的判定只读盘，且分三层：通路（有答案、未 abort、worker 侧 stop 非 error）→
 语义（文字结论里的 `PASS`/`DONE`）→ **证据**（工件 `evidence` 数组点名的绝对路径必须
@@ -55,7 +68,7 @@ SA 的判定只读盘，且分三层：通路（有答案、未 abort、worker �
 
 ## Configuration
 
-三文件表：`~/.kestrel/providers.toml`（provider/key 唯一归属地，key 三态 `literal`/`$ENV`/`!cmd`）→ `harness/roles/<role>.toml`（权限/沙箱/提示词/后端/审批人；路径支持 `$VAR` 与 `$VAR:-fallback`）→ `<project>/.kestrel/kestrel.toml`（仅权限引用；**禁止定义 providers**）。优先级 runtime > role > project > user > env（详见 design.md §6）。预算不在 role 里声明——上限由 SA 的 journal 账本执行。
+三文件表：`~/.kestrel/providers.toml`（provider/key/费率 的唯一归属地，key 三态 `literal`/`$ENV`/`!cmd`）→ `harness/roles/<role>.toml`（权限/沙箱/提示词/后端/审批人；路径支持 `$VAR` 与 `$VAR:-fallback`）→ `<project>/.kestrel/kestrel.toml`（仅权限引用；**禁止定义 providers**）。优先级 runtime > role > project > user > env（详见 design.md §6）。预算上限不在 role 里声明——由 SA 的 journal 账本执行；单价跟着 provider 住，同一条「唯一归属地」纪律。
 
 工具审批按同一条优先级：`--approve all|none|bus` > role 的 `[permissions].approve` >
 `none`（拒绝）。`bus` 是反向请求：worker 把审批请求（带 tool + args + 可判定的命令）
@@ -95,14 +108,19 @@ t2:harness-rd --journal t2.jsonl` 告诉 SA 打哪一对 worker；task id 会盖
 
 ## Journal 截断
 
-`demo-sa --rotate-after-records N` / `--rotate-max-bytes B`（都默认 0 = 不截断）：活文件
-超过 N 条记录或 B 字节时，把
-较旧的前缀折成一个 `snapshot` 检查点并搬进归档段 `journal.seg<from>-<to>.jsonl`（名字就是
-它覆盖的记录区间），活文件
-只剩「检查点 + 最近若干条」。检查点里带着**未结算的铃**和每个 peer 的花费，所以巡检、
-崩溃对账与预算停损的结论与不截断时完全一致；完整审计读 `replay_all()`（段 + 活文件）。
-轮转顺序是崩溃安全的（归档 fsync → 新活文件 fsync → rename 原子替换），任何一步断电，
-盘上都还有一份可读的 journal。**这不是删除**：段文件不自动清理，session 树也永不截断。
+活文件有**默认上限**：512 条记录 / 1 MiB（`demo-sa --rotate-after-records N` /
+`--rotate-max-bytes B`；没传 = 用默认，传 `0` = 明确关掉那一个条件）。触顶时把较旧的前缀
+折成一个 `snapshot` 检查点并搬进归档段 `journal.seg<from>-<to>.jsonl`（名字就是它覆盖的记录
+区间），活文件只剩「检查点 + 最近若干条」，于是长期在上限的 1/2~1 之间浮动。折叠只发生在
+**stage 结算边界**，判据是两个 O(1) 读（投影条数 + metadata 字节数）。
+
+阈值不是猜派发节奏，而是给「崩溃对账与丢铃巡检要从活文件里读多少」定一条上界：一次完整派发
+约 7 条记录，512 条 ≈ 最近七十次；字节上限是因为记录大小不齐（`approval_requested` 能带着
+stderr）。检查点里带着**未结算的铃**与每个 peer 的花费（含未结算的预算预留），所以巡检、崩溃
+对账与预算停损的结论与不截断时完全一致——`the_default_rotation_policy_changes_no_conclusion`
+就是拿两条 journal 跑同一条 pipeline 逐 stage 对照这件事。完整审计读 `replay_all()`（段 + 活文件）。
+轮转顺序是崩溃安全的（归档 fsync → 新活文件 fsync → rename 原子替换），任何一步断电，盘上都还有
+一份可读的 journal。**这不是删除**：段文件不自动清理，session 树也永不截断。
 
 投影是在线维护的：`Journal` 每追加一条就把折叠推进一步，`projection()`（stage /
 iteration / 每 peer 花费 / 未结算的铃）、`live_records()`、`file_bytes()` 都是 O(1)，

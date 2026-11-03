@@ -1,11 +1,16 @@
 # kestrel 设计文档：Rust harness kernel
 
-> 状态：M0-M4 已实现并通过测试（188/188）；§10 二期已落地八项——`ApproveMode::Bus`、
+> 状态：M0-M4 已实现并通过测试；§10 二期已落地九项——`ApproveMode::Bus`、
 > 「判定 = 工件 + 证据文件」、bus 重连重放（停车补投 + 客户端重连）、journal 快照/截断语义、
 > 多任务并行（task 命名空间 + 前缀寻址）、openai-responses wire（**真端点未实测**，§9.24）、
-> journal 投影增量化与轮转触发（§9.25）、worker 池（一 task 一引擎一树，§9.26）。
+> journal 投影增量化与轮转触发（§9.25）、worker 池（一 task 一引擎一树，§9.26）、
+> 预算价格表（usd 按 token 结算，§9.27）。
 > 质量闸门保持人工执行（本仓库不挂 CI，见 §9.19⑥）。
-> 实现规模：src 51 文件 12,869 行 + tests 9 文件 2,560 行——已到 plan 预算（10-13k）上沿。
+> **Metrics** — src 51 files / 13867 lines · tests 9 files / 2926 lines · 205 tests (lib 156 + bin 4 + integration 45)
+> **Integration** — core_loop 5 / discipline 2 / m1_tools 8 / m2_session 6 / m4_bus 15 / m5_pool 3 / sandbox_e2e 4 / wire_anthropic 2
+> 规模已过 plan 预算（10-13k）的上沿：多出来的部分几乎都花在「取消安全」与「对账」这两条纪律上。
+> 上面两行数字由 `tests/discipline.rs::metrics_lines_match_the_tree` 对照源码树重算校验——
+> 这些计数此前在三处文档里手抄过三次、漂移过三次（§9.19），现在它是闸门不是仪式。
 > 输入：实现规划（plan.md）与调研语料（codex / pi study notes、三方资料库 references.md）——均为开发过程资料，未随本仓库发布。
 > 本文沉淀实现后的最终设计；与 plan 的偏差在 §9 逐条记录。
 
@@ -100,6 +105,8 @@ role 文件的路径字段（`write_roots`/`read_only_islands`/`policy_file`/`pr
 
 预算不写进 role：`[budget].max_usd` 曾在三份 role 里各有一份，而代码中没有任何读者——花钱的上限由 SA 的 journal 账本执行（`demo-sa --max-usd`），单点权威，与「provider 归属唯一」是同一条理由。
 
+钱怎么算：费率跟着 provider 住在用户层（`providers.toml` 里每个 model 的 `cost`，单位是每百万 token 美元），role 文件只声明「本角色跑在哪个 provider/model 上」。SA 把这两张表拼起来（`--roles-dir` + `--prices`）就能把 worker 报回的 token 读数换成账单；**查不到价时记名义值**（`--nominal-usd`，缺省 0.5）并把它单独计入 `nominal_usd` 报出来，绝不按 0 计——按 0 记账的停损等于没有停损（详见 §9.27）。
+
 会话归属：`-p` 一次调用一个 append-only 树，默认新建，`--resume last|<id>|<path>` 续接。`serve` 的归属单位是 **task**：一个进程为每个 task 各起一台常驻引擎、各开一棵树（`--max-tasks`，缺省 4；超限的门铃被显式拒绝），每颗门铃是那台引擎上的下一个回合，因此历史、read-before-edit 台账与压缩检查点跨派发存活，但**不跨 task 串台**（`AgentHandle::spawn` 从树上重建 history/history_ids，并把 ctx_tokens 预置为重建上下文的估算值，否则恢复出的大会话要先采样一次才可能触发压缩）。
 
 ## 7 里程碑与验收（已全部达成）
@@ -118,7 +125,7 @@ role 文件的路径字段（`write_roots`/`read_only_islands`/`policy_file`/`pr
 
 faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_request` 纯函数）→ 零真 key 覆盖全部验收；三层测试（单元/组件 golden/e2e）；determinism 经 `IdGen`/`Clock` 注入；沙箱 e2e 仅 macOS（`#[cfg(target_os="macos")]`）；闸门 = `cargo fmt --check` + `clippy -D warnings` + 全测试，**人工执行、每次改动都跑**：本仓库不挂 CI（2026-10-28 试过 `ci.yml`，同日按决定移除，见 §9.19⑥），所以这道闸门没有兜底机制——rust/clippy 1.98 那次破功就是因为只靠人记得跑。
 
-188 项 = lib 单测 141 + bin 单测（CLI 形状）4 + 集成 43（core_loop 5 / m1_tools 8 / m2_session 6 / m4_bus 14 / m5_pool 3 / sandbox_e2e 4 / wire_anthropic 2 / discipline 1）。计数以实跑为准，改测试时同步这一行：此前 README / design / 报告三处各写一个数（137 / 137 / 121），实跑只有 130，漂移本身记在 §9.19。总线测试需要真 UDS `bind`，在严格沙箱或容器里以 `EPERM` 失败，属环境限制而非回归。
+数量与分组见文首的 **Metrics** / **Integration** 两行——它们由 `tests/discipline.rs` 从源码树重算并对照，不是人抄的。此前 README / design / 报告三处各写一个数（137 / 137 / 121，实跑 130），漂移记在 §9.19；现在改完代码忘了同步文档，转闸门就会红，且失败信息直接给出正确的那一行。总线测试需要真 UDS `bind`，在严格沙箱或容器里以 `EPERM` 失败，属环境限制而非回归。
 
 ## 9 与 plan 的偏差（诚实台账）
 
@@ -161,7 +168,7 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
     ① `JournalRecord::Snapshot { covers, checkpoint }`——检查点折的是「到此刻为止的投影」：stage / iteration / 每 peer 花费 / **未结算的铃清单**。最后这项是关键：截断若丢掉 in_flight，一次「worker 写完工件但死在拉铃前」就会被 SA 误读成「从没派发过」而重烧一轮预算，正是 journal 要防的事。
     ② `rotate(keep)` 把新于 `keep` 之外的前缀折成检查点并搬到归档段 `<stem>.seg<from>-<to>.jsonl`；段文件+活文件 = 完整历史（`replay_all()`），审计链不断。活文件的 `replay()` 里出现 Snapshot 时，折叠**从检查点重启**而不是继续累加，否则预算会被重复计一次。
     ③ 轮转顺序即安全性：全程持住 append 锁 → 段落盘 fsync → 新活文件写 `.new` 并 fsync → `rename` 原子替换 → 通过已持有的 guard 换 fd（先放锁再换会有「写进旧 inode」的窗口）。**段名取「覆盖的记录区间」而不是计数器**，`covers` 因此是累计值：这样「段已写好、rename 前崩溃」后重试会覆盖同一个文件，而不是把同一段前缀归档第二份——后者会让 `replay_all` 把预算重复计一遍。测试：`a_crashed_rotation_is_retried_idempotently`（手工造出崩溃残留）与 `concurrent_appends_survive_rotation`（4 线程并发追加 × 40 轮 rotate，断言 40 条记录不重不丢、无 `.new` 残留）。
-    语义边界：**这不是删除**。段文件不自动清理，`session` 树仍完全不截断；`demo-sa --rotate-after-records` 默认 0（不轮转），因为阈值该由派发节奏定，不该由库猜。
+    语义边界：**这不是删除**。段文件不自动清理，`session` 树仍完全不截断。当时 `demo-sa --rotate-after-records` 缺省 0（不轮转），理由是「阈值该由派发节奏定，不该由库猜」——这一条后来由 §9.28 收口：默认策略给的是**活文件的可读边界**，不是派发节奏。
 
 23. **多任务并行（2026-10-28）**：一个 hub 上并存多条 pipeline，前提不是并发而是**命名空间不串台**。原先 `demo-sa` 把 task 写死成 `"demo"`，工件名 `{session}-{stage}-iter{n}.json`：两条 pipeline 打同一个 worker 名、同一个 stage 时，后一条会读到前一条的工件并把它判成 pass——这是 §9.11④「两端各拼一遍文件名」那类 bug 的升级版。现在四件事：
     ① `cli/task.rs` 是唯一一份命名契约：`artifact_name(session, task, stage, iteration)`——SA 找文件与 worker 写文件调同一个函数，`serve` 不再自己 `format!`。
@@ -180,7 +187,7 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
     ② `Journal` 持一份在线投影：`append` 顺带推进一步（锁序固定 file → projection，与 `rotate` 一致），`projection()` / `live_records()` / `file_bytes()` 都是 O(1)。SA 的预算停损与丢铃巡检改读投影。
     ③ 轮转触发 `rotation_due(records, bytes, cap_records, cap_bytes)`：两个上限任一超限即折，0 关闭该条件。字节上限是必要的——记录大小不齐（一条 `approval_requested` 带着 stderr），只按条数封顶挡不住文件长大。保留新近一半，于是活文件在上限的 1/2~1 之间浮动。**退化情形由库自己挡**：`rotate` 在前缀不足 2 条原始记录时返回 `None`——折一条记录进检查点会让活文件变长（检查点那行比它替换的记录更贵），这种守卫不能指望调用方给的阈值刚好。
     ④ 顺带修掉一个既有缺陷：`Journal::create` 开的是追加模式，却把投影当空的。配合 `KESTREL_DEMO_KEEP_JOURNAL=1`（跨运行续账本）时，**昨天花掉的钱与没结算的铃在重启后被忘掉**，停损形同虚设。现在 `create`/`open` 都从盘上播种（`create_seeds_the_projection_of_an_existing_journal`）。
-    仍不做的事：库自己决定阈值。`--rotate-after-records` / `--rotate-max-bytes` 默认 0（不截断），策略归派发节奏的主人（SA/人），这条留在 §10。
+    当时仍不做的事：库自己决定阈值（缺省 0 = 不截断）。后来收了口——阈值不该由「谁记得传 flag」决定，见 §9.28。
 
 26. **worker 池：一 task 一引擎一树（2026-10-28）**：§9.23 解决了「并存不串台」，但同一 worker 收到多颗铃仍是一回合一回合地跑。这一项把它变成真并发，做法是**加一层归属，而不是放宽不变式**：单活跃槽（§4）是取消、steering、压缩时序的地基，动它等于把整套时序重推一遍；真正的并行单位是 task。
     ① `cli::pool`：pump 持有唯一的总线读写，按 `task_id` 路由到该 task 的 worker；每台引擎一个 `AgentHandle` + 一棵 `SessionStore` 树 + 一条自己的 8 轮预算。task 之间不共享历史，read-before-edit 台账与压缩检查点因此不会互相污染。
@@ -191,10 +198,26 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
        - 同一处 select 竞争里，已经就绪的门铃会随被丢弃的 future 一起消失——「取消安全」不等于「不丢帧」。泵因此改用专职 reader 任务把帧转进普通 mpsc，读取本身不再被取消。
     验证：`tests/m5_pool.rs` 用 faux 引擎跑真总线——两个 task 各自落工件、各自只在自己的请求里看见自己的铃（历史隔离用 `recorded_requests()` 做反向断言）、超限的拒绝不带 `result_ref`。
 
+27. **预算价格表：usd 按 token 结算（2026-11-03）**：§10 划出的第一条边界落地。此前账本按派发次数收固定名义值（`per_dispatch_usd = 0.5`），`CostPerMTok` 类型早在 M3 就写进了 registry，但**没有任何读者**——一个没人读的价格字段比没有价格更危险，因为它让人以为停损在算钱。
+    ① 方向定死为「worker 报读数，SA 定价」：token 用量来自 worker 的结果铃（`usage`），费率只从用户层 `providers.toml` 的 `[models.cost]` 查（与 provider/key 同一条唯一归属地纪律，§6），「哪个 peer 跑在哪个 model 上」来自 `--roles-dir` 的 role 文件。花钱的一方不能自己开价。
+    ② 记账改成**预留 → 结算**两段式：派发前按该模型的最坏情况（整窗输入 + 满 `max_out` 输出）预留额度并落 journal，结果铃回来后按实际 token 账单换掉预留。为什么要预留而不是直接按事后账单停损：只看历史支出的上限拦不住**正在跑**的那次派发，而「崩溃后重来」的路径会反复烧同一份预算——这与 §9.22 的写前对账是同一条理由。
+    ③ 配对靠 `BudgetKey = (task, peer, stage, iteration)`：`BudgetSpent`（预留）与新的 `BudgetSettled`（结算）共用这个坐标，折叠时 `reserved` 表把两者接上；找不到预留的结算**丢弃**（重复投递不能把一次派发烧成两笔钱），`ResultCommitted` 收掉该 task+stage 的配对键（账本不随 pipeline 无限增长，未结算的预留按预留额留在账上，宁可不退）。
+    ④ 「没有价」与「免费」是两回事：`cost` 未声明、provider 不认识、或表填成 `{input = 0.0, output = 0.0}` 一律视作**没有价**（`CostPerMTok::is_declared`），此时记名义值并把它单独计入 `nominal_usd`，SA 开工即打印哪些 peer 没有价、收尾报「总花费 / 其中名义」。按 0 记账的停损等于没有停损。
+    ⑤ 缓存桶不进算法就等于漏计：`Usage::cost_usd` 把 `cache_read/cache_write` 一起算，表里没声明这两个费率时按 `input` 计价（读缓存因此略偏高、写缓存略偏低，需要精确就在表里写出来）。
+    ⑥ 踩到的坑（`serde_json` 只接受字符串 map key）：`Checkpoint.reserved` 用元组当 key 时，编译与单测全绿（**空 map 恰好能序列化**），真实序列「预留 → 轮转 → 迟到结算」才会炸在运行期。改为数组形式 `Vec<(BudgetKey, Booking)>`，并加 `checkpoint_with_unsettled_reservations_roundtrips_through_json`——构造一个带未结算预留的检查点做字节级往返，把这类「空值掩盖」的形状钉住。
+    ⑦ 文档漂移同期治理：规模/测试计数原先散在三处文档里手抄，已漂移三次（§9.19）。现在每份文档只有一行规范值（`**Metrics**` / `**Integration**`），由 `tests/discipline.rs::metrics_lines_match_the_tree` 从源码树重算并对照——忘了同步，转闸门就红，失败信息直接给出正确的那一行。
+
+28. **journal 轮转的默认策略（2026-11-03）**：§10 上那条「机制已齐、阈值仍由调用方给」在这里收口。此前 `--rotate-after-records` / `--rotate-max-bytes` 缺省都是 0（永不截断），于是活文件的长度实际由「谁记得传 flag」决定，而不是由任何理由决定——「库不猜派发节奏」这句话，更像是把决定权推给人。
+    ① 阈值不猜派发节奏，而是**给活文件定一条可读边界**：`DEFAULT_ROTATE_RECORDS = 512`、`DEFAULT_ROTATE_MAX_BYTES = 1 MiB`。条数挡派发次数（一次完整派发约 7 条记录，512 ≈ 最近七十次），字节挡记录大小不齐（`approval_requested` 能带几十 KB 的 stderr，只按条数封顶挡不住文件长大）。这两个数不是性能猜测，它们是「崩溃对账与丢铃巡检要从活文件里读多少东西」的上界；完整历史在归档段里，`replay_all()` 永远读得到（§9.22 的「截断不是删除」）。
+    ② 折叠点仍然只在 **stage 结算边界**（`ResultCommitted` 之后）——那是这次派发真正结清的时刻，此后的前缀不再影响对账。触发判断是两个 O(1) 读（投影里的条数 + metadata 的字节数），检查本身不比它保护的那次 append 更贵。
+    ③ 三态语义 `resolve_rotation_policy(Option<usize>, Option<u64>)`：**没给 = 默认策略；给 0 = 明确关闭那一个条件；其余 = 自定义**。两个上限各自独立解析——只封顶条数时字节上限仍跟着默认值，「填了一个」不等于「另一个想要无限」。SA 开工把生效的策略印出来，包括「两个都关 = 单文件永不截断」这种明示的退化。
+    ④ 生产与测试走同一个函数 `rotate_at_boundary(journal, cap_records, cap_bytes)`。这一步是刻意的：`tests/m4_bus.rs::the_default_rotation_policy_changes_no_conclusion` 让两条 journal 跑完同一条 12 轮 × 4 stage 的 pipeline（一条走这个生产函数、一条永不截断），每个 stage 结算后断言投影逐字段相等、未结算的铃相等、活文件不越过上限，最后断言 `replay_all()` 折出来 == 不截断的那份。测试若自己重写一遍触发条件，它能通过而生产照样不轮转——那种测试是假的。
+    ⑤ 折叠把活文件降到上限的一半附近，于是长期在 1/2~1 倍上限之间浮动；段文件按覆盖区间命名、不自动清理（审计资产，不是缓存）。「段本身也该压缩/归档」是另一格，仍留在 §10。
+
 ## 10 二期清单
 
-已落地（2026-10-28）：~~`ApproveMode::Bus`~~（授权表 + 超时 fail-closed + journal 审计，§9.20）、~~SA 判定升级到「工件 + 证据文件」~~（绝对路径存在性/非空核对，§9.20）、~~bus 重连重放~~（离线 session 停车补投 + 客户端自动重连；RPC 与「写入即死」的帧不重放，§9.21）、~~journal 快照/截断语义~~（检查点 + 归档段 + 崩溃安全轮转，§9.22）、~~多任务并行~~（task 命名空间三处同源 + 前缀寻址，§9.23）、~~openai-responses wire~~（第三条 v1 wire，金身 + fixture 验证，**真端点未实测**，§9.24）、~~journal 投影增量化与轮转触发~~（在线投影 = 全量重放 + 条数/字节双上限，§9.25）、~~一个引擎内真正并发地服务多个 task~~（改为「一 task 一引擎」的 worker 池，单活跃槽不动，§9.26）。
+已落地（2026-10-28 起）：~~`ApproveMode::Bus`~~（授权表 + 超时 fail-closed + journal 审计，§9.20）、~~SA 判定升级到「工件 + 证据文件」~~（绝对路径存在性/非空核对，§9.20）、~~bus 重连重放~~（离线 session 停车补投 + 客户端自动重连；RPC 与「写入即死」的帧不重放，§9.21）、~~journal 快照/截断语义~~（检查点 + 归档段 + 崩溃安全轮转，§9.22）、~~多任务并行~~（task 命名空间三处同源 + 前缀寻址，§9.23）、~~openai-responses wire~~（第三条 v1 wire，金身 + fixture 验证，**真端点未实测**，§9.24）、~~journal 投影增量化与轮转触发~~（在线投影 = 全量重放 + 条数/字节双上限，§9.25）、~~一个引擎内真正并发地服务多个 task~~（改为「一 task 一引擎」的 worker 池，单活跃槽不动，§9.26）、~~`BudgetSpent` 的价格表~~（预留 → 结算两段式、按 token 换账单、无价退回名义值并报出来，§9.27；2026-11-03）。
 
-仍在清单上：tree-sitter-bash 命令解析、execpolicy DSL（Starlark）、landlock/bwrap（Linux 沙箱）、TUI（行级 diff 形制，pi-tui 蓝本）、MCP 客户端、model-in-the-loop evals（含 openai-responses 的真端点实测，§9.24）、审批批复的可靠投递（请求与批复都是 Notify：§9.21 的停车补投已覆盖「审批者当时不在线」，剩下的缺口是批复迟到——回合结束即丢弃，语义停在超时 deny；跨进程重启的可靠投递要等 ack 语义）、journal 轮转的**默认策略**（机制已齐：`rotate` + 条数/字节双上限 + O(1) 触发，§9.25；阈值仍由调用方给，库不猜派发节奏）、worker 池的资源护栏（`--max-tasks` 只挡 task 数，不挡每 task 的内存与并发 HTTP；真·多进程编排属于 harness 上层）。
+仍在清单上：tree-sitter-bash 命令解析、execpolicy DSL（Starlark）、landlock/bwrap（Linux 沙箱）、TUI（行级 diff 形制，pi-tui 蓝本）、MCP 客户端、model-in-the-loop evals（含 openai-responses 的真端点实测，§9.24）、审批批复的可靠投递（请求与批复都是 Notify：§9.21 的停车补投已覆盖「审批者当时不在线」，剩下的缺口是批复迟到——回合结束即丢弃，语义停在超时 deny；跨进程重启的可靠投递要等 ack 语义）、worker 池的资源护栏（`--max-tasks` 只挡 task 数，不挡每 task 的内存与并发 HTTP；真·多进程编排属于 harness 上层）、**归档段自身的治理**（默认策略落地后，长运行会攒出很多段；段按覆盖区间命名、永不自动清理，所以「段也该压缩或离线归档」是新的一格——不能靠默认轮转顺手做删除，那会撞上「这不是删除」那条语义边界）。
 
-新划出的两条边界：`BudgetSpent` 的价格表（有单价表之后 usd 才能真正按 token 结算，而不是 per-dispatch 名义值）；证据的类型化（`evidence` 从「路径存在」升级到「测试产物/截图按 stage 要求齐全」）。
+新划出的边界：证据的类型化（`evidence` 从「路径存在」升级到「测试产物/截图按 stage 要求齐全」）；价格表之后的下一步——`nominal_usd` 的占比应当随 `providers.toml` 填写完整率下降，这条曲线本身值得盯（单价填全之后，`--max-usd` 才是真正的账单上限，名义值只作为「说不清价」的兜底存在）。

@@ -7,17 +7,17 @@
 
 ## 1. 自动化测试基线（cargo test）
 
-| 组 | 数量 | 覆盖 |
-|---|---|---|
-| 单测（lib） | 141 | wire 归一（含 openai-responses）/ partial_json / retry / registry / 权限矩阵 / sbpl golden / session 树 / journal 对账、轮转与在线投影 / 证据契约 / 审批授权表 / task 命名空间 / worker 池路由表 |
-| 单测（bin：CLI 形状） | 4 | `--tools` 三态、`--approve` 三值（none / all / bus）、`--resume` 选择子、bus 模式保留 role 期限 |
-| 集成（core_loop 5 / m1_tools 8 / sandbox_e2e 4 / m2_session 6 / m4_bus 14 / m5_pool 3 / wire_anthropic 2 / discipline 1） | 43 | 引擎验收 / 工具并发与审批超时 / 真实 Seatbelt / golden JSONL / 总线路由、审批往返、停车补投、重连重放、多 pipeline 并存、取消安全、截断后巡检与崩溃对账 / worker 池真并发与历史隔离 |
-| 合计 | **188**，全部通过；`fmt --check` 与 `clippy -D warnings` 干净（本机实跑；本仓库不挂 CI，闸门靠人工每次执行） | |
+**Metrics** — src 51 files / 13867 lines · tests 9 files / 2926 lines · 205 tests (lib 156 + bin 4 + integration 45)
+**Integration** — core_loop 5 / discipline 2 / m1_tools 8 / m2_session 6 / m4_bus 15 / m5_pool 3 / sandbox_e2e 4 / wire_anthropic 2
 
-> 计数以 2026-10-28 实跑为准。历史上这张表漂移过三次（101 → 121 → 137，实跑 130），
-> §8.3 里那句「137/137」也是其中之一——数字一旦需要人肉同步就会失真，而没有 CI 兜底，
-> 唯一防线就是改完立刻跑一遍并把输出写回这张表：
-> 本行随 `cargo test` 输出更新（漂移记录见 design.md §9.19）。
+| 组 | 覆盖 |
+|---|---|
+| 单测（lib） | wire 归一（含 openai-responses）/ partial_json / retry / registry / 权限矩阵 / sbpl golden / session 树 / journal 对账、轮转与在线投影 / 证据契约 / 审批授权表 / task 命名空间 / worker 池路由表 / **预算价格表与预留—结算配对**（§13） |
+| 单测（bin：CLI 形状） | `--tools` 三态、`--approve` 三值（none / all / bus）、`--resume` 选择子、bus 模式保留 role 期限 |
+| 集成（逐文件分组见上面的 Integration 行） | 引擎验收 / 工具并发与审批超时 / 真实 Seatbelt / golden JSONL / 总线路由、审批往返、停车补投、重连重放、多 pipeline 并存、取消安全、截断后巡检与崩溃对账 / worker 池真并发与历史隔离 / **文档数字不再靠人抄**（discipline） |
+| 合计 | 见 Metrics 行；2026-10-28 那次实跑全部通过，`fmt --check` 与 `clippy -D warnings` 干净（本仓库不挂 CI，闸门靠人工每次执行） |
+
+> 上面两行的数字**不再由人抄写**：`tests/discipline.rs::metrics_lines_match_the_tree` 会把源码树重算一遍并与 README / design / 本报告对照，忘了同步就转红。历史上这张表漂移过三次（101 → 121 → 137，实跑 130，见 design.md §9.19）——没有 CI 兜底时，唯一防线就是把「同步」变成闸门。
 > 总线测试要真 UDS `bind`：在严格沙箱/容器内以 `EPERM` 失败，属环境限制而非回归。
 
 ## 2. 端点 smoke 结果
@@ -263,3 +263,57 @@ reasoning 项的回显要求，都要等真端点定案（§9.9 的 Qwen 教训�
 其一，`take_inbox` 取出接收器后被 drop，连接从此每次读都以 `inbox already polled`
 失败（上一版 `serve` 的审批循环是同一种形状，同样中招）；其二，竞争同时就绪时被丢弃的
 分支会连带丢掉那一帧——取消安全不等于不丢帧，所以泵改用专职 reader 任务读总线。
+
+## 13. 2026-11-03 预算价格表（usd 按 token 结算）与文档数字闸门
+
+design §10 第一条新边界落地：`CostPerMTok` 早在 M3 就进了 registry，但**没有任何读者**——
+一个没人读的价格字段比没有价格更危险，它让人以为 `--max-usd` 在算钱。本轮把「名义值停损」
+换成「预留 → 结算」的两段式账本，并把查不到价的情形显式标成名义值（详见 design §9.27）。
+
+| 项 | 用例 | 结果 |
+|---|---|---|
+| 账单算到每个 token 桶（含缓存读写） | `wire::tests::usage_cost_uses_every_bucket` | 通过；未声明缓存费率时按 input 计价，缓存 token 不会掉出总额 |
+| 预留 = 整窗输入 + 满 `max_out` | `wire::tests::reservation_is_the_context_window_plus_one_full_answer` | 通过（128k/8k @ 1.0/4.0 → 0.160768） |
+| 空价表 ≠ 免费 | `wire::tests::zero_rate_is_not_a_declared_price`、`config::tests::model_cost_only_answers_for_declared_rates` | 通过；`{0.0,0.0}`、未知 provider、未声明 model 一律 `None` |
+| 结算替换预留 | `records::tests::settlement_replaces_the_reservation` | 通过；`spent_usd` 从 0.5 变 0.12，`tokens` 留档，配对键消耗 |
+| 名义值可分离报告 | `records::tests:unpriced_reservation_stays_on_the_books_as_nominal` / `settling_a_nominal_reservation_clears_the_nominal_slice` | 通过；`nominal_usd` 随结算退回，不出自相矛盾的账 |
+| 找不到预留的结算丢弃 | `records::tests::settlement_without_a_reservation_is_ignored`、`settlement_pairs_by_iteration_not_just_stage` | 通过；重复投递不把一次派发烧成两笔钱 |
+| stage 结账收掉配对键（账本有界） | `records::tests::committed_stage_prunes_pairing_but_keeps_the_money` | 通过；按 (task, stage) 收敛，不跨 task 串台 |
+| **检查点带未结算预留的 JSON 往返** | `records::tests::checkpoint_with_unsettled_reservations_roundtrips_through_json` | 通过；同一个测试还直接断言「元组 key 的 map 序列化成 JSON 会失败」——因为**空 map 恰好能过**，只有非空往返 + 这条反断言才钉得住这个形状（`Checkpoint.reserved` 因此存数组而不是 map） |
+| 价格来源两端可缺 | `sa_demo::tests::price_ledger_prices_a_peer_from_role_then_registry` / `an_unpriced_backend_books_nominal_not_zero` | 通过；role→model→费率拼装，缺任一端退回名义值 |
+| 在线投影 == 全量重放（含新账本字段） | `journal::tests::projection_equals_a_full_replay_after_every_append` | 通过；预留/结算/名义/token 四类状态都不分裂 |
+| 文档数字不再人抄 | `discipline::metrics_lines_match_the_tree` | 通过；三份文档各只有一行 `**Metrics**`（design/报告另有 `**Integration**`），与源码树重算值逐字符对照 |
+
+**验证状态**：`cargo check --all-targets`、`cargo clippy --all-targets -- -D warnings`、
+`cargo fmt --check` 本轮已跑并干净；**`cargo test` 全量三闸门按仓库惯例仍由人工执行**
+（本仓库不挂 CI，见 §1 与 design §9.19⑥）。
+
+顺带留下的两处判断，记下来免得日后被当成疏漏：
+① `--max-usd` 的默认值 6.0 仍是「名义时代」的数字——按价结算后每次派发的预留远小于 0.5，
+预算因此几乎不会触发。要复现停损行为，请把 `--max-usd` 调小（或删掉 `cost` 退回名义记账），
+这条属于 §10 的「默认策略」范畴，库不替人猜上限。
+② 缓存写费率缺省按 input 计，是**轻微低估**（厂商通常加价 ~25%）；缓存读缺省按 input 计则是
+高估。两者都写进 `Usage::cost_usd` 的文档注释里，需要精确就在 `providers.toml` 填
+`cache_read` / `cache_write`。
+
+## 14. 2026-11-03 journal 轮转的默认策略（活文件有界）
+
+§10 上那条「机制已齐、阈值仍由调用方给」收口：缺省从「永不截断」改成「活文件 512 条 / 1 MiB
+双上限」，三态 CLI（没给 = 默认，`0` = 明确关闭，其余 = 自定义）。阈值的来历不是派发节奏，而是
+「崩溃对账与丢铃巡检要从活文件里读多少东西」的上界（详见 design §9.28）。
+
+| 项 | 用例 | 结果 |
+|---|---|---|
+| 默认策略与不截断**结论逐字段相等** | `m4_bus::the_default_rotation_policy_changes_no_conclusion` | 通过；12 轮 × 4 stage 同一条 pipeline 跑两条 journal，每个 stage 结算后投影与未结算的铃都相等，活文件不越过上限，`replay_all()` 折出来 == 不截断的那份 |
+| 策略真的反复触发 | 同上（`rotations >= 3`、`segments >= 3`） | 通过；不是「测试里没人轮转」的空过 |
+| 生产与测试同一条路径 | `sa_demo::rotate_at_boundary` 被测试直接调用 | 通过；测试不复制触发条件（复制了就会「测试绿、生产不轮转」） |
+| 三态解析、两个上限各自独立 | `sa_demo::tests::rotation_policy_is_three_state_per_ceiling` | 通过；只封顶条数时字节上限仍跟默认 |
+| 默认值的量级护栏 | 同上 | 通过；512 条不至于天天折文件，1 MiB 不至于挡不住增长 |
+
+**验证状态**：`cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test`
+本轮全部实跑（见 §1 的 Metrics 行——它由 `tests/discipline.rs` 对照源码树校验，本轮就被它抓到
+过一次漂移：新增测试后文档仍写着 203）。沙箱内 UDS `bind` 会以 `EPERM` 失败，需在真机跑
+`cargo test`，属环境限制（§1 已注明）。
+
+一处**故意没做**：归档段自身仍然不治理（不压缩、不清理）。默认策略落地后长运行会攒出很多段，
+这条被单列进 §10，因为「顺手删段」会撞上 §9.22 那条「这不是删除」的语义边界。
