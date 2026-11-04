@@ -2,7 +2,7 @@
 
 为星型多 Agent harness 写的 Rust harness kernel：引擎 + wire 层 + 工具/权限/沙箱 + 会话 + 总线/journal + CLI/配置。设计文档（中文）见本仓库 `docs/design.md`。
 
-**Metrics** — src 51 files / 16036 lines · tests 9 files / 3319 lines · 234 tests (lib 182 + bin 4 + integration 48)
+**Metrics** — src 51 files / 16212 lines · tests 9 files / 3319 lines · 235 tests (lib 183 + bin 4 + integration 48)
 
 Status: M0-M4 complete + 二期开工（`ApproveMode::Bus`、SA 判定含证据核对、bus 停车补投与自动重连、journal 快照/截断与在线投影、多任务 task 命名空间、openai-responses wire、worker 池、预算按 token 结算的价格表、journal 轮转的默认策略、按类型核对的证据与 stage 要求表、审批请求的 at-least-once 投递与按 req 幂等、验证 FAIL 回跳写者、bash `output_path` 交出可核对的 test_log）——这批改动 2026-11-04 走完真端点联跑（`pipeline complete`；那两轮联跑抓出并修掉三个「测试全绿但跑不起来」的缺陷，见 docs/design.md §9.32 / §9.33）。fmt / clippy `-D warnings` / test 三闸门全绿（人工执行：本仓库不挂 CI）。上面那行数字由 `tests/discipline.rs` 与源码树对照校验：改完代码不更新它，闸门就红。
 
@@ -94,6 +94,12 @@ Ask——审批不能放宽角色的写范围。`test_log` 的汇总表认 cargo
 `test_log` 还带**结论**：内核落的日志里有那行 `exit:`，SA 读它，也数 `N passed`/`N failed`/
 `failures=`。非零退出、被信号杀死、或数出失败条数，都是一句 issue——盘上的失败可以顶回 worker
 那句 `DONE`。数不出来的字段留 `None`（缺席不是 0），读出来的结论随判定一起落 journal。
+
+结论还是**状态**：投影按 `(task, stage)` 存最后一次提交的结论（覆盖，不是追加；什么都没数
+出来的提交会把它撤掉），并且跨 journal 轮转存活。两个读者是收尾报账
+（`[sa] test conclusion [demo] Dev: green — exit 0, ran 27, 27 passed / 0 failed`，读投影不重读
+工件）与返工铃（`ref.rework.last_test`，`null` 明说「你上关什么都没数出来」）。预算停损刻意
+不读它：那本账记的是钱。
 
 ## Configuration
 

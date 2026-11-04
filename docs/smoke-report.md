@@ -7,7 +7,7 @@
 
 ## 1. 自动化测试基线（cargo test）
 
-**Metrics** — src 51 files / 16036 lines · tests 9 files / 3319 lines · 234 tests (lib 182 + bin 4 + integration 48)
+**Metrics** — src 51 files / 16212 lines · tests 9 files / 3319 lines · 235 tests (lib 183 + bin 4 + integration 48)
 **Integration** — core_loop 5 / discipline 2 / m1_tools 9 / m2_session 6 / m4_bus 15 / m5_pool 5 / sandbox_e2e 4 / wire_anthropic 2
 
 | 组 | 覆盖 |
@@ -471,6 +471,27 @@ journal 行没有该字段仍可读，缺席读成空而不是 0）、以及上�
 `code: None, signal: Some(9)` 把 9 读成退出码——把「没有读数」记成「退出码 9」。现在只吃
 key 紧跟着的那个值（剥 `:`/`=`/空白与 `Some(`），读不到就是 `None`。这行代码的 bug 恰好是
 这一格最反对的那类错误：把缺席当结论。
+
+## 21. 2026-11-04 第四轮联跑：结论进了投影，并且有人读它
+
+§9.35（`StateSnapshot.tests` + `Checkpoint.tests` + 两个读者）落地后，再跑一轮真端点。
+
+| 检查 | 实测 |
+|---|---|
+| 阶段 | dev iter1 fail（8 回合内无判定词）→ dev iter2 pass → review / test / build 各 iter1 pass → `pipeline complete`，5 颗门铃、2.5000 usd 全 nominal、journal 33 条 |
+| 落账的形状 | 5 条 `result_committed` 里，**失败那条 `test_runs` 是空的**（`no PASS/DONE/FAIL verdict…`，什么都没数出来），另外四条各带 `{passed: 27, failed: 0, exit_code: 0}` |
+| 投影的覆盖语义 | 收尾只打印 **4** 行结论而不是 5 行：dev 那关被 iter2 那份通过覆盖掉了 iter1 那份空结论——状态回答「现在是什么」，历史仍在那五条记录里 |
+| 读者之一（报账） | `[sa] test conclusion [demo] Dev: green — exit 0, ran 27, 27 passed / 0 failed`（Review/Test/Build 同）；读的是 `journal.projection()`，与预算停损同一份状态 |
+| 读者之二（返工铃） | `ref.rework.last_test = {green, runs}`；本轮没走到返工（四关一次过），所以这一条是**单元级**验证（`the_test_conclusion_is_state_not_just_payload` + §19.2 那轮的实弹路由），不假装现场发生过 |
+| 独立复核 | `python3 -m unittest test_lru_cache` → `Ran 27 tests in 0.002s / OK`，与投影里那 27/0 一致 |
+
+**闸门**：`cargo fmt --check` / `cargo clippy --all-targets -- -D warnings` / `cargo test` 实跑全绿，
+235 tests（lib 183 + bin 4 + integration 48）。新增 1 项：`the_test_conclusion_is_state_not_just_payload`
+——覆盖 / 撤掉 / 轮转往返三件事在同一次折叠里验，因为在线投影与 `reconcile` 共用同一个 `Folder`。
+`**Metrics**` 又被拦红一次（加了测试与实现），照它给的数字回写。
+
+**轮转没在现场被触发**（33 条 < 默认 512），检查点带结论这件事只有单元级覆盖（构造检查点 →
+JSON 往返 → 重放等于在线）。要现场验它得跑到 512 条记录，那是另一轮的量级，不在今天这一格内。
 
 ## 19. 2026-11-04 第二轮联跑：`test_log` 真的可交了，FAIL 路由真的会回跳
 

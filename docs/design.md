@@ -1,15 +1,17 @@
 # kestrel 设计文档：Rust harness kernel
 
-> 状态：M0-M4 已实现并通过测试；§10 二期已落地十三项——`ApproveMode::Bus`、
+> 状态：M0-M4 已实现并通过测试；§10 二期已落地十三项 + 2026-11-04 走完的四格（§9.32–§9.35）——`ApproveMode::Bus`、
 > 「判定 = 工件 + 证据文件」、bus 重连重放（停车补投 + 客户端重连）、journal 快照/截断语义、
 > 多任务并行（task 命名空间 + 前缀寻址）、openai-responses wire（**真端点未实测**，§9.24）、
 > journal 投影增量化与轮转触发（§9.25）、worker 池（一 task 一引擎一树，§9.26）、
 > 预算价格表（usd 按 token 结算，§9.27）、journal 轮转的默认策略（活文件有界，§9.28）、
 > 证据的类型化（按类型核对 + stage 要求齐全，§9.29）、审批批复的可靠投递（at-least-once + 幂等，§9.30）、批复回执与过期审批不谎报生效（§9.31）。
+> 2026-11-04：role 路径的只读岛缺陷与「跑不起来的 runner」（§9.32）、验证 FAIL 回跳写者 + bash `output_path`
+> 交出可核对的 test_log（§9.33）、证据自己携带结论（§9.34）、结论进入投影并被读走（§9.35）。
 > 质量闸门保持人工执行（本仓库不挂 CI，见 §9.19⑥）。
 > 二期十一项已于 2026-11-04 在真端点联跑中走完（`pipeline complete`，四阶段全 pass，
 > 审批请求/判定/回执各 5 条成对）；那一次联跑抓出并修掉两个「测试全绿但跑不起来」的缺陷，见 §9.32。
-> **Metrics** — src 51 files / 16036 lines · tests 9 files / 3319 lines · 234 tests (lib 182 + bin 4 + integration 48)
+> **Metrics** — src 51 files / 16212 lines · tests 9 files / 3319 lines · 235 tests (lib 183 + bin 4 + integration 48)
 > **Integration** — core_loop 5 / discipline 2 / m1_tools 9 / m2_session 6 / m4_bus 15 / m5_pool 5 / sandbox_e2e 4 / wire_anthropic 2
 > 规模已过 plan 预算（10-13k）的上沿：多出来的部分几乎都花在「取消安全」与「对账」这两条纪律上。
 > 上面两行数字由 `tests/discipline.rs::metrics_lines_match_the_tree` 对照源码树重算校验——
@@ -265,6 +267,14 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
 
     ⑥ 真端点验证（smoke §20）：收敛那一轮四关都打印 `test log … -> exit 0, ran 32, 32 passed / 0 failed`，`result_committed` 里带着同样的数；前面一轮暴露的是**档位**问题（RD 把日志写进 `evidence:` 那行，档位是 `file`，于是 `test_log` 那一格没人顶），不是这层误判——修在提示词（要交测试日志必须另起一行 `EVIDENCE test_log <abs>`）。教训归一句：SA 只核对文件**声称的那种东西**，所以「声明档位」这件事必须是命令式的，不能是可选的。
 
+35. **结论成为状态：`test_runs` 进投影（2026-11-04，§9.34 ⑤ 自己点出来的那一格）**：
+    ① 形状：`StateSnapshot.tests: Vec<StageTest>{task, stage, runs}`，按 `(task, stage)` **覆盖**而不是追加。这不是「省空间」的美化，而是语义：投影回答的是「现在这一关的测试结论是什么」，历史本来就活在一条条形如 `result_committed` 的记录里。一份什么都没数出来的提交会把这一关的结论**撤掉**——留着上一轮那个更好看的数字，就是让状态说谎（本轮实测：dev 那次 `round budget exhausted` 的提交带着空 runs，投影里最终只有 iter2 那份 27/0）。
+    ② 长度有界：条目数 = 并存的 task × stage，不随 iteration 增长；顺序定序（task, stage），于是检查点字节可比、`projection == replay` 那条断言不会被遍历顺序偶然放过。
+    ③ 必须跨轮转活着：`Checkpoint.tests`（`#[serde(default)]`，老检查点仍可读）。截断把旧前缀折掉之后，「这一关过没过」如果凭空消失，那 §9.22 讲的「截断不丢结论」就只对钱成立了一半。`the_test_conclusion_is_state_not_just_payload` 把覆盖、撤掉、轮转往返三件事放在同一次折叠里验，因为线上投影与 `reconcile` 用的就是同一份 `Folder`（不变式 5）。
+    ④ 有读者，不是「加了个没人读的字段」（§9.27 那个 `CostPerMTok` 的教训）：**其一**是收尾报账，`[sa] test conclusion [demo] Dev: green — exit 0, ran 27, 27 passed / 0 failed` 直接读投影，不重新翻那几份工件——它和停损看的是同一份状态；**其二**是返工铃：回跳给写者时把 `ref.rework.last_test = {green, runs}` 一起带上，`null` 明说「你上关什么都没数出来」，而不是让人以为没问题。
+    ⑤ 刻意没有的第三个读者：让预算停损或放行闸门去读它。判定层在当场就已经拦下失败的日志（§9.34），再加一道闸门是把同一件事判两次，还会让「钱的上限」混进「测试的结论」这两本账。要做的话，得先想清楚它拦的是钱还是进度。
+    ⑥ 还没做的：同一份日志被 4 个 stage 各引用一次时**不去重**（投影里就是 4 条，各自回答自己那一关）。跨 stage 去重要等到「结论按 artifact 而不是按 stage 归位」那天——现在按 stage 归位是有意的：每一关交出的那份东西才算这一关的结论。
+
 ## 10 二期清单
 
 已落地（2026-10-28 起）：~~`ApproveMode::Bus`~~（授权表 + 超时 fail-closed + journal 审计，§9.20）、~~SA 判定升级到「工件 + 证据文件」~~（绝对路径存在性/非空核对，§9.20）、~~bus 重连重放~~（离线 session 停车补投 + 客户端自动重连；RPC 与「写入即死」的帧不重放，§9.21）、~~journal 快照/截断语义~~（检查点 + 归档段 + 崩溃安全轮转，§9.22）、~~多任务并行~~（task 命名空间三处同源 + 前缀寻址，§9.23）、~~openai-responses wire~~（第三条 v1 wire，金身 + fixture 验证，**真端点未实测**，§9.24）、~~journal 投影增量化与轮转触发~~（在线投影 = 全量重放 + 条数/字节双上限，§9.25）、~~一个引擎内真正并发地服务多个 task~~（改为「一 task 一引擎」的 worker 池，单活跃槽不动，§9.26）、~~`BudgetSpent` 的价格表~~（预留 → 结算两段式、按 token 换账单、无价退回名义值并报出来，§9.27；2026-11-03）、~~journal 轮转的**默认策略**~~（活文件 512 条 / 1 MiB 双上限、三态 CLI、生产与测试同一条 `rotate_at_boundary`，§9.28；2026-11-03）、~~证据的类型化~~（`file` / `test_log` / `diff` / `screenshot` 各自可在盘上反驳 + `--evidence-spec` 的 stage 要求，坏表硬失败，§9.29；2026-11-03）、~~审批批复的可靠投递~~（请求 at-least-once + 按 req 幂等 + 台账从 journal 播种，判定仍只一次，§9.30；2026-11-03）、~~批复到底有没有生效~~（回执 `approval_receipt` + `ApprovalAcked` 落账 + 到点撤摊，**没生效的批准不许记成生效**，§9.31；2026-11-03）。
@@ -273,4 +283,4 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
 
 2026-11-04 联跑新添的两格同日落地（§9.33）：验证类 stage 的 FAIL 回跳给写者返工（带额度 `max_reworks`、带原因 `ref.rework`、每关 iter 跨回跳不清零），bash 用 `output_path` 参数交出可核对的 `test_log`（内核把 stdout/stderr 连 `exit: ExitStatus{...}` 一起写进那个文件）。下一格因此有了明确的落点：SA 只要去读那行 `exit:`，「形状」就能升级成「结论」——现在它还只证明「这份文件是测试汇总」。
 
-新划出的边界：`nominal_usd` 的占比应当随 `providers.toml` 填写完整率下降，这条曲线本身值得盯（单价填全之后 `--max-usd` 才是真正的账单上限，名义值只作为「说不清价」的兜底存在）。证据强度这一格已于同日走完（§9.34）：`test_log` 现在带退出状态与计数，跑挂的日志能顶回那句 `DONE`，「过了几条、failed 几条」随判定落进 journal。剩下的是两件没做的事——**结论还不是状态**（`test_runs` 不参与投影，停损与巡检都看不见它），以及**同一份日志被多个 stage 引用时不去重**。
+新划出的边界：`nominal_usd` 的占比应当随 `providers.toml` 填写完整率下降，这条曲线本身值得盯（单价填全之后 `--max-usd` 才是真正的账单上限，名义值只作为「说不清价」的兜底存在）。证据强度这一格已于同日走完（§9.34），**结论也已经是状态**（§9.35）：`test_runs` 进投影、跨轮转存活，并被收尾报账与返工铃读走。清单上因此只剩相关的两件：**同一份日志被多个 stage 引用时不去重**（按 stage 归位是刻意的），以及**没有任何闸门把结论当输入**——停损只看钱，要不要让「测试没绿」影响放行，先要想清楚它拦的到底是钱还是进度。
