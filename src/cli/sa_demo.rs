@@ -757,10 +757,30 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
                     );
                 }
                 reworks_left -= 1;
+                // 返工铃除了「上一关为什么没过」，还带上写者那一关**账上**的测试结论
+                // （§9.35：结论成为状态之后，这里就是它的读者之一）。省掉一轮「我到底
+                // 哪儿没过」的试探；`null` 说的是「你上关什么都没数出来」，不是「没问题」。
+                let proj = journal.projection();
+                let last_test = proj
+                    .state
+                    .tests
+                    .iter()
+                    .find(|t| t.task == args.task_id && t.stage == Stage::Dev)
+                    .map(|t| {
+                        serde_json::json!({
+                            "green": t.green(),
+                            "runs": t
+                                .runs
+                                .iter()
+                                .map(describe_run)
+                                .collect::<Vec<String>>(),
+                        })
+                    });
                 rework = Some(serde_json::json!({
                     "from": format!("{stage_name} iter{iter}"),
                     "issues": verdict.issues.clone(),
                     "verdict_artifact": artifact.display().to_string(),
+                    "last_test": last_test,
                 }));
                 println!(
                     "[sa] {stage_name} iter{iter}: fail ({}) -> rework by {} ({} credit(s) left)",
@@ -805,6 +825,26 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
 /// 「账单上限」还是「名义上限」，由这行说清楚，不靠人记住这次有没有传 `--roles-dir`。
 fn report_ledger(journal: &Journal, ledger: &PriceLedger) {
     let state = journal.projection().state;
+    // 结论也是账的一部分（§9.35）：报账时说出「每一关最后一次提交读出来的测试结论」。
+    // 读的是投影，不是重新去翻那几份工件——它和预算停损看的必须是同一份状态。
+    if state.tests.is_empty() {
+        println!("[sa] test conclusions: none (no stage handed in a counted test log)");
+    } else {
+        for t in &state.tests {
+            let verdict = match t.green() {
+                Some(true) => "green",
+                Some(false) => "NOT green",
+                None => "shape only, nothing counted",
+            };
+            let counts: Vec<String> = t.runs.iter().map(describe_run).collect();
+            println!(
+                "[sa] test conclusion [{}] {:?}: {verdict} — {}",
+                t.task,
+                t.stage,
+                counts.join("; ")
+            );
+        }
+    }
     if state.spent_usd.is_empty() {
         println!("[sa] ledger: nothing booked");
         return;

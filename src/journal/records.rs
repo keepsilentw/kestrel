@@ -241,8 +241,31 @@ pub struct StateSnapshot {
     /// 还没结算的预留（dispatch 坐标 -> 金额/是否按价）。轮转把它抄进检查点，
     /// 结算才配对得上——丢了它就等于同一笔派发计两次钱。
     pub reserved: BTreeMap<BudgetKey, Booking>,
+    /// 每个 (task, stage) **最后一次提交**读出的测试结论（§9.35）。这是状态不是
+    /// 历史：历史在 `result_committed` 记录里，这里只回答「现在这一关的测试结论是
+    /// 什么」，所以停损报账与返工铃都能 O(1) 读到，不必重读工件。
+    pub tests: Vec<StageTest>,
 }
 
+/// 一关的测试结论。按 `(task, stage)` 唯一；runs 是那份判定当时从盘上读出来的每一条。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StageTest {
+    pub task: TaskId,
+    pub stage: Stage,
+    pub runs: Vec<TestRun>,
+}
+
+impl StageTest {
+    /// 这一关现在到底是不是绿的：只要有一条读得出的结论失败就不算绿。
+    /// `None`（没有结论）不算绿也不算红——它交给调用方去说「这一关没交测试日志」。
+    pub fn green(&self) -> Option<bool> {
+        self.runs
+            .iter()
+            .filter(|r| r.carries_verdict())
+            .map(|r| !r.failed_run())
+            .min()
+    }
+}
 /// Reconciliation report: in-flight bells = BellSent without a later
 /// BellReceived for the same iteration AND without a ResultCommitted covering
 /// them. Those are the "worker may have finished but the bell was lost" cases
@@ -274,6 +297,10 @@ pub struct Checkpoint {
     pub nominal_usd: BTreeMap<String, f64>,
     pub tokens: BTreeMap<String, crate::provider::wire::Usage>,
     pub reserved: Vec<ReservationEntry>,
+    /// 每个 (task, stage) 最后一次的测试结论。截断把旧前缀折进检查点，若这里空着，
+    /// 「这一关测试过没过」就会在轮转后凭空消失——而它现在是状态。
+    #[serde(default)]
+    pub tests: Vec<StageTest>,
 }
 
 impl Checkpoint {
@@ -293,6 +320,7 @@ impl Checkpoint {
                 .iter()
                 .map(|(key, booking)| (key.clone(), *booking))
                 .collect(),
+            tests: report.state.tests.clone(),
         }
     }
 }
@@ -335,6 +363,9 @@ pub struct Folder {
     /// 尚未结算的预留：dispatch 坐标 -> (金额, 是否按价)。结算靠它配对，
     /// 轮转靠它跨检查点存活——丢了它，同一笔派发会被计两次钱。
     reserved: BTreeMap<BudgetKey, Booking>,
+    /// 每个 (task, stage) 最后一次的测试结论（覆盖，不追加），所以它的长度上界是
+    /// 「并存的 task × stage 数」，不随 iteration 增长。
+    tests: Vec<StageTest>,
     /// records physically present in the live file (a checkpoint line counts
     /// as one), which is what the rotation trigger looks at
     live_records: usize,
@@ -354,7 +385,11 @@ impl Folder {
                 self.settled.keys.insert(bell_key(bell));
                 self.settled.max_iteration = self.settled.max_iteration.max(bell.iteration);
             }
-            JournalRecord::ResultCommitted { task, stage, .. } => {
+            JournalRecord::ResultCommitted {
+                task,
+                stage,
+                verdict,
+            } => {
                 self.settled.last_stage = Some(*stage);
                 // dev 结果提交结算该 stage 的在途铃（任何 iteration）
                 self.in_flight.retain(|(_, _, bell)| bell.stage != *stage);
@@ -364,6 +399,21 @@ impl Folder {
                 let name = stage_name(*stage);
                 self.reserved
                     .retain(|(t, _, s, _), _| !(s == &name && t == task));
+                // 结论同样按 (task, stage) 覆盖：这里要回答的是「现在这一关的测试
+                // 结论是什么」。一份什么都没数出来的提交，就是把这一关的结论撤掉，
+                // 而不是留着上一轮那个更好看的数字。
+                self.tests
+                    .retain(|t| !(t.task == *task && t.stage == *stage));
+                if !verdict.test_runs.is_empty() {
+                    self.tests.push(StageTest {
+                        task: task.clone(),
+                        stage: *stage,
+                        runs: verdict.test_runs.clone(),
+                    });
+                    // 定序：检查点要字节可比，投影相等那条断言也依赖这一点。
+                    self.tests
+                        .sort_by(|a, b| a.task.cmp(&b.task).then(a.stage.cmp(&b.stage)));
+                }
             }
             JournalRecord::StageWritten {
                 stage, iteration, ..
@@ -443,6 +493,8 @@ impl Folder {
                 for (key, booking) in &checkpoint.reserved {
                     self.reserved.insert(key.clone(), *booking);
                 }
+                self.tests.clear();
+                self.tests.extend(checkpoint.tests.clone());
                 self.settled.last_stage = checkpoint.stage;
                 self.settled.max_iteration = checkpoint.iteration;
                 // Receipt keys of the archived prefix go with it: the bells they
@@ -469,6 +521,7 @@ impl Folder {
                 nominal_usd: self.nominal.clone(),
                 tokens: self.tokens.clone(),
                 reserved: self.reserved.clone(),
+                tests: self.tests.clone(),
             },
         }
     }
@@ -835,6 +888,7 @@ mod tests {
             nominal_usd: Default::default(),
             tokens: Default::default(),
             reserved: vec![(key, (0.5, true))],
+            tests: Default::default(),
         };
         let records = vec![
             JournalRecord::Snapshot {
@@ -870,6 +924,7 @@ mod tests {
             nominal_usd: Default::default(),
             tokens: [("rd".to_string(), usage(8, 8))].into_iter().collect(),
             reserved: vec![(key, (0.5, true))],
+            tests: Default::default(),
         };
         let record = JournalRecord::Snapshot {
             covers: 1,
@@ -948,5 +1003,86 @@ mod tests {
         };
         assert_eq!(read_back, &verdict, "读出来的结论要能原样落盘再读回");
         assert_eq!(serde_json::to_string(&back).unwrap(), text);
+    }
+
+    fn run(code: Option<i64>, passed: Option<u64>, failed: Option<u64>) -> TestRun {
+        TestRun {
+            path: "/tmp/unittest.log".into(),
+            exit_code: code,
+            exit_signal: None,
+            passed,
+            failed,
+            ran: passed,
+        }
+    }
+
+    fn committed(task: &str, stage: Stage, runs: Vec<TestRun>) -> JournalRecord {
+        JournalRecord::ResultCommitted {
+            task: task.into(),
+            stage,
+            verdict: Verdict {
+                pass: true,
+                issues: vec![],
+                test_runs: runs,
+            },
+        }
+    }
+
+    /// 「这一关的测试结论」现在是**状态**（§9.35）：它随提交覆盖而不是追加、被什么都没
+    /// 数出来的提交撤掉、并且必须跨轮转与序列化活着。三条都在一条测试里，因为它们共用
+    /// 同一次折叠——`reconcile` 与在线投影是同一份代码（不变式 5）。
+    #[test]
+    fn the_test_conclusion_is_state_not_just_payload() {
+        // (a) 覆盖而不是追加
+        let rep = reconcile(&[
+            committed("t", Stage::Dev, vec![run(Some(0), Some(32), Some(0))]),
+            committed("t", Stage::Dev, vec![run(Some(1), Some(30), Some(2))]),
+        ]);
+        assert_eq!(rep.state.tests.len(), 1, "同一关只留最后一次结论");
+        assert_eq!(rep.state.tests[0].green(), Some(false), "最后一次是挂的");
+
+        // (b) 撤掉：一份什么都没数出来的提交，不能留着上一轮那个更好看的数字
+        let rep = reconcile(&[
+            committed("t", Stage::Dev, vec![run(Some(0), Some(32), Some(0))]),
+            committed("t", Stage::Dev, vec![]),
+        ]);
+        assert!(
+            rep.state.tests.is_empty(),
+            "撤掉就是撤掉: {:?}",
+            rep.state.tests
+        );
+
+        // (c) 跨轮转与序列化活着：先折进检查点，再从检查点重放
+        let prefix = [
+            committed("t", Stage::Dev, vec![run(Some(0), Some(32), Some(0))]),
+            committed("t", Stage::Review, vec![run(Some(0), Some(7), Some(0))]),
+        ];
+        let live = reconcile(&prefix);
+        let checkpoint = Checkpoint::capture(&live);
+        assert_eq!(checkpoint.tests.len(), 2, "两条结论都要抄进去");
+        let line = serde_json::to_string(&JournalRecord::Snapshot {
+            covers: 2,
+            checkpoint,
+        })
+        .expect("a checkpoint with conclusions serializes");
+        let back: JournalRecord = serde_json::from_str(&line).expect("and parses back");
+        let JournalRecord::Snapshot { checkpoint, .. } = &back else {
+            panic!("roundtrip changed the record kind");
+        };
+        let after = reconcile(std::slice::from_ref(&back));
+        assert_eq!(
+            after.state.tests, live.state.tests,
+            "截断前后的结论必须一致"
+        );
+        assert_eq!(
+            checkpoint
+                .tests
+                .iter()
+                .map(|t| (t.stage, t.green()))
+                .collect::<Vec<_>>(),
+            vec![(Stage::Dev, Some(true)), (Stage::Review, Some(true))],
+            "定序：检查点要字节可比"
+        );
+        assert_eq!(serde_json::to_string(&back).unwrap(), line, "字节级往返");
     }
 }

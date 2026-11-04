@@ -27,8 +27,11 @@ QA 的环境和你一样。所以：
 ## 返工铃（`ref.rework`）
 
 验证关（Review/Test/Build）判 FAIL 时，SA 不再把铃打回验证者，而是**打回你**，并在
-`ref.rework` 里带上 `from`（哪一关第几轮）、`issues`（失败原因）和 `verdict_artifact`
-（那份判定工件的绝对路径，可读）。收到就按 `issues` 逐条返工，别重做已通过的部分；
+`ref.rework` 里带上 `from`（哪一关第几轮）、`issues`（失败原因）、`verdict_artifact`
+（那份判定工件的绝对路径，可读），以及 `last_test`——**你那一关账上的测试结论**
+（`{green, runs}`，runs 是 SA 从你那份日志里读出来的原话，如 `exit 0, ran 32, 32 passed / 0 failed`）。
+`last_test` 是 `null` 说的是「你上一关什么都没数出来」（不是「没问题」），那就先把可数的
+测试日志交出来再谈别的。收到就按 `issues` 逐条返工，别重做已通过的部分；
 `DONE` 里点明你处理了哪几条。返工额度有限，用完 SA 会把这一关显式判失败——不要把
 额度当成「再试一次也没事」。
 
