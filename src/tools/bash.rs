@@ -22,7 +22,11 @@ impl Tool for Bash {
         json!({
             "type": "object",
             "properties": {
-                "command": { "type": "string", "description": "shell command to run" }
+                "command": { "type": "string", "description": "shell command to run" },
+                "output_path": {
+                    "type": "string",
+                    "description": "optional ABSOLUTE path inside your writable roots: the kernel writes this run's stdout+stderr (plus the exit line) there. Use it to land a verifiable test log — do NOT write `> file` in the command, that is not a command the permission engine can judge."
+                }
             },
             "required": ["command"]
         })
@@ -38,6 +42,42 @@ impl Tool for Bash {
                 message: "bash requires a string `command`".into(),
             });
         };
+        // `output_path` is I/O plumbing, not part of the command the approver
+        // judges — which is why it is a tool argument and not shell redirection:
+        // `pytest -q > log` fails the tokenizer, and fail-closed turns that into
+        // Ask -> deny, so a worker could never land a test log (design §9.32④).
+        // It is checked with the *write* rule: inside a writable root, outside
+        // any read-only island. Out-of-bounds is Blocked, not asked: approval
+        // cannot widen a role's write scope (that's the sandbox's job).
+        let output_path = match call.args.get("output_path") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(p)) if p.trim().is_empty() => None,
+            Some(Value::String(p)) => {
+                let raw = std::path::Path::new(p);
+                let p = if raw.is_absolute() {
+                    raw.to_path_buf()
+                } else {
+                    ctx.cwd.join(raw)
+                };
+                if !ctx
+                    .engine
+                    .path_writable(&ctx.fs.writable_roots, &ctx.fs.read_only_within, &p)
+                {
+                    return Err(Reject::Blocked {
+                        reason: format!(
+                            "bash output_path {p:?} is outside writable roots for role {}",
+                            ctx.role
+                        ),
+                    });
+                }
+                Some(p)
+            }
+            Some(other) => {
+                return Err(Reject::RespondToModel {
+                    message: format!("bash `output_path` must be a string path, got {other}"),
+                });
+            }
+        };
         // Policy gate: Deny -> Blocked; Ask -> reverse approval (or headless
         // resolution inside the orchestrator); Allow -> proceed. On the
         // post-approval re-prepare pass the Ask has already been granted.
@@ -51,7 +91,10 @@ impl Tool for Bash {
                     detail: json!({ "command": cmd }),
                 })
             }
-            _ => Ok(Prepared(json!({ "command": cmd }))),
+            _ => Ok(Prepared(json!({
+                "command": cmd,
+                "output_path": output_path.map(|p| p.display().to_string()),
+            }))),
         }
     }
 
@@ -76,7 +119,10 @@ impl Tool for Bash {
         }
 
         let spawn = SpawnCmd {
-            argv: vec!["/bin/bash".into(), "-c".into(), cmd],
+            // `cmd` stays alive after the spawn: the landed log quotes it, so the
+            // file says which command produced it (a log without a command line is
+            // not checkable evidence).
+            argv: vec!["/bin/bash".into(), "-c".into(), cmd.clone()],
             cwd: ctx.cwd.clone(),
         };
         let wrapped = if ctx.unsandboxed {
@@ -130,6 +176,24 @@ impl Tool for Bash {
             code: status.code(),
             signal: std::os::unix::process::ExitStatusExt::signal(&status),
         };
+        // Land the output *before* judging it: the run that failed is the one
+        // whose log you want. Parent dirs are not created (same rule as the
+        // write tool — fail loudly instead of inventing a tree).
+        let log_note = match prep.0.get("output_path").and_then(Value::as_str) {
+            None => String::new(),
+            Some(path) => {
+                let log = format!(
+                    "command: {cmd}\nexit: {exit:?}\n--- stdout ---\n{stdout}--- stderr ---\n{stderr}"
+                );
+                match tokio::fs::write(path, log).await {
+                    Ok(()) => format!("\n[output written to {path}]"),
+                    Err(e) => format!(
+                        "\n[output NOT written to {path}: {e} — the file your evidence \
+                         points at does not exist]"
+                    ),
+                }
+            }
+        };
         if !status.success() {
             // Sandbox refusal -> escalate via the orchestrator (not a plain failure).
             if !ctx.unsandboxed && denial::looks_like_sandbox_denied(exit, &stderr) {
@@ -137,13 +201,13 @@ impl Tool for Bash {
             }
             return Ok(ToolOutcome {
                 content: vec![crate::provider::wire::ToolContent::Text {
-                    text: format!("exit {exit:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"),
+                    text: format!("exit {exit:?}\nstdout:\n{stdout}\nstderr:\n{stderr}{log_note}"),
                 }],
                 is_error: true,
                 terminate: false,
             });
         }
-        Ok(ToolOutcome::text(format!("{stdout}{stderr}")))
+        Ok(ToolOutcome::text(format!("{stdout}{stderr}{log_note}")))
     }
 }
 
