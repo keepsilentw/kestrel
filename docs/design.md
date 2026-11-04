@@ -7,8 +7,10 @@
 > 预算价格表（usd 按 token 结算，§9.27）、journal 轮转的默认策略（活文件有界，§9.28）、
 > 证据的类型化（按类型核对 + stage 要求齐全，§9.29）、审批批复的可靠投递（at-least-once + 幂等，§9.30）、批复回执与过期审批不谎报生效（§9.31）。
 > 质量闸门保持人工执行（本仓库不挂 CI，见 §9.19⑥）。
-> **Metrics** — src 51 files / 15374 lines · tests 9 files / 3204 lines · 228 tests (lib 177 + bin 4 + integration 47)
-> **Integration** — core_loop 5 / discipline 2 / m1_tools 8 / m2_session 6 / m4_bus 15 / m5_pool 5 / sandbox_e2e 4 / wire_anthropic 2
+> 二期十一项已于 2026-11-04 在真端点联跑中走完（`pipeline complete`，四阶段全 pass，
+> 审批请求/判定/回执各 5 条成对）；那一次联跑抓出并修掉两个「测试全绿但跑不起来」的缺陷，见 §9.32。
+> **Metrics** — src 51 files / 16036 lines · tests 9 files / 3319 lines · 234 tests (lib 182 + bin 4 + integration 48)
+> **Integration** — core_loop 5 / discipline 2 / m1_tools 9 / m2_session 6 / m4_bus 15 / m5_pool 5 / sandbox_e2e 4 / wire_anthropic 2
 > 规模已过 plan 预算（10-13k）的上沿：多出来的部分几乎都花在「取消安全」与「对账」这两条纪律上。
 > 上面两行数字由 `tests/discipline.rs::metrics_lines_match_the_tree` 对照源码树重算校验——
 > 这些计数此前在三处文档里手抄过三次、漂移过三次（§9.19），现在它是闸门不是仪式。
@@ -102,7 +104,7 @@ flowchart TD
 
 工具审批走同一条优先级链：`--approve all|none|bus`（runtime）> role 的 `[permissions].approve` > `none`（拒绝，fail-closed）。此前 `serve` 硬编码 HeadlessDeny，worker 永远走不到「沙箱拒绝 → 审批 → 脱沙箱重试」这条回路；现在 role 可以声明三态（demo 里 RD = `bus` 且 `approver = "harness-sa"`，QA 保持缺省拒绝）。runtime 只覆盖**模式**，不覆盖 role 声明的 `approve_timeout_secs`（`with_role_deadline`）——一个 CLI flag 不该顺手把审批等待改成无限。
 
-role 文件的路径字段（`write_roots`/`read_only_islands`/`policy_file`/`prompt_file`）支持 `$VAR` 与 `$VAR:-fallback`：role 是共享文件，把某台机器的绝对路径钉进 `write_roots` 等于把沙箱写范围钉死在那台机器上（demo 的 worktree 由 `run-demo.sh` 导出 `KESTREL_WORKTREE`，于是 SA 广播的 `ref` 与 RD 能写的目录同源）。变量未设且无 fallback 是**带拼写的硬错误**——静默丢掉一个写根会悄悄改变沙箱边界。
+role 文件的路径字段（`write_roots`/`read_only_islands`/`policy_file`/`prompt_file`）支持 `$VAR`、`$VAR:-fallback`，以及要再接路径的 `${VAR:-fallback}/子路径`：role 是共享文件，把某台机器的绝对路径钉进 `write_roots` 等于把沙箱写范围钉死在那台机器上（demo 的 worktree 由 `run-demo.sh` 导出 `KESTREL_WORKTREE`，于是 SA 广播的 `ref` 与 RD 能写的目录同源）。变量未设且无 fallback 是**带拼写的硬错误**——静默丢掉一个写根会悄悄改变沙箱边界。裸写 `$VAR:-fallback` 时 `:-` **拥有整条后缀**，所以「默认值之后再拼路径」只能用花括号形式；写成 `$WT:-/tmp/wt/.git` 会在 env 设过时悄悄丢掉 `.git`，§9.32① 的只读岛事故就是这么来的。
 
 预算不写进 role：`[budget].max_usd` 曾在三份 role 里各有一份，而代码中没有任何读者——花钱的上限由 SA 的 journal 账本执行（`demo-sa --max-usd`），单点权威，与「provider 归属唯一」是同一条理由。
 
@@ -238,6 +240,30 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
     ③ 回执落 journal 为新记录 `ApprovalAcked{req, by, applied}`：纯审计记录，不参与状态折叠（与 `ApprovalRequested` / `ApprovalDecided` 同一档，`approval_and_usage_records_are_audit_only` 把它一起验）。台账据此分出 `unacked()`——判过但没有回执的批复；SA 重启时对每条**各补投一次**（不循环补投，闭环靠回执本身）。补投落到 worker 那边要么唤醒还在等的工具，要么换回一张 `applied:false`，两种都会留下记录。
     ④ 台账仍只从**活文件**播种（`replay()`，长度由 §9.28 的上限管住），不读归档段。理由不是省事：`unacked()` 只关心「判了却没回执」，而回执一到就永久离开这个集合；判了没回执又活过一整轮轮发的请求，早随回合结束被关掉并回执成 `applied:false` 了。去读段只会把已经闭环的历史再扫一遍。这一条我先前写错过（先声称 `replay_all()` 的读「有界」，理由站不住），改正的经过留在 §9.30④。
     ⑤ 刻意不做的两件事：其一，`applied:false` 的迟到批复**不会**在下一次同样的调用上被重新兑现——那等于把一次 allow 变成一张长期通行证，正是 §5 fail-closed 要防的；要放宽只有把 `sa.approvals.json` 那一格显式改成 allow 这一条路（数据，可审计）。其二，不做「跨回合挂起的审批槽位」（SA 下班、明早再批）：那需要未决请求的第二份真相与新的取消语义，仍在 §10。
+32. **真端点联跑抓出的两处「测试全绿但跑不起来」（2026-11-04 联跑，均已修）**：自 §9.20 起落的十一项只有 faux + 总线级 e2e 覆盖，这次用 `harness/run-demo.sh` 在 DeepSeek(RD) / BigModel(QA) / 百炼(SA 侧策略) 上真跑，两次失败两次都是真的：
+    ① **role 的只读岛吃掉了自己的写根**。`rd.toml` 写的是 `read_only_islands = ["$KESTREL_WORKTREE:-/tmp/kestrel-worktree/.git"]`，而 `expand_env_path` 里 `:-` 拥有**整条后缀**——env 一设（脚本必然设），展开结果就是 worktree 本身，`.git` 消失，于是整个工作树落进只读岛：RD 三次派发、六个候选路径全部 `outside writable roots`，一个文件都写不下去。库本身没错（fail-closed 的报错正是它该有的样子），错在**表达不出来**：`$NAME:-default` 无法写「默认值之后再拼路径」，而 `§10` 与错误信息都在推荐 `${name}:-<fallback>` 这个没实现的拼法。补上花括号形式（`${NAME}` / `${NAME:-default}` 后可接路径），空 fallback 仍按「没声明默认值」硬失败——根为 `""` 会让机器上每条路径都前缀匹配。回归：`role_paths_expand_env_references` 钉四种拼法，`shipped_roles_do_not_island_away_their_own_write_root` 直接读 `harness/roles/*.toml`，断言任何岛都不得覆盖自己的写根（这条纪律从此不再靠人看提示词）。
+    ② **提示词把 RD 推向一个本环境跑不起来的 runner**。QA 诚实判 FAIL：`test_lru_cache.py` 第 5 行 `import pytest` 在本机 `ModuleNotFoundError`，而 role 的 `sandbox.network = "none"` 意味着 pip 永远装不上——这条验收条件**不可能**被满足，回派只是重复同一个 FAIL 直到 iter 上限。修在数据面：`systems/rd.md` 增「测试只用这台机器上真有的东西」一节（标准库 `unittest` / `cargo test`，并说明 bash 的 cwd 已经是 worktree——`cd X && ...` 这种复合命令整条按最严的一段判，一条 `cd` 把后面的 `python3 -m` 一起带进拒绝），两份提示词里 `pytest.log` 的例子换成 `unittest.log`。
+    ③ 修完的联跑：五颗门铃（dev iter1 仍在 8 回合内耗尽——见下条，dev iter2 pass）→ review / test / build 各 iter1 pass，`pipeline complete`；journal 45 条记录，`approval_requested`/`decided`/`acked` 各 5 条成对（§9.31 的审批闭环在真端点上第一次跑完），工件名带 task 前缀（§9.23），账本 2.5000 usd 全部 nominal（`providers.toml` 没填 `cost`，§9.27 的退回路径按预期打印出来）。我另外独立复跑 `python3 -m unittest discover -s /tmp/kestrel-worktree` → `Ran 26 tests / OK`，确认 QA 的 `PASS` 不是引用 RD 的旧输出。
+    ④ 这次**没**修的两件事，记成 §10 的格子：其一，`review` FAIL 的回派仍然打给同一个 peer（QA），而缺陷在 RD 的产物里——验证者无法自证式返工，回派只是重复判定（本轮正是靠 iter 上限把它变成显式失败，不是静默通过）；其二，重定向 `>` 让整条命令在 tokenizer 里解析失败 → Ask → 被拒，于是「把测试输出落成 log 文件再按 `test_log` 取证」这条路径在 demo 里走不通（本轮 `--evidence-spec` 只要求 `file`，没被它卡住）。
+
+33. **验证 FAIL 的路由，加一份能落盘的测试日志（2026-11-04，把 §9.32④ 那两格拔掉）**：
+    ① 路由成为一条可读的规则（`rework_target(stage)`）：`Dev` 的 FAIL 是「你还没做成」，原地重派同一个写者；`Review`/`Test`/`Build` 的 FAIL 说的是「被验证的产物不行」，而 `qa.toml` 的写范围是空的——再给验证者一颗铃只会得到同一份 FAIL（本轮盘上证据就是 QA 连着三次说「RD 未做任何返工」），所以回跳给写者，返工完再重跑这一关。「铃丢了」不走这条路：那是投递问题，原地重派才对。回跳有**额度**（`max_reworks`，缺省 2），用尽就显式 bail，不静默放宽验收标准。
+    ② stage 机从 `for stage` 改成「索引 + 每关自己的 iter」：回跳之后各关的重试次数必须接着上次算，清零等于没有上限；返工是写者的**下一次**派发（iter+1），不能复用已通过那一轮的工件名——覆盖盘上那份通过件就是把真相源当草稿纸。
+    ③ 返工的理由进铃：`ref.rework = {from, issues, verdict_artifact}`。写者拿到的是可核对的失败原因连那份判定工件的路径，不是「再试一次」这种措辞（与 §5「请求带数据不带心情」同一个原则）。
+    ④ bash 多一个 `output_path` 参数：内核把这次的 stdout/stderr 连退出状态写到那个绝对路径，按 **write 的规则**核它落在写根内、不在只读岛；跑成的和跑挂的**都**落盘（最想看日志的正是挂的那次）。为什么不直接把 `>` 给模型：重定向在 tokenizer 里解析失败 → Ask → 被拒，于是 `test_log` 这一档永远交不出东西；把 I/O 形状做成工具参数，判定层看到的仍是整条可判的命令。越界是 **Blocked** 而不是 Ask——审批不能放宽角色的写范围（§5）。
+    ⑤ `test_log` 的汇总表补上标准库 unittest 的两种汇总行（`Ran N tests` / `FAILED (failures=…)`）：demo 的 RD 只能用它（沙箱无网络 ⇒ 装不了 pytest），而那张表原先只认 cargo / pytest / jest / maven，一份真跑过的日志会被判成「不是测试日志」。跑失败也是跑过——结论归判定词，形状归类型（§9.29）。
+    ⑥ demo 侧把 `dev` 那格改成 `["file", "test_log"]`：写者必须自己交出「真跑过测试」的盘上形状，验证者才有东西可反驳。
+
+    ⑦ 强制 `review: ["diff"]` 那一轮（§19）实测出一个新发现：**返工派发会吃掉写者自己的 iter 预算**。dev 从 iter1（通过）被回跳到 iter2、iter3，第三次直接撞 `iteration cap reached for Dev`——那句话把真实原因藏了起来，读的人会以为「模型又不稳」，而该改的是那条永不满足的验收标准。上限现在会说明它**怎么**撞上的（几次 iter 是验证者要来的返工），因为「上限到了」和「上限为什么到了」是两件需要分开说的事。
+
+34. **证据自己携带结论：`test_log` 从「有形状」走到「跑没跑过」（2026-11-04，§9.33 留下的那一格）**：
+    ① 读的是已经在那儿的东西。`output_path` 落的日志第二行就是内核写的 `exit: ExitStatus { code: Some(0), signal: None }`，各 runner 的汇总行在文件尾——所以头尾各读一段（`SPAN_BYTES`），不把整份日志吃进内存。计数按三家形状取：`N passed` / `N failed`（cargo、pytest）、`Ran N tests`（unittest）、`failures=` / `errors=`（unittest 的失败汇总），失败侧取总和：这一层的用途是**反驳**，漏报比误报贵。
+    ② 「缺席」和「零」是两件事，这是本格最容易写错的地方。`exit_code: None` 说的是这份日志不是内核落的（worker 自己 tee 的、或者 QA 读来的），不是「退出码为空所以没跑」；`failed: None` 也不是「0 条失败」。所以字段全是 `Option`，且解析器只吃 **key 紧跟着的那个值**（剥掉 `:`/`=`/空白与 `Some(`）：早先按「往后扫第一个数字」实现时，`code: None, signal: Some(9)` 把 9 读成了退出码——把「没有读数」记成「退出码 9」，正是 §5 fail-closed 反过来骗了自己的样子。`key_number_i64` 钉住这条。
+    ③ 判定层翻了一格，而且是刻意的：`test_log` 里读得出非零退出、被信号杀死、或失败计数 > 0，就是一句 issue ——**盘上的失败可以顶回 worker 那句 `DONE`**（`a_done_claim_with_a_failing_test_log_is_rebutted`）。§9.29 那句「跑失败也是跑过——结论归判定词、形状归类型」到此作废，同一份旧断言改成了断言它 fail。判定词仍然是第一层（它说的是「worker 认为」），证据现在是第二层（它说的是「盘上记录」），两层不一致时按不通过处理。
+    ④ 结论落 journal：`Verdict` 加 `test_runs: Vec<TestRun>{path, exit_code, exit_signal, passed, failed, ran}`（`#[serde(default)]`，**没有该字段的老行仍然必须能重放**——不变式 5 不能因为加一格就读不了历史，`verdict_test_runs_roundtrip_and_old_lines_still_replay` 同时钉这两件事）。SA 判定时把每份日志的结论打到 stdout：`[sa] dev iter2: test log … -> exit 0, ran 25, 25 passed / 0 failed`，人读日志就知道这一关的结论是从哪份文件来的。
+    ⑤ 没做的：`test_runs` 只随 `result_committed` 落账，**不参与投影**（预算停损、丢铃巡检、崩溃对账都不看它），也不跨 stage 去重同一份日志的引用。这两件要等「结论成为状态」的那天再说——现在它是证据，不是账。
+
+    ⑥ 真端点验证（smoke §20）：收敛那一轮四关都打印 `test log … -> exit 0, ran 32, 32 passed / 0 failed`，`result_committed` 里带着同样的数；前面一轮暴露的是**档位**问题（RD 把日志写进 `evidence:` 那行，档位是 `file`，于是 `test_log` 那一格没人顶），不是这层误判——修在提示词（要交测试日志必须另起一行 `EVIDENCE test_log <abs>`）。教训归一句：SA 只核对文件**声称的那种东西**，所以「声明档位」这件事必须是命令式的，不能是可选的。
 
 ## 10 二期清单
 
@@ -245,4 +271,6 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
 
 仍在清单上（审批已闭环到「有没有生效」这一层：请求 at-least-once、批复有回执、未回执的批复重启后补投一次。剩下的是**跨回合挂起的审批槽位**——「SA 下班、明早再批」需要未决请求的第二份真相与新的取消语义，见 §9.31⑤）：tree-sitter-bash 命令解析、execpolicy DSL（Starlark）、landlock/bwrap（Linux 沙箱）、TUI（行级 diff 形制，pi-tui 蓝本）、MCP 客户端、model-in-the-loop evals（含 openai-responses 的真端点实测，§9.24）、worker 池的资源护栏（`--max-tasks` 只挡 task 数，不挡每 task 的内存与并发 HTTP；真·多进程编排属于 harness 上层）、**归档段自身的治理**（默认策略落地后，长运行会攒出很多段；段按覆盖区间命名、永不自动清理，所以「段也该压缩或离线归档」是新的一格——不能靠默认轮转顺手做删除，那会撞上「这不是删除」那条语义边界）。
 
-新划出的边界：`nominal_usd` 的占比应当随 `providers.toml` 填写完整率下降，这条曲线本身值得盯（单价填全之后 `--max-usd` 才是真正的账单上限，名义值只作为「说不清价」的兜底存在）；证据类型化之后的下一步是**要求的强度**——`test_log` 只证明「有一份像测试日志的东西」，不证明「测试通过」（`0 passed; 14 failed` 同样合格）。把结论判定交给判定词、把形状交给类型，是刻意的分工；要让证据自己携带结论，就得再开一格：解析 runner 的退出码或结构化输出，并把「过了几条、failed 几条」写进 journal。
+2026-11-04 联跑新添的两格同日落地（§9.33）：验证类 stage 的 FAIL 回跳给写者返工（带额度 `max_reworks`、带原因 `ref.rework`、每关 iter 跨回跳不清零），bash 用 `output_path` 参数交出可核对的 `test_log`（内核把 stdout/stderr 连 `exit: ExitStatus{...}` 一起写进那个文件）。下一格因此有了明确的落点：SA 只要去读那行 `exit:`，「形状」就能升级成「结论」——现在它还只证明「这份文件是测试汇总」。
+
+新划出的边界：`nominal_usd` 的占比应当随 `providers.toml` 填写完整率下降，这条曲线本身值得盯（单价填全之后 `--max-usd` 才是真正的账单上限，名义值只作为「说不清价」的兜底存在）。证据强度这一格已于同日走完（§9.34）：`test_log` 现在带退出状态与计数，跑挂的日志能顶回那句 `DONE`，「过了几条、failed 几条」随判定落进 journal。剩下的是两件没做的事——**结论还不是状态**（`test_runs` 不参与投影，停损与巡检都看不见它），以及**同一份日志被多个 stage 引用时不去重**。

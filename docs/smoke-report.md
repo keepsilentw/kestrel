@@ -7,8 +7,8 @@
 
 ## 1. 自动化测试基线（cargo test）
 
-**Metrics** — src 51 files / 15374 lines · tests 9 files / 3204 lines · 228 tests (lib 177 + bin 4 + integration 47)
-**Integration** — core_loop 5 / discipline 2 / m1_tools 8 / m2_session 6 / m4_bus 15 / m5_pool 5 / sandbox_e2e 4 / wire_anthropic 2
+**Metrics** — src 51 files / 16036 lines · tests 9 files / 3319 lines · 234 tests (lib 182 + bin 4 + integration 48)
+**Integration** — core_loop 5 / discipline 2 / m1_tools 9 / m2_session 6 / m4_bus 15 / m5_pool 5 / sandbox_e2e 4 / wire_anthropic 2
 
 | 组 | 覆盖 |
 |---|---|
@@ -174,8 +174,8 @@ assistant: [tool_use(c2)]             user: [tool_result(c2)]
 
 ### 8.4 遗留
 
-1. 联跑是否绿取决于 worker 当次能否收敛；判定严格之后，失败路径（回派 → iter 上限 → 非零退出）是真实行为，不是回归缺陷。任务/提示词层面的收敛调优仍属 demo 打磨。
-2. ~~`ApproveMode::Bus`（worker 把审批反向请求发给 SA/真人）未接线~~ —— 2026-10-28 接线（§9）：请求带 `tool`+`args`+命令，SA 按 `roles/sa.approvals.json` 判定，超时/断开由 worker deny。**尚未在真端点联跑里验证**（只过了单测与总线级 e2e）。
+1. ~~联跑是否绿取决于 worker 当次能否收敛~~ —— 2026-11-04 一轮把「跑不起来」的三处根因拔掉后收敛了（§18）：剩下 dev iter1 那一次「8 回合内没给判定词」是模型行为，不是通路缺陷；失败路径（回派 → iter 上限 → 非零退出）仍是真实行为。
+2. ~~`ApproveMode::Bus`（worker 把审批反向请求发给 SA/真人）未接线~~ —— 2026-10-28 接线（§9）：请求带 `tool`+`args`+命令，SA 按 `roles/sa.approvals.json` 判定，超时/断开由 worker deny。~~**尚未在真端点联跑里验证**~~ —— 2026-11-04 真端点联跑验证（§18）：5 请求 / 5 判定 / 5 回执成对落 journal，被拒的命令确实没跑，工件里的 `decision`/`applied` 与实际一致。
 3. ~~SA 判定只吃 `result` 文字与 `aborted`/`stop`~~ —— 2026-10-28 加了第三层：`serve` 从结论提绝对路径写进工件 `evidence`，SA 核对这些路径存在且非空（§9）。按类型核对证据（截图/测试产物）仍在清单上。
 
 ## 9. 2026-10-28 二期开工：审批反向请求 + 证据层
@@ -400,3 +400,129 @@ journal 与工件会互相印证一个假结论。现在到点即撤摊并广播
 **没做**：`applied:false` 的迟到批复不会在下一次同样调用上被重新兑现（那等于把一次 allow 变成长期
 通行证；要放宽只能改 `sa.approvals.json` 那一格）。跨回合挂起的审批槽位（「SA 下班、明早再批」）
 仍在 §10。
+
+## 18. 2026-11-04 真端点联跑：十一项二期改动的第一次端到端验证
+
+对象：`harness/run-demo.sh` 四进程（hub + RD=DeepSeek `deepseek-v4-flash` + QA=BigModel
+`glm-5.3-flash` + demo-sa），凭据由 `~/.kestrel/providers.toml` 经 `!sqlite3` 从 cc-switch 取。
+这一轮的意义不在于「又跑了一次」，而在于 §9.20–§9.31 那十一项**只有 faux 与总线级 e2e 覆盖**，
+而报告自己在 §8.4② 写着「尚未在真端点联跑里验证」——欠了 7 天的账。
+
+前两次都没收敛，且都不是「模型不稳」：
+
+| 现象 | 根因 | 修法 |
+|---|---|---|
+| RD 三轮写不进 worktree（六个候选路径全 `outside writable roots`） | `rd.toml` 的只读岛写成 `$KESTREL_WORKTREE:-…/.git`，而 `:-` 拥有整条后缀：env 一设，岛就展开成 worktree 本身，`.git` 消失 → 整个工作树只读 | 库里补 `${NAME:-default}` 花括号形式（此后能表达「默认值再拼路径」；空 fallback 仍硬失败），role 改用它；`shipped_roles_do_not_island_away_their_own_write_root` 读真实 role 文件断言岛不覆盖写根（design §9.32①） |
+| Review 连续三轮诚实 FAIL：`import pytest` → `ModuleNotFoundError` | role 的 `sandbox.network = "none"` ⇒ pip 永远装不上 ⇒ 这条验收条件在本环境**不可能**满足，而回派只是重复同一个 FAIL | `systems/rd.md` 增「测试只用这台机器上真有的东西」（标准库 `unittest` / `cargo test`；bash 的 cwd 已是 worktree，`cd X && …` 整条按最严一段判会被拒），两份提示词的 `pytest.log` 例子换 `unittest.log`（§9.32②） |
+
+修完的一轮（`pipeline complete`，退出码 0）：
+
+| 检查 | 实测 |
+|---|---|
+| 阶段收敛 | dev iter1 fail（8 回合内无判定词，模型行为）→ dev iter2 **pass** → review / test / build 各 iter1 **pass** |
+| journal 真相源 | 45 条：`stage_written`/`bell_sent`/`budget_spent`/`bell_received`/`result_committed`/`usage_reported` 各 5，write-ahead 顺序成立 |
+| 审批闭环（§9.31） | `approval_requested` 5 / `approval_decided` 5 / `approval_acked` 5 成对；被拒命令确实没跑，工件 `decision:"deny", applied:true` 与回执一致 |
+| 重发与幂等（§9.30） | 现场抓到一颗 re-sent：重复批复换回 `applied:false` 且台账标重，不落第二对请求/判定 |
+| 轮转默认策略（§9.28） | 45 < 512 ⇒ 无归档段（`journal.seg*.jsonl` 为空），活文件未被截断——与「默认值不是关闭」一致 |
+| task 命名空间（§9.23） | 工件名 `harness-rd-demo-dev-iter2.json` / `harness-qa-demo-review-iter1.json` 带 task 前缀 |
+| 预算（§9.27） | 开工即打印 `budget stays NOMINAL for harness-rd,harness-qa`；结算 2.5000 usd 全 nominal（`providers.toml` 未填 `cost`）——「没人填价」没被记成「这次免费」 |
+| 判定可信度独立复核 | 我另跑 `python3 -m unittest discover -s /tmp/kestrel-worktree` → `Ran 26 tests in 0.011s / OK`，与 QA 声明一致，不是引用 RD 的旧输出 |
+
+**闸门**：`cargo fmt --check` / `cargo clippy --all-targets -- -D warnings` / `cargo test` 本轮实跑全绿
+（178 lib + 4 bin + 47 integration）。`**Metrics**` 行先红后绿：新增两个测试后忘了同步文档，
+`discipline::metrics_lines_match_the_tree` 直接把正确的那一行打出来——这道闸门第一次按设计拦住我本人。
+
+**仍开着**（design §10 新添两格）：失败回派仍打给同一个 verifier（缺陷常在写者产物里，验证者无法
+自证式返工）；重定向 `>` 在 tokenizer 里解析失败 ⇒ 整条 Ask ⇒ 被拒，于是 worker 拿不到 stdout，
+`test_log` 这类证据在 demo 里落不成盘。dev iter1 那次「轮预算耗尽无判定词」是模型行为，与 §7 的
+遗留说法一致。
+
+## 20. 2026-11-04 第三轮联跑：证据带上结论，以及一次「声明档位」的翻车
+
+§9.34 落地后（`read_test_run` 读 `exit:` 行 + 数 `N passed`/`N failed`/`failures=`，
+`Verdict.test_runs` 随判定落 journal），用最终二进制连跑两轮。
+
+**第一轮没过，而且原因值得记**：`dev iter2`/`iter3` 都是
+`fail (no verified test_log evidence: this stage requires one)`。盘上那份 `unittest.log`
+本身是好的（`exit: ExitStatus { code: Some(0), … }`、32 例全过），问题是 RD 这次只把它写进
+`evidence:` 那一行——而那一行的档位是 `file`。SA 只核对文件**声称的那种东西**，所以那一格
+没人顶。不是新层误判（同一份日志按 `test_log` 声明时逐条通过），是提示词留了个歧义：
+「证据可以声明类型」听起来像可选项。修法是把话写死（`systems/rd.md`：要交测试日志必须**另起
+一行** `EVIDENCE test_log <绝对路径>`，同一个路径在两处各出现一次不算重复），并把这次的后果
+原样引进提示词。
+
+**第二轮（收敛）**：
+
+| 检查 | 实测 |
+|---|---|
+| 阶段 | dev iter1 pass → review / test / build 各 iter1 pass → `pipeline complete`，4 颗门铃、2.0000 usd 全 nominal |
+| 现场打印的结论 | 每一关都打 `[sa] <stage> iter1: test log /tmp/kestrel-worktree/unittest.log -> exit 0, ran 32, 32 passed / 0 failed` |
+| 结论落账 | journal 27 条；四条 `result_committed` 的 `verdict.test_runs` 都是 `{exit_code: 0, exit_signal: null, passed: 32, failed: 0, ran: 32}`——事后能问「那一次到底过了几条」 |
+| 计数从哪来 | unittest 只打 `Ran 32 tests` + 一行 `OK`，不打 passed 计数：按它自己的语义补（`unittest_ok_line` 只认整行 `OK` / `OK (…)`，不按 `contains` 匹配正文里的两个字母） |
+| 独立复核 | `python3 -m unittest test_lru_cache` → `Ran 32 tests in 0.008s / OK`，与落账的 32/0 一致 |
+| 反驳能力 | 单元层已钉：`a_done_claim_with_a_failing_test_log_is_rebutted`（同一份工件，日志换成 exit 1 就 FAIL）、`a_landed_test_log_carries_its_exit_status`（含 `signal: Some(9)` 那条：没有退出码也算没过）。真端点上这次没有跑挂的日志可反驳——不假装它发生过 |
+
+**闸门**：`cargo fmt --check` / `clippy -D warnings` / `cargo test` 全绿，234 tests
+（lib 182 + bin 4 + integration 48）。本轮新加 4 项：`read_test_run` 的退出状态与计数、
+`unittest` 的 `OK` 行推断、`verdict_test_runs_roundtrip_and_old_lines_still_replay`（老
+journal 行没有该字段仍可读，缺席读成空而不是 0）、以及上面那句反驳。
+
+**踩到的解析坑（值得留在台账里）**：`key_number_i64` 起初写成「往后扫第一个数字」，于是
+`code: None, signal: Some(9)` 把 9 读成退出码——把「没有读数」记成「退出码 9」。现在只吃
+key 紧跟着的那个值（剥 `:`/`=`/空白与 `Some(`），读不到就是 `None`。这行代码的 bug 恰好是
+这一格最反对的那类错误：把缺席当结论。
+
+## 19. 2026-11-04 第二轮联跑：`test_log` 真的可交了，FAIL 路由真的会回跳
+
+§18 之后接着落地 design §9.33（bash `output_path` + 验证 FAIL 回跳写者 + unittest 汇总行）。
+这一节的规矩和 §18 一样：**只写盘上真发生过的**。两轮，各证一件事。
+
+### 19.1 第一轮：默认证据表把 `dev` 提到 `file+test_log`
+
+`roles/sa.evidence.json` 从此要求写者交出「真跑过测试」的盘上形状。开工首行即打印
+`evidence requirements: build:file, dev:file+test_log, review:file, test:file`。
+
+| 检查 | 实测 |
+|---|---|
+| 阶段 | dev iter1 fail（8 回合内无判定词，模型行为）→ dev iter2 pass → review / test / build 各 iter1 pass → `pipeline complete`，5 颗门铃，2.5000 usd 全 nominal |
+| `output_path` 落盘 | worktree 里真出现 `unittest.log` / `doctest.log`，文件头是内核写的 `command: python3 -m unittest test_lru_cache -v` + `exit: ExitStatus { code: Some(0), signal: None }` + `--- stdout ---` |
+| 按类型核对 | dev 工件的 `evidence` 里两份都是 `kind: "test_log"` 且核对通过（`Ran 25 tests in 0.004s / OK` 命中新加的 `Ran ` 标记；`4 passed.` 命中既有的 `passed`）。**没有 shell 重定向参与**：RD 试 `> log` 那类命令仍会被 tokenizer 拒，这次它走的是工具参数 |
+| 独立复核 | `python3 -m unittest discover -s /tmp/kestrel-worktree` → `Ran 25 tests / OK`，与工件声明一致 |
+
+### 19.2 第二轮：故意让验证过不了，看路由往哪儿派
+
+临时把 review 提到 `["diff"]`（`KESTREL_DEMO_EVIDENCE_SPEC=<tmp>/kestrel-evidence-diff.json ./harness/run-demo.sh`，
+表内容 `{"dev":["file","test_log"],"review":["diff"],"test":["file"],"build":["file"]}`，写在 repo 外：
+这是一次性的实验条件，不是要提交的验收标准。dev 盘上已有源文件与日志，所以它会先 pass——
+目的只有一个：制造一次**验证类 stage 的 FAIL**）。
+
+| 时刻 | SA 打出来的那一行 | 为什么这行是新的 |
+|---|---|---|
+| review iter1 | `fail (no verified diff evidence: this stage requires one) -> rework by harness-rd (1 credit(s) left)` | 回派对象是**写者**，不再是刚判 FAIL 的 QA；额度显式打印 |
+| dev iter2 | `fail (empty result, worker stop: round budget exhausted) -> re-dispatch` | 返工铃打给 RD 后它自己没做成——这时才该原地重派（`rework_target(Dev) == None`） |
+| dev iter3 | `pass` | 返工确实被接住（`ref.rework` 进了铃，RD 去试 `make_diff.py` / `changes.diff`，被审批拒了几条命令后交了活） |
+| review iter2 | `fail (...) -> rework by harness-rd (0 credit(s) left)` | 第二次回跳，额度归零 |
+| 结束 | `Error: [sa] iteration cap reached for Dev` | 显式失败、非零退出——**没有**静默放宽那条 diff 要求 |
+
+这一轮证的是**路由发生**，不是返工必然收敛：RD 两次没能交出符合 `diff` 形状的文件（一次轮预算
+耗尽、一次空结果），所以最终仍判失败。这是诚实结果，也顺带挖出一个缺陷——返工派发吃的是写者
+自己的 iter 预算，而 `iteration cap reached for Dev` 把原因藏了起来（design §9.33⑦）。上限现在会
+说明「其中几次是验证者要来的返工」。
+
+### 19.3 闸门
+
+`cargo fmt --check` / `cargo clippy --all-targets -- -D warnings` / `cargo test` 本轮实跑全绿：
+231 tests（lib 179 + bin 4 + integration 48）。新增三项：`a_verifier_fail_routes_back_to_the_writer`
+（路由规则，不需要总线）、`bash_output_path_lands_a_log_inside_the_write_root`（落盘 / 越界 Blocked /
+父目录不猜 / 落进的文件要能过 `test_log` 那一档核对）、unittest 汇总行的两条断言。`**Metrics**` /
+`**Integration**` 两行今天被 `discipline` 拦红三次（加测试、再加测试、改完源码行数变了），每次都照它
+给的数字回写——这道闸门拦的是写代码的人自己。
+
+**用最终二进制在干净工作树上复跑了一遍**（19.1/19.2 跑的是改动过程中的构建）：dev iter1 fail（8 回合内
+无判定词）→ dev iter2 pass → review / test / build 各 iter1 pass → `pipeline complete`；journal 42 条
+（`stage_written`/`bell_sent`/`budget_spent`/`bell_received`/`result_committed`/`usage_reported` 各 5，审批
+三件套各 4），RD 工件的 `test_log` 那一格核对通过，盘上 `unittest.log` 写的是 `Ran 37 tests in 0.003s /
+OK`——我独立重跑 `unittest discover` 得到同一句，不是引用谁的输出。
+
+**仍没做**：`exit:` 那一行已经在日志里了，SA 还没有去读它——`test_log` 仍然只证明形状、不证明结论
+（design §10 那条边界段落，现在有了明确的下一步落点）。

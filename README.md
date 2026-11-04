@@ -2,9 +2,9 @@
 
 为星型多 Agent harness 写的 Rust harness kernel：引擎 + wire 层 + 工具/权限/沙箱 + 会话 + 总线/journal + CLI/配置。设计文档（中文）见本仓库 `docs/design.md`。
 
-**Metrics** — src 51 files / 15374 lines · tests 9 files / 3204 lines · 228 tests (lib 177 + bin 4 + integration 47)
+**Metrics** — src 51 files / 16036 lines · tests 9 files / 3319 lines · 234 tests (lib 182 + bin 4 + integration 48)
 
-Status: M0-M4 complete + 二期开工（`ApproveMode::Bus`、SA 判定含证据核对、bus 停车补投与自动重连、journal 快照/截断与在线投影、多任务 task 命名空间、openai-responses wire、worker 池、预算按 token 结算的价格表、journal 轮转的默认策略、按类型核对的证据与 stage 要求表、审批请求的 at-least-once 投递与按 req 幂等）——fmt / clippy `-D warnings` / test 三闸门全绿（人工执行：本仓库不挂 CI）。上面那行数字由 `tests/discipline.rs` 与源码树对照校验：改完代码不更新它，闸门就红。
+Status: M0-M4 complete + 二期开工（`ApproveMode::Bus`、SA 判定含证据核对、bus 停车补投与自动重连、journal 快照/截断与在线投影、多任务 task 命名空间、openai-responses wire、worker 池、预算按 token 结算的价格表、journal 轮转的默认策略、按类型核对的证据与 stage 要求表、审批请求的 at-least-once 投递与按 req 幂等、验证 FAIL 回跳写者、bash `output_path` 交出可核对的 test_log）——这批改动 2026-11-04 走完真端点联跑（`pipeline complete`；那两轮联跑抓出并修掉三个「测试全绿但跑不起来」的缺陷，见 docs/design.md §9.32 / §9.33）。fmt / clippy `-D warnings` / test 三闸门全绿（人工执行：本仓库不挂 CI）。上面那行数字由 `tests/discipline.rs` 与源码树对照校验：改完代码不更新它，闸门就红。
 
 ## Quick start
 
@@ -78,13 +78,30 @@ SA 的判定只读盘，且分三层：通路（有答案、未 abort、worker �
 `--evidence-spec` 指向的表把「这一关要哪类证据」变成数据：`{"test": ["test_log"], "dev": ["file"]}`。
 要求看的是**核对通过**的类型，所以一份普通文件顶不出 `test_log` 那一格。表读不出来或要求了
 认不出的类型 => **启动即失败**（坏表当成「没有要求」就是 fail-open；永远满足不了的要求会让
-pipeline 无限回派）。`harness/roles/sa.evidence.json` 缺省四个 stage 都只要 `file`，也就是
-类型化之前的语义——收紧哪一格是定标准的人的决定，不由 demo 替它默认。QA 写范围为零这条纪律
-没动：它指认盘上已有的那份，不需要为了「声明过」而先造一个文件。
+pipeline 无限回派）。`harness/roles/sa.evidence.json` 把 `dev` 提到 `["file", "test_log"]`：
+写者必须自己交出「真跑过测试」的盘上形状，验证者才有东西可反驳；其余三关仍只要 `file`——
+收紧哪一格是定标准的人的决定。QA 写范围为零这条纪律没动：它指认盘上已有的那份，不需要为了
+「声明过」而先造一个文件。
+
+那份形状从哪来——bash 工具的 `output_path` 参数（绝对路径，内核按 write 的规则核它落在写根内、
+不在只读岛，把 stdout/stderr 连 `exit:` 状态一起写进去；跑挂的那次**也**落盘，因为最想看日志的
+正是这一次）。不要把 shell 重定向给他：`cmd > log` 整条在权限层的 tokenizer 里解析失败 → Ask →
+被拒（fail-closed 是对的），而 `output_path` 是 I/O 形状，不是判定对象。越界是 Blocked 而不是
+Ask——审批不能放宽角色的写范围。`test_log` 的汇总表认 cargo / pytest / jest / maven /
+**标准库 unittest**（`Ran N tests`、`FAILED (failures=…)`）：demo 的沙箱 `network = none`，
+第三方 runner 装不上，这条不是可选项。
+
+`test_log` 还带**结论**：内核落的日志里有那行 `exit:`，SA 读它，也数 `N passed`/`N failed`/
+`failures=`。非零退出、被信号杀死、或数出失败条数，都是一句 issue——盘上的失败可以顶回 worker
+那句 `DONE`。数不出来的字段留 `None`（缺席不是 0），读出来的结论随判定一起落 journal。
 
 ## Configuration
 
-三文件表：`~/.kestrel/providers.toml`（provider/key/费率 的唯一归属地，key 三态 `literal`/`$ENV`/`!cmd`）→ `harness/roles/<role>.toml`（权限/沙箱/提示词/后端/审批人；路径支持 `$VAR` 与 `$VAR:-fallback`）→ `<project>/.kestrel/kestrel.toml`（仅权限引用；**禁止定义 providers**）。优先级 runtime > role > project > user > env（详见 design.md §6）。预算上限不在 role 里声明——由 SA 的 journal 账本执行；单价跟着 provider 住，同一条「唯一归属地」纪律。
+三文件表：`~/.kestrel/providers.toml`（provider/key/费率 的唯一归属地，key 三态 `literal`/`$ENV`/`!cmd`）→ `harness/roles/<role>.toml`（权限/沙箱/提示词/后端/审批人；路径支持 `$VAR`、`$VAR:-fallback`，要再接子路径就写 `${VAR:-fallback}/sub`——裸写时 `:-` 拥有整条后缀）→ `<project>/.kestrel/kestrel.toml`（仅权限引用；**禁止定义 providers**）。优先级 runtime > role > project > user > env（详见 design.md §6）。预算上限不在 role 里声明——由 SA 的 journal 账本执行；单价跟着 provider 住，同一条「唯一归属地」纪律。
+
+验证关判 FAIL 时，铃**回跳给写者**（`ref.rework` 带着失败原因与那份判定工件的路径），而不是
+再派一次验证者——QA 没有写范围，再给它一颗铃只会得到同一个结论。回跳有额度（`max_reworks`，
+缺省 2），用尽就显式失败，不静默放宽验收标准；「铃丢了」不走这条路，那是投递问题，原地重派。
 
 工具审批按同一条优先级：`--approve all|none|bus` > role 的 `[permissions].approve` >
 `none`（拒绝）。`bus` 是反向请求：worker 把审批请求（带 tool + args + 可判定的命令）
