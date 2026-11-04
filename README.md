@@ -2,7 +2,7 @@
 
 为星型多 Agent harness 写的 Rust harness kernel：引擎 + wire 层 + 工具/权限/沙箱 + 会话 + 总线/journal + CLI/配置。设计文档（中文）见本仓库 `docs/design.md`。
 
-**Metrics** — src 51 files / 16762 lines · tests 9 files / 3381 lines · 243 tests (lib 190 + bin 4 + integration 49)
+**Metrics** — src 51 files / 16848 lines · tests 9 files / 3383 lines · 243 tests (lib 190 + bin 4 + integration 49)
 
 Status: M0-M4 complete + 二期开工（`ApproveMode::Bus`、SA 判定含证据核对、bus 停车补投与自动重连、journal 快照/截断与在线投影、多任务 task 命名空间、openai-responses wire、worker 池、预算按 token 结算的价格表、journal 轮转的默认策略、按类型核对的证据与 stage 要求表、审批请求的 at-least-once 投递与按 req 幂等、验证 FAIL 回跳写者、bash `output_path` 交出可核对的 test_log）——这批改动 2026-11-04 走完真端点联跑（`pipeline complete`；那两轮联跑抓出并修掉三个「测试全绿但跑不起来」的缺陷，见 docs/design.md §9.32 / §9.33）。fmt / clippy `-D warnings` / test 三闸门全绿（人工执行：本仓库不挂 CI）。上面那行数字由 `tests/discipline.rs` 与源码树对照校验：改完代码不更新它，闸门就红。
 
@@ -127,6 +127,10 @@ Ask——审批不能放宽角色的写范围。`test_log` 的汇总表认 cargo
 回合没交出东西」的 FAIL，说的是 QA 的哑火，不是产物的缺陷——那种情况**原地重派 QA、不扣返工额度**。
 只有产物类的 FAIL（缺文件、类型不符、要求没满足）才回跳写者。把 QA 的哑火算到 RD 头上，实测换来
 两轮辩护 + 撞上限。
+
+归因是**判定自带的字段**（`Verdict.attribution: Artifact | Turn`，§9.41），不是路由去读的措辞：
+分类在判定产出的那一刻做完并随判定落 journal，改一句 issue 文案不会悄悄改掉路由；分不出来源时默认落在
+`Artifact`（更贵的一侧）。「工件根本没落地」也算 `Turn`——那一关的产出没出来，不能拿去定罪被审的产物。
 
 工具审批按同一条优先级：`--approve all|none|bus` > role 的 `[permissions].approve` >
 `none`（拒绝）。`bus` 是反向请求：worker 把审批请求（带 tool + args + 可判定的命令）

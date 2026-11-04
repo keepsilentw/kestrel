@@ -1,6 +1,6 @@
 # kestrel 设计文档：Rust harness kernel
 
-> 状态：M0-M4 已实现并通过测试；§10 二期已落地十三项 + 2026-11-04 走完的九格（§9.32–§9.40）——`ApproveMode::Bus`、
+> 状态：M0-M4 已实现并通过测试；§10 二期已落地十三项 + 2026-11-04 走完的十格（§9.32–§9.41）——`ApproveMode::Bus`、
 > 「判定 = 工件 + 证据文件」、bus 重连重放（停车补投 + 客户端重连）、journal 快照/截断语义、
 > 多任务并行（task 命名空间 + 前缀寻址）、openai-responses wire（**真端点未实测**，§9.24）、
 > journal 投影增量化与轮转触发（§9.25）、worker 池（一 task 一引擎一树，§9.26）、
@@ -9,10 +9,11 @@
 > 2026-11-04：role 路径的只读岛缺陷与「跑不起来的 runner」（§9.32）、验证 FAIL 回跳写者 + bash `output_path`
 > 交出可核对的 test_log（§9.33）、证据自己携带结论（§9.34）、结论进入投影并被读走（§9.35）、名义钱按来源分开报
 > （§9.36–§9.37）、截断与假 FAIL（§9.38–§9.39）、FAIL 归因分成「产物的罪」与「回合的哑火」（§9.40）。
+> 归因随后提成判定自带的字段，不再让路由读措辞（§9.41）。
 > 质量闸门保持人工执行（本仓库不挂 CI，见 §9.19⑥）。
 > 二期十一项已于 2026-11-04 在真端点联跑中走完（`pipeline complete`，四阶段全 pass，
 > 审批请求/判定/回执各 5 条成对）；那一次联跑抓出并修掉两个「测试全绿但跑不起来」的缺陷，见 §9.32。
-> **Metrics** — src 51 files / 16762 lines · tests 9 files / 3381 lines · 243 tests (lib 190 + bin 4 + integration 49)
+> **Metrics** — src 51 files / 16848 lines · tests 9 files / 3383 lines · 243 tests (lib 190 + bin 4 + integration 49)
 > **Integration** — core_loop 5 / discipline 2 / m1_tools 9 / m2_session 6 / m4_bus 15 / m5_pool 6 / sandbox_e2e 4 / wire_anthropic 2
 > 规模已过 plan 预算（10-13k）的上沿：多出来的部分几乎都花在「取消安全」与「对账」这两条纪律上。
 > 上面两行数字由 `tests/discipline.rs::metrics_lines_match_the_tree` 对照源码树重算校验——
@@ -309,6 +310,13 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
     ③ 为什么不反过来判（「哑火就当产物有问题」）：那等于让一次读取失败给产品定罪。也不能因为 QA 哑火就把它判过——所以是**重派**，不是**改判**。
     ④ 还欠一层：现在的归因读的是 issue 的**文本前缀**。更稳的是给 `Verdict` 一个结构化的归因字段（`attribution: Artifact | Turn`），让判定端在生成 issue 的那一刻就标好，而不是让路由去猜措辞。这一格先按文本判，因为改判定的产出形状要动 §9.34 那套 verdict 语义，值得单独想清楚。
 
+41. **归因成为判定的字段，不再是路由去读措辞（2026-11-04，§9.40 ④ 那一格）**：
+    ① `Verdict.attribution: Attribution{Artifact|Turn}`（`#[serde(default)]`，旧 journal 行照旧可读）。分类在**判定产出的那一刻**完成并落进真相源，路由只读这个字段。上一版它住在路由里，读的是 `"empty result"` / `"worker stop:"` 这类字符串前缀——那意味着**改一句 issue 的文案就能悄悄改掉路由**，而没有任何测试会为此变红。「正确性寄生在措辞上」正是 journal 是真相源这条不变式反对的事。
+    ② 默认值选 `Artifact` 是刻意的下限：分不出来源时宁可多问写者一次，也绝不因为「读不懂」而把这一关放过去。
+    ③ 「工件根本没落地」也算 `Turn`（`artifact missing:` / `artifact is not valid JSON:`）：那一关的产出本身没出来，不能拿去定罪被审的产物。这是 §9.40 那条原则的延伸，不是兜底。
+    ④ 测的是产出端而不是辅助函数：`the_verdict_carries_its_own_attribution` 用真工件长出真 verdict（空结果 + `stop=error` → `Turn`；说了 `DONE` 但文件不在 → `Artifact`；工件缺失 → `Turn`），而不是直接调分类器。旧 journal 行的默认读法也有断言（「老行没有归因字段：落在产物那一侧」）。
+    ⑤ 还欠一层（已列 §10）：`issues` 仍是 `Vec<String>`，新加一类 issue 时忘了判归因会**静默落在 `Artifact`**。彻底的做法是让 issue 自己带归因变体（`JudgmentIssue::Artifact(..) | Turn(..)`），把「忘了标」变成编译不过去的事——那要改 `verdict_from_artifact` 的产出形状与所有读 `issues` 的地方（返工铃、报账、测试断言），值得单独一轮。
+
 ## 10 二期清单
 
 已落地（2026-10-28 起）：~~`ApproveMode::Bus`~~（授权表 + 超时 fail-closed + journal 审计，§9.20）、~~SA 判定升级到「工件 + 证据文件」~~（绝对路径存在性/非空核对，§9.20）、~~bus 重连重放~~（离线 session 停车补投 + 客户端自动重连；RPC 与「写入即死」的帧不重放，§9.21）、~~journal 快照/截断语义~~（检查点 + 归档段 + 崩溃安全轮转，§9.22）、~~多任务并行~~（task 命名空间三处同源 + 前缀寻址，§9.23）、~~openai-responses wire~~（第三条 v1 wire，金身 + fixture 验证，**真端点未实测**，§9.24）、~~journal 投影增量化与轮转触发~~（在线投影 = 全量重放 + 条数/字节双上限，§9.25）、~~一个引擎内真正并发地服务多个 task~~（改为「一 task 一引擎」的 worker 池，单活跃槽不动，§9.26）、~~`BudgetSpent` 的价格表~~（预留 → 结算两段式、按 token 换账单、无价退回名义值并报出来，§9.27；2026-11-03）、~~journal 轮转的**默认策略**~~（活文件 512 条 / 1 MiB 双上限、三态 CLI、生产与测试同一条 `rotate_at_boundary`，§9.28；2026-11-03）、~~证据的类型化~~（`file` / `test_log` / `diff` / `screenshot` 各自可在盘上反驳 + `--evidence-spec` 的 stage 要求，坏表硬失败，§9.29；2026-11-03）、~~审批批复的可靠投递~~（请求 at-least-once + 按 req 幂等 + 台账从 journal 播种，判定仍只一次，§9.30；2026-11-03）、~~批复到底有没有生效~~（回执 `approval_receipt` + `ApprovalAcked` 落账 + 到点撤摊，**没生效的批准不许记成生效**，§9.31；2026-11-03）。
@@ -317,4 +325,4 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
 
 2026-11-04 联跑新添的两格同日落地（§9.33）：验证类 stage 的 FAIL 回跳给写者返工（带额度 `max_reworks`、带原因 `ref.rework`、每关 iter 跨回跳不清零），bash 用 `output_path` 参数交出可核对的 `test_log`（内核把 stdout/stderr 连 `exit: ExitStatus{...}` 一起写进那个文件）。下一格因此有了明确的落点：SA 只要去读那行 `exit:`，「形状」就能升级成「结论」——现在它还只证明「这份文件是测试汇总」。
 
-新划出的边界：`nominal_usd` 的占比应当随 `providers.toml` 填写完整率下降，这条曲线本身值得盯（单价填全之后 `--max-usd` 才是真正的账单上限，名义值只作为「说不清价」的兜底存在）。2026-11-04 补一句并走完它：**只填价不够**——名义值有两个来源（没填价 / 读数不可信，§9.36），而这两个来源现在分开报了（§9.37），报账那一行直接指出下一步该做什么。证据强度这一格同日走完（§9.34），**结论也已经是状态**（§9.35）：`test_runs` 进投影、跨轮转存活，并被收尾报账与返工铃读走。形状校验也已挪到写侧（§9.39，`path_tokens` 认得全角括号 + `evidence_warnings` 跟着工件走），读侧的 `resolve_claim` 退成兜底。清单上因此留下相关的四件：**同一份日志被多个 stage 引用时不去重**（按 stage 归位是刻意的）、**没有任何闸门把结论当输入**（停损只看钱，要不要让「测试没绿」影响放行得先定它拦的是钱还是进度）、分类账只到「来源」这一层——**没有细到 peer × 来源**（`nominal_by_reason` 看不出「哪个 peer 说不清」，要改的是这张表的 key 形状）、以及 §9.40 的 FAIL 归因现在读的是 issue 的**文本前缀**——稳的做法是让判定端在生成 issue 那一刻就标好 `attribution: Artifact | Turn`，而不是让路由去猜措辞。
+新划出的边界：`nominal_usd` 的占比应当随 `providers.toml` 填写完整率下降，这条曲线本身值得盯（单价填全之后 `--max-usd` 才是真正的账单上限，名义值只作为「说不清价」的兜底存在）。2026-11-04 补一句并走完它：**只填价不够**——名义值有两个来源（没填价 / 读数不可信，§9.36），而这两个来源现在分开报了（§9.37），报账那一行直接指出下一步该做什么。证据强度这一格同日走完（§9.34），**结论也已经是状态**（§9.35）：`test_runs` 进投影、跨轮转存活，并被收尾报账与返工铃读走。形状校验也已挪到写侧（§9.39，`path_tokens` 认得全角括号 + `evidence_warnings` 跟着工件走），读侧的 `resolve_claim` 退成兜底；FAIL 归因也从「路由读措辞」提成了「判定自带字段」（§9.41）。清单上因此留下相关的四件：**同一份日志被多个 stage 引用时不去重**（按 stage 归位是刻意的）、**没有任何闸门把结论当输入**（停损只看钱，要不要让「测试没绿」影响放行得先定它拦的是钱还是进度）、分类账只到「来源」这一层——**没有细到 peer × 来源**（`nominal_by_reason` 看不出「哪个 peer 说不清」，要改的是这张表的 key 形状）、以及 §9.41 ⑤ 新露出的那层——`issues` 还是 `Vec<String>`，新加一类 issue 忘了判归因会**静默落在 `Artifact`**；把「忘了标」变成编译不过去的事，需要让 issue 自己带归因变体（`JudgmentIssue::Artifact | Turn`）。

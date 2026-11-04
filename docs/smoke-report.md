@@ -7,7 +7,7 @@
 
 ## 1. 自动化测试基线（cargo test）
 
-**Metrics** — src 51 files / 16762 lines · tests 9 files / 3381 lines · 243 tests (lib 190 + bin 4 + integration 49)
+**Metrics** — src 51 files / 16848 lines · tests 9 files / 3383 lines · 243 tests (lib 190 + bin 4 + integration 49)
 **Integration** — core_loop 5 / discipline 2 / m1_tools 9 / m2_session 6 / m4_bus 15 / m5_pool 6 / sandbox_e2e 4 / wire_anthropic 2
 
 | 组 | 覆盖 |
@@ -709,5 +709,35 @@ Error: [sa] iteration cap reached for Dev — 1 of those iterations were rework 
 并且**顺带抓到一个真 bug**：`notes = report.notes` 是赋值，会覆盖掉先合并进来的写侧警告，改成 `extend`）。
 `**Metrics**` / `**Integration**` 各被拦红一次并回写（lib 187→190，m5_pool 5→6）。
 
-**账本形状上没做**：归因现在读 issue 的文本前缀；稳的做法是让判定端在生成 issue 那一刻就标好
-`attribution: Artifact | Turn`（design §10 已列为下一格）。
+**当时没做的一层**：归因还住在路由里，读的是 issue 的文本前缀。这一格随后由 §26 走完
+（design §9.41）——保留这句原文，是为了留下「当时的边界画在哪里」。
+
+## 26. 2026-11-04 第十一轮联跑：归因从「读措辞」提成「判定自带字段」
+
+§9.41 落地：`Verdict.attribution: Attribution{Artifact|Turn}`（`#[serde(default)]`，旧 journal 行
+照旧可读），分类在判定产出的那一刻做完并随判定落账，路由只读这个字段。
+
+| 检查 | 实测 |
+|---|---|
+| 阶段 | dev iter1 fail → dev iter2 pass → review / test / build 各 iter1 pass → `pipeline complete` |
+| 结论 | 四关各打印 `test log … exit 0, ran 27, 27 passed / 0 failed`；收尾四行 `test conclusion … green` |
+| 报账 | `ledger total: 2.5000 usd, of which 2.5000 nominal (no rate 2.5000)`（§9.37 的分类账，本轮没有费率表，所以来源全是 `no rate`） |
+| 归因的新家 | `result_committed.verdict.attribution` —— 事后能从 journal 直接问出「那一次 SA 为什么回跳/为什么原地重派」，而不是靠当时的源码去反推措辞 |
+| 老账本 | `verdict_test_runs_roundtrip_and_old_lines_still_replay` 里加了一条断言：**没有归因字段的老行落在 `Artifact`**（更贵的默认），不猜成 `Turn` 把这一关放过去 |
+
+为什么这件事值得单独一轮：上一版分类住在路由里，读的是 `"empty result"` / `"worker stop:"` 这类**字符串
+前缀**。那意味着改一句 issue 的文案就能悄悄改掉路由，而没有任何测试会为此变红——正确性寄生在措辞上。
+`the_verdict_carries_its_own_attribution` 因此测的是**产出端**（用真工件长出真 verdict），而不是那个辅助函数。
+
+**没在现场复现的部分**：第十一轮没有出现回合类 FAIL（QA 每关都交出了东西），所以 `Turn` 分支这一轮
+仍未在真端点上走过，只有单元覆盖。这条与 §25 末尾那句是同一件事——路由规则本身在 §25 第一轮之后
+一直没被现场触发过，我把它当作**未验证**而不是「跑过很多轮所以没问题」。
+
+**闸门**：`cargo fmt --check` / `cargo clippy --all-targets -- -D warnings` / `cargo test` 实跑全绿，
+243 tests（lib 190 + bin 4 + integration 49）。净新增 0 项：`a_broken_turn_is_not_evidence_about_the_artifact`
+（测辅助函数的文本匹配）被 `the_verdict_carries_its_own_attribution`（测产出端的真 verdict）替掉，
+外加老 journal 行默认值的一条断言。`**Metrics**` 又被拦红一次并回写（src 16762→16848 行）。
+
+**新露出的一层**（design §10）：`issues` 还是 `Vec<String>`，所以新加一类 issue 忘了判归因会**静默落在
+`Artifact`**。要根治得让 issue 自己带归因变体（`JudgmentIssue::Artifact | Turn`），把「忘了标」变成
+编译不过去的事。
