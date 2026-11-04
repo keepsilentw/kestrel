@@ -687,14 +687,14 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
                                 );
                             }
                             (Some(_), true) => {
-                                journal.append(&JournalRecord::settled(
+                                journal.append(&JournalRecord::settled_as_nominal(
                                     args.task_id.clone(),
                                     target,
                                     stage,
                                     iter,
                                     usage,
                                     reserve,
-                                    false,
+                                    crate::journal::records::NominalReason::UnderReported,
                                 ))?;
                                 println!(
                                     "[sa] {stage_name} iter{iter}: {target} reported 0 input \
@@ -886,6 +886,12 @@ fn report_ledger(journal: &Journal, ledger: &PriceLedger) {
     }
     let nominal_total: f64 = state.nominal_usd.values().sum();
     let total: f64 = state.spent_usd.values().sum();
+    // 「说不清的钱」要分得出为什么说不清：该补价，还是该修读数（§9.37）。
+    let reasons: Vec<String> = state
+        .nominal_by_reason
+        .iter()
+        .map(|(reason, usd)| format!("{} {usd:.4}", reason.label()))
+        .collect();
     for (peer, usd) in &state.spent_usd {
         let tokens = state.tokens.get(peer).copied().unwrap_or_default();
         let unsettled = state
@@ -914,7 +920,14 @@ fn report_ledger(journal: &Journal, ledger: &PriceLedger) {
             }
         );
     }
-    println!("[sa] ledger total: {total:.4} usd, of which {nominal_total:.4} nominal");
+    println!(
+        "[sa] ledger total: {total:.4} usd, of which {nominal_total:.4} nominal{}",
+        if reasons.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", reasons.join(", "))
+        }
+    );
 }
 
 /// 回答一颗审批铃：先落 journal（谁请求、SA 判了什么），再回铃给 worker。
