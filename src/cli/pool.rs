@@ -22,7 +22,7 @@ use tokio_util::task::AbortOnDropHandle;
 
 use crate::bus::frame::{Envelope, FrameKind};
 use crate::bus::rpc::BusClient;
-use crate::cli::evidence::evidence_from_answer;
+use crate::cli::evidence::{annotation_warnings, evidence_from_answer};
 use crate::cli::serve::{
     approval_receipt_frame, approval_request_frame, bell_prompt, decision_from_frame, decision_name,
 };
@@ -582,6 +582,10 @@ fn spawn_worker(
                 // 一串路径：worker 声称那是测试日志，SA 就能在盘上反驳这句话。
                 // 正文里没有契约行时退回裸路径，按 `file` 档记。
                 "evidence": evidence_from_answer(&result_text),
+                // 声明形状的问题在这里就说出来，而不是等判定端悄悄修好（§9.39）：
+                // 工件是 worker 留给 SA 的唯一物件，警告要跟着它走，不然这条信息只活在
+                // 一个没人读的日志行里。
+                "evidence_warnings": annotation_warnings(&result_text),
                 "usage": usage,
                 "approvals": approvals,
                 "ref": payload["ref"],

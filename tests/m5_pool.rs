@@ -300,6 +300,66 @@ async fn a_bell_without_a_task_id_uses_the_default_namespace() {
     h.pool.abort();
 }
 
+/// 写侧的形状修复必须真的落到工件里：worker 把全角括注粘在路径上，工件里的 `evidence`
+/// 必须是干净路径，并且 `evidence_warnings` 要把这次认读说出来（§9.39）。这一段是
+/// worker → 工件；SA 那端的读法由 sa_demo 的单测覆盖。
+#[tokio::test]
+async fn a_glued_annotation_is_cut_before_it_reaches_the_artifact() {
+    let wires: Wires = Arc::new(Mutex::new(HashMap::new()));
+    let seen = Arc::clone(&wires);
+    let factory: EngineFactory = Arc::new(move |task: &str| {
+        let wire = Arc::new(FauxWire::new());
+        wire.push_turn_script(stop_script(&format!(
+            "DONE: answer for {task}\n\
+             evidence: /tmp/wt/lru.py, /tmp/wt/unittest.log（其内含汇总行）\n"
+        )));
+        seen.lock()
+            .unwrap()
+            .insert(task.to_string(), Arc::clone(&wire));
+        let (handle, events) = common::spawn_engine(wire, common::EngineSpec::default());
+        Ok(PooledEngine { handle, events })
+    });
+    let h = harness_with(
+        "shape-write",
+        2,
+        Duration::from_millis(40),
+        None,
+        factory,
+        wires,
+    )
+    .await;
+    h.sa.notify("harness-rd", bell("shape", "dev", "implement"));
+    tokio::time::timeout(Duration::from_secs(5), h.sa.recv_notify())
+        .await
+        .expect("no result bell")
+        .unwrap();
+
+    let artifact = read_artifact(&h.artifacts, "harness-rd-shape-dev-iter1.json").await;
+    let paths: Vec<&str> = artifact["evidence"]
+        .as_array()
+        .expect("the artifact records its evidence")
+        .iter()
+        .filter_map(|e| e["path"].as_str())
+        .collect();
+    assert_eq!(
+        paths,
+        vec!["/tmp/wt/lru.py", "/tmp/wt/unittest.log"],
+        "括注不能进到工件的路径里: {paths:?}"
+    );
+    let warnings = artifact["evidence_warnings"]
+        .as_array()
+        .expect("the artifact records the shape warning");
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0]
+            .as_str()
+            .unwrap_or_default()
+            .contains("was read as path /tmp/wt/unittest.log"),
+        "切掉了就要在工件里说出来: {warnings:?}"
+    );
+    h.pool.abort();
+}
+
 /// §10 批复的可靠投递：第一份审批请求「丢了」（测试侧故意不答它，等价于帧写进了
 /// 随后死掉的 socket——§9.21 明确说这种帧总线不会重放），worker 必须自己再问一次；
 /// 而批复**重复投递**时只能生效一次：同一个 req 的第二份 `allow` 不能再把工具跑一遍。

@@ -555,11 +555,44 @@ fn dedup_cap(items: Vec<Evidence>) -> Vec<Evidence> {
 fn path_tokens(span: &str) -> Vec<String> {
     span.split([
         ' ', '\t', ',', ';', '"', '\'', '(', ')', '[', ']', '{', '}', '|',
+        // 全角括号也必须切：2026-11-04 那次假 FAIL 是 `…/unittest.log（其内含汇总行）`——
+        // ASCII 括号在表里，全角不在，于是括注一路活到判定端，被当成文件名的一部分。
+        // 写侧切掉它（下面 `annotation_warnings` 负责说出来），读侧的 `resolve_claim`
+        // 只作兜底：不是所有工件都经这里生成。
+        '（', '）', '［', '］', '【', '】', '《', '》', '「', '」', '『', '』', '“', '”',
     ])
     .map(|t| t.trim_matches(|c: char| ".:!?、）。*`".contains(c)))
     .filter(|t| t.starts_with('/') && t.len() > 1 && !t.contains("://") && !t.ends_with('/'))
     .map(|t| t.to_string())
     .collect()
+}
+
+/// 把答案里「被切掉的括注」说出来：路径形状可疑的声明（括号粘在路径上）不该静默修好——
+/// 写的人需要知道自己在用什么形状，读的人也需要知道这个路径不是逐字符来自原文的。
+/// 返回的是原 token 与切出来的路径的对照，交给 `serve` 落进工件、SA 打印。
+pub fn annotation_warnings(text: &str) -> Vec<String> {
+    const OPENERS: [char; 8] = ['(', '（', '[', '［', '【', '《', '「', '『'];
+    let mut out: Vec<String> = Vec::new();
+    for token in text.split_whitespace() {
+        let Some((idx, _)) = token.char_indices().find(|(_, c)| OPENERS.contains(c)) else {
+            continue;
+        };
+        let head = token[..idx].trim_matches(|c: char| "`*.,;:!?、）。".contains(c));
+        // 只对**看起来是路径**的那一段报警：散文里的 `(note)` 不是证据声明。
+        if head.starts_with('/') && head.len() > 1 && head != token {
+            // 报出来时剥掉 markdown 装饰：这条信息是给人读的。反引号常在**中间**
+            // （`` `path`（注）``），只 trim 两端不够。
+            let shown = token.replace(['`', '*'], "");
+            let note = format!("evidence claim {shown} was read as path {head}");
+            if !out.contains(&note) {
+                out.push(note);
+            }
+        }
+        if out.len() >= MAX_EVIDENCE_PATHS {
+            break;
+        }
+    }
+    out
 }
 
 fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
@@ -818,6 +851,48 @@ mod tests {
             rep.issues
         );
         assert!(rep.notes.is_empty(), "{:?}", rep.notes);
+    }
+
+    /// 全角括注在**写侧**就被切掉（§9.39）：ASCII 括号一直在这张表里，全角不在——
+    /// 那次假 FAIL 的整串 `…/unittest.log（其内含汇总行）` 就是这么活到判定端的。
+    /// 切掉不是静默宽容：`annotation_warnings` 必须把「原文 vs 读成的路径」说出来。
+    #[test]
+    fn a_full_width_annotation_is_cut_at_the_write_side() {
+        let answer = "DONE: 实现完了，测试都过。\n\
+                      evidence: /tmp/wt/lru_cache.py, /tmp/wt/unittest.log（其内含汇总行）\n\
+                      EVIDENCE test_log /tmp/wt/doctest.log（跑过了）\n";
+        let got = evidence_from_answer(answer);
+        let paths: Vec<&str> = got.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                "/tmp/wt/lru_cache.py",
+                "/tmp/wt/unittest.log",
+                "/tmp/wt/doctest.log"
+            ],
+            "括注不能留在路径里: {paths:?}"
+        );
+        assert_eq!(
+            got[2].kind,
+            EvidenceKind::TestLog,
+            "切完仍要认得那一行的类型"
+        );
+
+        let warnings = annotation_warnings(answer);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("unittest.log（其内含汇总行）")
+                    && w.contains("was read as path /tmp/wt/unittest.log")),
+            "认了账就要说出原文: {warnings:?}"
+        );
+
+        // 散文里的括号不是证据声明：不报警，也不当路径。
+        assert!(
+            annotation_warnings("这版 (alpha) 只改了注释, 没有新文件").is_empty(),
+            "只对看起来是路径的东西报警"
+        );
     }
 
     #[test]
