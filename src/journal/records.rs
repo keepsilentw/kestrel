@@ -1005,6 +1005,32 @@ mod tests {
         assert_eq!(serde_json::to_string(&back).unwrap(), text);
     }
 
+    /// 「有价但读数不可信」的结算（§9.36）：钱必须留在账上、并且留在**名义那一份**里，
+    /// 同时配对键要消耗掉——否则同一次派发会被再来一次结算计成两笔。
+    #[test]
+    fn booking_a_priced_reservation_back_as_nominal_keeps_the_money() {
+        let records = vec![
+            JournalRecord::reserved("t", "qa", Stage::Test, 1, 0.160_768, true),
+            JournalRecord::settled("t", "qa", Stage::Test, 1, usage(0, 671), 0.160_768, false),
+        ];
+        let rep = reconcile(&records);
+        assert!(
+            (rep.state.spent_usd["qa"] - 0.160_768).abs() < 1e-9,
+            "按名义多计，不是按少报的读数少计: {:?}",
+            rep.state.spent_usd
+        );
+        assert!(
+            (rep.state.nominal_usd["qa"] - 0.160_768).abs() < 1e-9,
+            "名义那一份要跟着涨，报账才说不清这钱是「算不出来」的: {:?}",
+            rep.state.nominal_usd
+        );
+        assert!(
+            rep.state.reserved.is_empty(),
+            "配对键消耗掉了，不会被二次结算烧穿"
+        );
+        assert_eq!(rep.state.tokens["qa"], usage(0, 671), "读数照样留档");
+    }
+
     fn run(code: Option<i64>, passed: Option<u64>, failed: Option<u64>) -> TestRun {
         TestRun {
             path: "/tmp/unittest.log".into(),

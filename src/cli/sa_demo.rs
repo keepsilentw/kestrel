@@ -663,8 +663,14 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
                         // 算得出来就把上面那笔预留换成实际账单；算不出来就让预留
                         // 原样留着——宁可按名义多计，也不把「没人填价」记成免费。
                         // 配对用的是这次派发的 peer（预留记在它名下）。
-                        match ledger.settle(target, &usage) {
-                            Some(usd) => {
+                        // 有价不代表能算账：读数是 0 输入的，结算照做（预留得配对掉，
+                        // 否则同一笔派发会被后来者再计一次），但**按名义落账**并说出理由。
+                        // 金额取本次的预留：宁可按最坏情况多计，也不按一个不可信的读数少计。
+                        // 用二元组匹配而不是 guard：`Some(x) if !flag` / `Some(_) if flag`
+                        // 让穷尽性检查看不见那个布尔，编译器会要求一条多余的兜底臂。
+                        let untrustworthy = under_reports_input(&usage);
+                        match (ledger.settle(target, &usage), untrustworthy) {
+                            (Some(usd), false) => {
                                 journal.append(&JournalRecord::settled(
                                     args.task_id.clone(),
                                     target,
@@ -680,7 +686,25 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
                                     usage.input_tokens, usage.output_tokens
                                 );
                             }
-                            None => println!(
+                            (Some(_), true) => {
+                                journal.append(&JournalRecord::settled(
+                                    args.task_id.clone(),
+                                    target,
+                                    stage,
+                                    iter,
+                                    usage,
+                                    reserve,
+                                    false,
+                                ))?;
+                                println!(
+                                    "[sa] {stage_name} iter{iter}: {target} reported 0 input \
+                                     tokens with {} out — the gateway under-reports (§9.7), so \
+                                     this books the reservation {reserve:.4} usd as NOMINAL \
+                                     instead of a bill that would read too cheap",
+                                    usage.output_tokens
+                                );
+                            }
+                            (None, _) => println!(
                                 "[sa] {stage_name} iter{iter}: {target} has no rate — the \
                                  reservation stays as the bill (nominal)"
                             ),
@@ -823,6 +847,17 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
 
 /// 收尾报账：花了多少、其中多少仍是名义值、换出了多少 token。`--max-usd` 到底是
 /// 「账单上限」还是「名义上限」，由这行说清楚，不靠人记住这次有没有传 `--roles-dir`。
+/// 这份读数能不能按 token 算成账单。
+///
+/// 网关在 `message_start` 不回 input usage（§9.7 对 BigModel 的实测），于是
+/// `input_tokens = 0` 而 output 照报。这时候「按价格表结算」会算出一张**少掉整个输入侧**
+/// 的账单——它比名义值更危险，因为它看起来是算出来的。§9.7 的字符估算只该用来兜
+/// 「要不要压上下文」那个判断，拿来当钱是另一回事：钱的来源必须是读数。
+/// 所以这里不下「这次免费」的结论，只说「这份读数顶不起一张账单」。
+fn under_reports_input(usage: &Usage) -> bool {
+    usage.input_tokens == 0 && usage.output_tokens > 0
+}
+
 fn report_ledger(journal: &Journal, ledger: &PriceLedger) {
     let state = journal.projection().state;
     // 结论也是账的一部分（§9.35）：报账时说出「每一关最后一次提交读出来的测试结论」。
@@ -1305,6 +1340,31 @@ mod tests {
                 "{stage:?} 的产物在写者手里，回派验证者只是重复同一次判定"
             );
         }
+    }
+
+    /// 有价 ≠ 能算账。BigModel 实测在 `message_start` 不回 input usage（§9.7），
+    /// 于是按 token 结算会算出一张少掉整个输入侧的账单。这里只判「这份读数顶不顶得起
+    /// 账单」，不判「这次多少钱」——钱的来源必须是读数，不是字符估算。
+    #[test]
+    fn a_zero_input_reading_is_not_a_bill() {
+        let reading = |i, o| Usage {
+            input_tokens: i,
+            output_tokens: o,
+            ..Default::default()
+        };
+        assert!(
+            under_reports_input(&reading(0, 671)),
+            "output 照报而 input 为 0"
+        );
+        assert!(
+            !under_reports_input(&reading(442, 640)),
+            "报了输入就不是少报"
+        );
+        // 什么都没报 ≠ 少报：那走的是「没有价」那条路，别在这里重复计一次。
+        assert!(
+            !under_reports_input(&reading(0, 0)),
+            "没有读数不等于读数不可信"
+        );
     }
 
     /// task id 是 journal 记录、门铃、工件名三处**同源**的命名空间；peer 由 stage
