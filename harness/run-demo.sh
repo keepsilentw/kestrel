@@ -16,6 +16,9 @@
 #     （不设 = 走 SA 的默认策略 512 条；显式设 0 = 关闭这一条）
 #   KESTREL_DEMO_ROTATE_BYTES 活文件超过这么多字节也折（不设 = 默认 1 MiB；0 = 关闭）
 #   KESTREL_DEMO_TASK / KESTREL_DEMO_BELL_TIMEOUT / KESTREL_DEMO_MAX_USD
+#   KESTREL_DEMO_PRICES       费率表（默认用 ~/.kestrel/providers.toml）。仓库外的
+#                             实验文件，用来验证「按 token 结算」这条路径——单价跟着
+#                             provider 住，不把费率数字钉进 demo。
 #
 # 用法：./run-demo.sh
 set -euo pipefail
@@ -106,6 +109,10 @@ if [ -n "$EVIDENCE_SPEC" ]; then
   EVIDENCE_ARGS+=(--evidence-spec "$EVIDENCE_SPEC")
 fi
 
+# 没设这个变量就**不传** --prices：让 SA 走用户层那份 providers.toml（存在才读）。
+PRICE_ARGS=()
+[ -z "${KESTREL_DEMO_PRICES+set}" ] || PRICE_ARGS+=(--prices "$KESTREL_DEMO_PRICES")
+
 KESTREL_TEST_KILL_AFTER="${KESTREL_TEST_KILL_AFTER:-}" \
   "$BIN" demo-sa --bus-socket "$SOCKET" --task "${KESTREL_DEMO_TASK:-demo: 实现一个 LRU cache}" \
   --journal "$HERE/journal.jsonl" --artifacts-dir "$ARTIFACTS" \
@@ -114,5 +121,6 @@ KESTREL_TEST_KILL_AFTER="${KESTREL_TEST_KILL_AFTER:-}" \
   ${EVIDENCE_ARGS[@]+"${EVIDENCE_ARGS[@]}"} \
   --roles-dir "$HERE/roles" \
   --nominal-usd "${KESTREL_DEMO_NOMINAL:-0.5}" \
+  ${PRICE_ARGS[@]+"${PRICE_ARGS[@]}"} \
   ${ROTATE_ARGS[@]+"${ROTATE_ARGS[@]}"} \
   --bell-timeout-secs "${KESTREL_DEMO_BELL_TIMEOUT:-300}" --max-usd "${KESTREL_DEMO_MAX_USD:-6.0}"
