@@ -777,7 +777,9 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
             // FAIL 之后「派给谁」是路由问题，不是判定强度：验证类 stage 说不达标，
             // 说的是**被验证的产物**，而验证者没有写范围，再给它一颗铃只会得到同一份
             // FAIL。返工要有额度（`max_reworks`），额度用尽就把它说成显式失败。
-            if rework_target(stage) == Some(Stage::Dev) {
+            if rework_target(stage) == Some(Stage::Dev)
+                && !verdict_is_about_the_turn(&verdict.issues)
+            {
                 if reworks_left == 0 {
                     anyhow::bail!(
                         "[sa] {stage_name} iter{iter}: fail ({}) and the rework budget is spent \
@@ -820,8 +822,16 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
                 iter += 1;
                 break StageOutcome::Rework;
             }
+            // 走到这里有两种：Dev 自己的 FAIL（「你还没做成」），或验证者那一回合坏了
+            // （空结果 / abort / stop=error）。后者的产物**还没被可信地看过**，重派验证者、
+            // 不扣返工额度——把 QA 的哑火算到 RD 头上，只会换来两轮辩护。
+            let why = if verdict_is_about_the_turn(&verdict.issues) {
+                "the verifier's own turn is broken, so the artifact was never credibly seen"
+            } else {
+                "the writer did not finish the job"
+            };
             println!(
-                "[sa] {stage_name} iter{iter}: fail ({}) -> re-dispatch",
+                "[sa] {stage_name} iter{iter}: fail ({}) -> re-dispatch {target} ({why})",
                 verdict.issues.join(", ")
             );
             iter += 1;
@@ -861,6 +871,21 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
 /// 所以这里不下「这次免费」的结论，只说「这份读数顶不起一张账单」。
 fn under_reports_input(usage: &Usage) -> bool {
     usage.input_tokens == 0 && usage.output_tokens > 0
+}
+
+/// FAIL 归因：这一关没过，说的是**被验证的产物**，还是**验证者自己那一回合**？
+///
+/// 2026-11-04 实测出来的这一格：`review iter1: fail (empty result, worker stop: round budget
+/// exhausted)` 被路由成「RD 返工」，RD 连着两轮都在替一个它改不动的东西辩护，白烧掉 dev 的
+/// iteration 预算，最后撞上限。验证者这一回合本身不可信时，**不能**拿它的结论去定罪产物——
+/// 重派验证者才是那一条正确的动作，也不该因此扣掉返工额度。
+fn verdict_is_about_the_turn(issues: &[String]) -> bool {
+    issues.iter().any(|i| {
+        i == "empty result"
+            || i == "worker aborted"
+            || i.starts_with("worker stop:")
+            || i.starts_with("no result bell")
+    })
 }
 
 fn report_ledger(journal: &Journal, ledger: &PriceLedger) {
@@ -1201,6 +1226,16 @@ pub fn verdict_from_artifact(path: &Path, required: &[EvidenceKind]) -> Verdict 
     // stage 要求看的还是**核对通过**的类型：一份普通文件顶不出 `test_log` 那一格。
     let mut test_runs: Vec<TestRun> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
+    // 写侧（`serve`/池）折进工件的形状警告，跟着判定一起落账：谁在用什么形状写声明，
+    // 应该在看判定的人面前显形，而不是只在 worker 那侧的日志里闪一下（§9.39）。
+    if let Some(warnings) = json["evidence_warnings"].as_array() {
+        notes.extend(
+            warnings
+                .iter()
+                .filter_map(|w| w.as_str())
+                .map(|w| format!("worker-side shape warning: {w}")),
+        );
+    }
     if converged {
         let mut evidence = evidence_from_artifact(&json);
         if evidence.is_empty() {
@@ -1213,7 +1248,9 @@ pub fn verdict_from_artifact(path: &Path, required: &[EvidenceKind]) -> Verdict 
             let report = check_evidence(&evidence);
             issues.extend(report.issues);
             // 认账说明跟着判定落进真相源：重启后复现这次判定，要连「当初认了什么」一起复现。
-            notes = report.notes;
+            // `extend` 而不是赋值——上面已经并进了写侧的形状警告，覆盖就等于把它们丢掉
+            // （这个测试第一次跑就抓到了这里）。
+            notes.extend(report.notes);
             // 每份 test_log 读出来的结论随判定一起落 journal（§9.34）：事后能问
             // 「那一次到底过了几条」，而不是只有一句 pass。
             test_runs = report.test_runs;
@@ -1364,6 +1401,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_broken_turn_is_not_evidence_about_the_artifact() {
+        let issues = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
+        // 验证者这一回合本身不可信：空结果 / abort / stop=error。
+        assert!(verdict_is_about_the_turn(&issues(&[
+            "empty result",
+            "worker stop: round budget exhausted",
+        ])));
+        assert!(verdict_is_about_the_turn(&issues(&["worker aborted"])));
+        // 产物没交对才是写者的账。
+        assert!(!verdict_is_about_the_turn(&issues(&[
+            "no verified test_log evidence: this stage requires one"
+        ])));
+        assert!(
+            !verdict_is_about_the_turn(&issues(&["evidence missing: /tmp/x.log"])),
+            "缺文件是产物的账，不是回合的账"
+        );
+    }
+
     /// 有价 ≠ 能算账。BigModel 实测在 `message_start` 不回 input usage（§9.7），
     /// 于是按 token 结算会算出一张少掉整个输入侧的账单。这里只判「这份读数顶不顶得起
     /// 账单」，不判「这次多少钱」——钱的来源必须是读数，不是字符估算。
@@ -1452,6 +1508,27 @@ mod tests {
         let path = dir.join(name);
         std::fs::write(&path, body).unwrap();
         path
+    }
+
+    #[test]
+    fn a_worker_side_shape_warning_rides_the_verdict() {
+        let file = evidence_file("shape-lru.py");
+        let art = write_artifact(
+            "shape.json",
+            &format!(
+                r#"{{"result":"DONE: shipped","evidence":[{{"kind":"file","path":"{}"}}],"evidence_warnings":["evidence claim /tmp/wt/a.log（注） was read as path /tmp/wt/a.log"],"aborted":false,"stop":{{"type":"stop"}}}}"#,
+                file.display()
+            ),
+        );
+        let v = verdict_from_artifact(&art, &[EvidenceKind::File]);
+        assert!(v.pass, "形状警告不是缺陷，不该把一关判死: {:?}", v.issues);
+        assert!(
+            v.notes
+                .iter()
+                .any(|n| n.contains("worker-side shape warning")),
+            "写侧说了什么，判定这端要能复述: {:?}",
+            v.notes
+        );
     }
 
     /// 一句 `DONE` 配一份**跑挂了**的测试日志：日志反驳判定词，stage 不能过。
