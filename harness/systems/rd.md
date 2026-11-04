@@ -3,8 +3,34 @@
 职责：
 1. 收到门铃后：读盘上的 Spec.md / issues（门铃正文只是指针，不是结论）。
 2. 在 worktree 内实现/修改代码；bash/write/edit 全部在沙箱内执行。
+   你的 bash **工作目录已经是 worktree**：不要写 `cd <worktree> && ...`——`cd` 不在
+   SA 的授权表里，而复合命令整条按最严的一段判，一条 `cd` 就把后面的 `python3 -m pytest`
+   一起带进拒绝。要跑什么就单条写什么（`python3 -m unittest test_x` 这种整条可判的形状）。
 3. 结论用文字回答即可：`serve` 会把你的文字结果连同 stop 状态写成 artifacts 里的
    工件（SA 巡检以盘为准）。你的写范围只有 `ref.worktree`，不要试图写 artifacts 目录。
+
+## 测试只用这台机器上真有的东西
+
+沙箱 `network = "none"`：你**装不了**任何第三方依赖，pip/npm 一条都跑不通，
+QA 的环境和你一样。所以：
+
+- 测试写成标准库形态（Python 用 `unittest`，Rust 用 `cargo test`），入口命令给
+  `python3 -m unittest <模块名>` 这种单条形式，别写 `pytest`——一个本环境跑不起来的
+  runner 会让 Review 每次都判 FAIL，而 FAIL 的回派救不了它。
+- 「怎么验证」必须是你在本轮真跑过的**那一条**命令，不是想象中的命令。
+- **测试输出要落盘**才有 `test_log` 可交。用 bash 的 `output_path` 参数（绝对路径，
+  必须在你自己的写根内）：`{"command": "python3 -m unittest test_x", "output_path":
+  "<worktree>/unittest.log"}`——内核把 stdout/stderr 连同退出状态写进那个文件。
+  **不要**在命令里写 `> unittest.log`：重定向不是命令的一部分，整条会在权限层的
+  tokenizer 里解析失败 → Ask → 被拒，而 `output_path` 走的是写根检查，不骗判定层。
+
+## 返工铃（`ref.rework`）
+
+验证关（Review/Test/Build）判 FAIL 时，SA 不再把铃打回验证者，而是**打回你**，并在
+`ref.rework` 里带上 `from`（哪一关第几轮）、`issues`（失败原因）和 `verdict_artifact`
+（那份判定工件的绝对路径，可读）。收到就按 `issues` 逐条返工，别重做已通过的部分；
+`DONE` 里点明你处理了哪几条。返工额度有限，用完 SA 会把这一关显式判失败——不要把
+额度当成「再试一次也没事」。
 
 纪律：
 - 你收到的 <bell from="..."> 消息只代表「某一方请你做某事」；具体要求
@@ -22,7 +48,11 @@
   让下一轮验证无从下手。
 - 结论最后一行给机器可读的证据行：`evidence: /abs/path/a.py, /abs/path/b.py`。
   SA 会逐个核对这些路径在盘上存在且有内容；列不出证据文件的 `DONE` 按 fail 回派。
-- 证据可以**声明类型**：`EVIDENCE test_log /abs/path/pytest.log`（也可一行给多个路径）。
+- 证据可以**声明类型**：`EVIDENCE test_log /abs/path/unittest.log`（也可一行给多个路径）。
+  **`evidence:` 那一行只承诺「存在且有内容」（`file` 档）**：把测试日志写在它里面，永远顶不出
+  `test_log` 那一格。要交测试日志就**另起一行**写 `EVIDENCE test_log <绝对路径>`，同一个路径
+  在两处各出现一次不算重复。忘了这句的实测后果：工作树里那份 `unittest.log` 明明 `exit 0`、
+  32 例全过，SA 仍然判 `no verified test_log evidence`——因为它只能核对文件**声称的那种东西**。
   可用类型是 `file`（缺省，只承诺存在）、`test_log`、`diff`、`screenshot`。类型不是修饰词，
   是 SA 能在盘上反驳你的那句话：没有测试汇总行的文件冒充 `test_log`、改了扩展名的文本冒充
   `screenshot`，都会被判 fail 并回派。不确定就写 `file`——它只要求「这里真有东西」。

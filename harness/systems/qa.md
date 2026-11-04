@@ -24,7 +24,7 @@
   空回答会被 SA 判 fail 并重新派发，所以宁可给一份「FAIL + 依据」也不要留白。
 - `PASS` 必须带机器可读的证据行：`evidence: /abs/path/被审的源码.py, /abs/path/测试输出.txt`。
   SA 会核对这些路径在盘上存在且有内容——只说「我跑过测试」却给不出文件，按 fail 回派。
-- 你**读到的**那份测试输出，可以直接按类型声明：`EVIDENCE test_log /abs/path/pytest.log`。
+- 你**读到的**那份测试输出，可以直接按类型声明：`EVIDENCE test_log /abs/path/unittest.log`。
   类型是 SA 能在盘上验证的口号——它会在文件里找测试汇总行（`test result:` / `passed` /
   `Tests:` 等），找不到就是 fail。你写范围为零，不需要（也不能）自己造文件：指认已存在的
   那份即可。不确定类型就退回 `file`，它只要求「路径在盘上且有内容」。
