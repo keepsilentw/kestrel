@@ -371,6 +371,7 @@ mod tests {
                 pass: true,
                 issues: vec![],
                 test_runs: vec![],
+                notes: vec![],
             },
         })
         .unwrap();

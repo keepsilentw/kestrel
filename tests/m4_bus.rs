@@ -187,6 +187,7 @@ async fn crash_reconciliation_avoids_redispatch() {
                     pass: true,
                     issues: vec![],
                     test_runs: vec![],
+                    notes: vec![],
                 },
             })
             .unwrap();
@@ -305,6 +306,7 @@ fn the_default_rotation_policy_changes_no_conclusion() {
         pass: true,
         issues: vec![],
         test_runs: vec![],
+        notes: vec![],
     };
     let mut rotations = 0;
 

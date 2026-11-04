@@ -10,7 +10,9 @@
 //! 声称 PNG 的文件开头应当真是 PNG 的魔数。类型把「我看过」变成「这句话能在盘上被
 //! 反驳」，也正是它能被 stage 要求的原因：`test` 这一关必须有一份可核对的测试日志。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use crate::journal::records::TestRun;
 
 /// 证据类型。`File` 是「只承诺存在且有内容」的那一档（也就是升级前的全部语义），
 /// 其余每档都比它多一个可机械核对的属性。
@@ -142,27 +144,43 @@ fn parse_evidence_span(rest: &str) -> Vec<Evidence> {
 
 /// 一次核对的产出：不能成立的条目 + **确实成立的那些类型**（stage 要求要看后者，
 /// 不能只看「有条目没报错」——一个 `file` 档的证据永远满足不了 `test_log` 的要求）。
-use crate::journal::records::TestRun;
-
 #[derive(Debug, Default, PartialEq)]
 pub struct EvidenceReport {
     pub issues: Vec<String>,
     pub verified_kinds: Vec<EvidenceKind>,
     /// 核对过的 `test_log` 各自读出来的结论（design §9.34）。没声称 test_log 的不进这里。
     pub test_runs: Vec<TestRun>,
+    /// 核对时的**认账说明**：不是问题，但事后必须看得见「SA 把哪句声明认成了哪个文件」。
+    /// 它跟判定一起落 journal（不变式 5：复现判定要连认账规则一起复现）。
+    pub notes: Vec<String>,
 }
 
 /// 按类型核对证据。`issues` 为空意味着每一条都按它**声称的类型**在盘上成立。
 pub fn check_evidence(items: &[Evidence]) -> EvidenceReport {
     let mut report = EvidenceReport::default();
     for item in items.iter().take(MAX_EVIDENCE_PATHS) {
-        let path = Path::new(&item.path);
-        let Ok(md) = std::fs::metadata(path) else {
+        // 现场抓到的形状（2026-11-04 那轮强制轮转的联跑）：`/tmp/wt/unittest.log（其内含汇总行）`。
+        // 模型把括注直接粘在路径后面，括注就成了文件名的一部分——盘上明明有的东西报
+        // `evidence missing`，白烧一次派发预算，还被路由成一次返工。
+        // 认账的条件很窄：字面路径不存在时，只在**切掉括注后那个前缀本身是个文件**时认，
+        // 认下来之后仍按声称的类型核对，并把这次认账写进 notes（不静默放宽）。
+        let Some((path, note)) = resolve_claim(Path::new(&item.path)) else {
             report
                 .issues
                 .push(format!("evidence missing: {}", item.path));
             continue;
         };
+        if let Some(note) = note {
+            report.notes.push(note);
+        }
+        let Ok(md) = std::fs::metadata(&path) else {
+            report
+                .issues
+                .push(format!("evidence missing: {}", item.path));
+            continue;
+        };
+        #[allow(unused_variables)]
+        let path = path.as_path();
         if md.is_dir() {
             // 目录只能证明「这里有东西」：它承载不了任何更强的类型声明
             if item.kind != EvidenceKind::File {
@@ -318,6 +336,39 @@ fn find_marker<'a>(text: &str, markers: &[&'a str]) -> Option<&'a str> {
 fn marker_list(markers: &[&str]) -> String {
     // 报错里只举几个例子，太长没人读
     format!("{} …", markers[..3].join(", "))
+}
+
+/// 这条声明指向盘上的哪个文件？返回 `(路径, 认账说明)`，`None` = 哪儿都没有。
+///
+/// 只在字面路径不存在时才试前缀，并且**前缀必须是文件**：`x(1).log` 落空时不许被认成
+/// 目录 `x`——那等于用「声明写得烂」换一次假通过。
+fn resolve_claim(claimed: &Path) -> Option<(PathBuf, Option<String>)> {
+    if std::fs::metadata(claimed).is_ok() {
+        return Some((claimed.to_path_buf(), None));
+    }
+    let prefix = annotation_prefix(claimed)?;
+    if !std::fs::metadata(&prefix).is_ok_and(|md| md.is_file()) {
+        return None;
+    }
+    Some((
+        prefix.clone(),
+        Some(format!(
+            "evidence {} resolved to {} — the trailing annotation is not part of the path",
+            claimed.display(),
+            prefix.display()
+        )),
+    ))
+}
+
+/// 切掉粘在路径后面的括注：`a.log（说明）` -> `a.log`。
+fn annotation_prefix(path: &Path) -> Option<PathBuf> {
+    const OPENERS: [char; 7] = ['(', '（', '[', '［', '【', '《', '“'];
+    let text = path.to_string_lossy();
+    let idx = text
+        .char_indices()
+        .find_map(|(i, c)| OPENERS.contains(&c).then_some(i))?;
+    let head = text[..idx].trim_end();
+    (!head.is_empty()).then(|| PathBuf::from(head))
 }
 
 fn looks_like_diff(text: &str) -> bool {
@@ -716,6 +767,57 @@ mod tests {
         assert!(rep.issues[0].contains("signal 9"), "{:?}", rep.issues);
         assert_eq!(rep.test_runs[0].exit_code, None);
         assert_eq!(rep.test_runs[0].exit_signal, Some(9));
+    }
+
+    /// 现场抓到的假 FAIL（2026-11-04 那轮强制轮转的联跑）：模型把括注粘在路径后面，
+    /// 括注就成了文件名的一部分，于是盘上明明有的东西报 `evidence missing`——白烧一次派发
+    /// 预算，还被路由成一次返工（design §9.38）。认账的条件很窄，而且认了必须说出来。
+    #[test]
+    fn an_annotation_glued_to_the_path_is_repaired_and_said_out_loud() {
+        let real = scratch(
+            "glue",
+            "unittest.log",
+            b"..........................\nRan 3 tests in 0.001s\n\nOK\n",
+        );
+        let glued = Evidence {
+            path: format!("{}（其内含汇总行）", real.path),
+            kind: EvidenceKind::TestLog,
+        };
+        let rep = check_evidence(&[glued]);
+        assert!(rep.issues.is_empty(), "{:?}", rep.issues);
+        assert_eq!(rep.verified_kinds, vec![EvidenceKind::TestLog]);
+        assert_eq!(rep.notes.len(), 1, "认了账就要说出来: {:?}", rep.notes);
+        assert!(rep.notes[0].contains("resolved to"), "{:?}", rep.notes);
+
+        // 切出来的前缀不存在：不认，照原样报 missing。
+        let ghost = Evidence {
+            path: format!(
+                "/tmp/kestrel-definitely-missing-{}/x.log（注）",
+                std::process::id()
+            ),
+            kind: EvidenceKind::File,
+        };
+        let rep = check_evidence(&[ghost]);
+        assert_eq!(rep.issues.len(), 1, "{:?}", rep.issues);
+        assert!(rep.issues[0].starts_with("evidence missing:"));
+        assert!(rep.notes.is_empty(), "没认账就不能说有认账");
+
+        // 前缀是**目录**：不认。否则 `dir(1).log` 落空时被认成目录 `dir`，
+        // 等于用「声明写得烂」换一次假通过。
+        let dir = std::env::temp_dir().join(format!("kestrel-glue-dir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("inside.txt"), "content\n").unwrap();
+        let trap = Evidence {
+            path: format!("{}(1).log", dir.display()),
+            kind: EvidenceKind::File,
+        };
+        let rep = check_evidence(&[trap]);
+        assert!(
+            rep.issues.iter().any(|i| i.starts_with("evidence missing")),
+            "目录不能顶替一个文件声明: {:?}",
+            rep.issues
+        );
+        assert!(rep.notes.is_empty(), "{:?}", rep.notes);
     }
 
     #[test]

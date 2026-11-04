@@ -29,6 +29,10 @@ pub struct Verdict {
     /// 本轮核对过的测试日志（每份一条）。空 = 这一关没有可数出来的测试证据。
     #[serde(default)]
     pub test_runs: Vec<TestRun>,
+    /// 核对时的**认账说明**（不是问题，不影响 pass）。它们必须跟着判定落进真相源：
+    /// 重启之后没人知道当初 SA 把哪句声明认成了哪个文件，就没法复现那次判定。
+    #[serde(default)]
+    pub notes: Vec<String>,
 }
 
 /// 一份测试日志读出来的结论。字段全可缺：`None` 说的是「这份日志里没写」，
@@ -674,6 +678,7 @@ mod tests {
                     pass: true,
                     issues: vec![],
                     test_runs: vec![],
+                    notes: vec![],
                 },
             },
         ];
@@ -934,6 +939,7 @@ mod tests {
                     pass: true,
                     issues: vec![],
                     test_runs: vec![],
+                    notes: vec![],
                 },
             },
         ];
@@ -950,6 +956,7 @@ mod tests {
                     pass: true,
                     issues: vec![],
                     test_runs: vec![],
+                    notes: vec![],
                 },
             },
         ];
@@ -1062,6 +1069,7 @@ mod tests {
         let verdict = Verdict {
             pass: false,
             issues: vec!["did not pass".into()],
+            notes: vec![],
             test_runs: vec![TestRun {
                 path: "/tmp/unittest.log".into(),
                 exit_code: Some(1),
@@ -1224,6 +1232,7 @@ mod tests {
                 pass: true,
                 issues: vec![],
                 test_runs: runs,
+                notes: vec![],
             },
         }
     }

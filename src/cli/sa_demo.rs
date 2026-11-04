@@ -747,6 +747,11 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
                     describe_run(run)
                 );
             }
+            // 认账说出来：它不改判定结果，但读日志的人要看得见「声明的那句」与「核对的那个
+            // 文件」不是同一个字符串。
+            for note in &verdict.notes {
+                println!("[sa] {stage_name} iter{iter}: note: {note}");
+            }
             journal.append(&JournalRecord::ResultCommitted {
                 task: args.task_id.clone(),
                 stage,
@@ -1195,6 +1200,7 @@ pub fn verdict_from_artifact(path: &Path, required: &[EvidenceKind]) -> Verdict 
     // 能在盘上被反驳的属性——没有测试汇总行的日志不是测试日志，改名的 txt 不是截图。
     // stage 要求看的还是**核对通过**的类型：一份普通文件顶不出 `test_log` 那一格。
     let mut test_runs: Vec<TestRun> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
     if converged {
         let mut evidence = evidence_from_artifact(&json);
         if evidence.is_empty() {
@@ -1206,6 +1212,8 @@ pub fn verdict_from_artifact(path: &Path, required: &[EvidenceKind]) -> Verdict 
         } else {
             let report = check_evidence(&evidence);
             issues.extend(report.issues);
+            // 认账说明跟着判定落进真相源：重启后复现这次判定，要连「当初认了什么」一起复现。
+            notes = report.notes;
             // 每份 test_log 读出来的结论随判定一起落 journal（§9.34）：事后能问
             // 「那一次到底过了几条」，而不是只有一句 pass。
             test_runs = report.test_runs;
@@ -1221,6 +1229,7 @@ pub fn verdict_from_artifact(path: &Path, required: &[EvidenceKind]) -> Verdict 
         pass: issues.is_empty(),
         issues,
         test_runs,
+        notes,
     }
 }
 
