@@ -2,7 +2,7 @@
 
 为星型多 Agent harness 写的 Rust harness kernel：引擎 + wire 层 + 工具/权限/沙箱 + 会话 + 总线/journal + CLI/配置。设计文档（中文）见本仓库 `docs/design.md`。
 
-**Metrics** — src 51 files / 16606 lines · tests 9 files / 3321 lines · 239 tests (lib 187 + bin 4 + integration 48)
+**Metrics** — src 51 files / 16762 lines · tests 9 files / 3381 lines · 243 tests (lib 190 + bin 4 + integration 49)
 
 Status: M0-M4 complete + 二期开工（`ApproveMode::Bus`、SA 判定含证据核对、bus 停车补投与自动重连、journal 快照/截断与在线投影、多任务 task 命名空间、openai-responses wire、worker 池、预算按 token 结算的价格表、journal 轮转的默认策略、按类型核对的证据与 stage 要求表、审批请求的 at-least-once 投递与按 req 幂等、验证 FAIL 回跳写者、bash `output_path` 交出可核对的 test_log）——这批改动 2026-11-04 走完真端点联跑（`pipeline complete`；那两轮联跑抓出并修掉三个「测试全绿但跑不起来」的缺陷，见 docs/design.md §9.32 / §9.33）。fmt / clippy `-D warnings` / test 三闸门全绿（人工执行：本仓库不挂 CI）。上面那行数字由 `tests/discipline.rs` 与源码树对照校验：改完代码不更新它，闸门就红。
 
@@ -109,13 +109,24 @@ Ask——审批不能放宽角色的写范围。`test_log` 的汇总表认 cargo
 工件）与返工铃（`ref.rework.last_test`，`null` 明说「你上关什么都没数出来」）。预算停损刻意
 不读它：那本账记的是钱。
 
+证据的**路径形状**在写侧就把住（§9.39）：`serve` 把答案折进工件时，路径 token 会在全角/半角括号、
+书名号、引号处切断——`` `…/unittest.log`（其内含汇总行） `` 这种写法过去会被当成一个不存在的文件名，
+把真的测试判成 `evidence missing`。切掉不是静默宽容：`evidence_warnings` 跟着工件进
+`Verdict.notes` 落 journal，SA 现场打印 `note: worker-side shape warning: …`。判定端另留了一层兜底
+（`resolve_claim`：字面路径不存在时只认「切掉括注后是个文件」的前缀，不认目录）。
+
 ## Configuration
 
 三文件表：`~/.kestrel/providers.toml`（provider/key/费率 的唯一归属地，key 三态 `literal`/`$ENV`/`!cmd`）→ `harness/roles/<role>.toml`（权限/沙箱/提示词/后端/审批人；路径支持 `$VAR`、`$VAR:-fallback`，要再接子路径就写 `${VAR:-fallback}/sub`——裸写时 `:-` 拥有整条后缀）→ `<project>/.kestrel/kestrel.toml`（仅权限引用；**禁止定义 providers**）。优先级 runtime > role > project > user > env（详见 design.md §6）。预算上限不在 role 里声明——由 SA 的 journal 账本执行；单价跟着 provider 住，同一条「唯一归属地」纪律。
 
 验证关判 FAIL 时，铃**回跳给写者**（`ref.rework` 带着失败原因与那份判定工件的路径），而不是
 再派一次验证者——QA 没有写范围，再给它一颗铃只会得到同一个结论。回跳有额度（`max_reworks`，
-缺省 2），用尽就显式失败，不静默放宽验收标准；「铃丢了」不走这条路，那是投递问题，原地重派。
+缺省 2），用尽就显式失败，不静默放宽验收标准。
+
+但**先归因再路由**（§9.40）：`empty result` / `worker aborted` / `worker stop:` 这类「验证者自己那一
+回合没交出东西」的 FAIL，说的是 QA 的哑火，不是产物的缺陷——那种情况**原地重派 QA、不扣返工额度**。
+只有产物类的 FAIL（缺文件、类型不符、要求没满足）才回跳写者。把 QA 的哑火算到 RD 头上，实测换来
+两轮辩护 + 撞上限。
 
 工具审批按同一条优先级：`--approve all|none|bus` > role 的 `[permissions].approve` >
 `none`（拒绝）。`bus` 是反向请求：worker 把审批请求（带 tool + args + 可判定的命令）

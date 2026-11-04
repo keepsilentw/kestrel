@@ -1,18 +1,19 @@
 # kestrel 设计文档：Rust harness kernel
 
-> 状态：M0-M4 已实现并通过测试；§10 二期已落地十三项 + 2026-11-04 走完的四格（§9.32–§9.35）——`ApproveMode::Bus`、
+> 状态：M0-M4 已实现并通过测试；§10 二期已落地十三项 + 2026-11-04 走完的九格（§9.32–§9.40）——`ApproveMode::Bus`、
 > 「判定 = 工件 + 证据文件」、bus 重连重放（停车补投 + 客户端重连）、journal 快照/截断语义、
 > 多任务并行（task 命名空间 + 前缀寻址）、openai-responses wire（**真端点未实测**，§9.24）、
 > journal 投影增量化与轮转触发（§9.25）、worker 池（一 task 一引擎一树，§9.26）、
 > 预算价格表（usd 按 token 结算，§9.27）、journal 轮转的默认策略（活文件有界，§9.28）、
 > 证据的类型化（按类型核对 + stage 要求齐全，§9.29）、审批批复的可靠投递（at-least-once + 幂等，§9.30）、批复回执与过期审批不谎报生效（§9.31）。
 > 2026-11-04：role 路径的只读岛缺陷与「跑不起来的 runner」（§9.32）、验证 FAIL 回跳写者 + bash `output_path`
-> 交出可核对的 test_log（§9.33）、证据自己携带结论（§9.34）、结论进入投影并被读走（§9.35）。
+> 交出可核对的 test_log（§9.33）、证据自己携带结论（§9.34）、结论进入投影并被读走（§9.35）、名义钱按来源分开报
+> （§9.36–§9.37）、截断与假 FAIL（§9.38–§9.39）、FAIL 归因分成「产物的罪」与「回合的哑火」（§9.40）。
 > 质量闸门保持人工执行（本仓库不挂 CI，见 §9.19⑥）。
 > 二期十一项已于 2026-11-04 在真端点联跑中走完（`pipeline complete`，四阶段全 pass，
 > 审批请求/判定/回执各 5 条成对）；那一次联跑抓出并修掉两个「测试全绿但跑不起来」的缺陷，见 §9.32。
-> **Metrics** — src 51 files / 16606 lines · tests 9 files / 3321 lines · 239 tests (lib 187 + bin 4 + integration 48)
-> **Integration** — core_loop 5 / discipline 2 / m1_tools 9 / m2_session 6 / m4_bus 15 / m5_pool 5 / sandbox_e2e 4 / wire_anthropic 2
+> **Metrics** — src 51 files / 16762 lines · tests 9 files / 3381 lines · 243 tests (lib 190 + bin 4 + integration 49)
+> **Integration** — core_loop 5 / discipline 2 / m1_tools 9 / m2_session 6 / m4_bus 15 / m5_pool 6 / sandbox_e2e 4 / wire_anthropic 2
 > 规模已过 plan 预算（10-13k）的上沿：多出来的部分几乎都花在「取消安全」与「对账」这两条纪律上。
 > 上面两行数字由 `tests/discipline.rs::metrics_lines_match_the_tree` 对照源码树重算校验——
 > 这些计数此前在三处文档里手抄过三次、漂移过三次（§9.19），现在它是闸门不是仪式。
@@ -295,6 +296,19 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
     ④ 代价是实测出来的：这一条假 FAIL 白烧一次派发（预留 0.032 usd 名义）+ 一次返工额度 + dev 的 iteration 预算，最后以非零退出收场。「判定严格」与「判定可用」的差别就在这一类细节上：严格不能建立在字符串巧合上。
     ⑤ 没做的事：本轮修复**没能在真端点上再现场复现一次**（接下来那一轮 RD 没有再粘括注，notes 为空）。所以它是单元级钉住的（`an_annotation_glued_to_the_path_is_repaired_and_said_out_loud` 三个分支：认账、前缀不存在不认、前缀是目录不认），现场那一次是事故本身。把这件事写成「已实弹验证」是假的。
 
+39. **形状问题挪到写侧：全角括注在进工件之前就被切掉（2026-11-04，§9.38 ⑤ 那一格）**：
+    ① 根因很朴素：`path_tokens` 的切分字符表里有 ASCII 的 `(` `)`，**没有全角的 `（`**。所以 `` `…/unittest.log`（其内含汇总行） `` 一路活到判定端，被当成文件名。补上全角括号/书名号/引号一类分隔符，写侧就拿到干净路径。
+    ② 切掉不是静默宽容：`annotation_warnings` 把「原文 vs 读成的路径」写进工件的 `evidence_warnings`，SA 折进 `Verdict.notes` 落 journal 并现场打印。工件是 worker 留给 SA 的唯一物件，警告不跟着它走就只活在一个没人读的日志行里。
+    ③ 认账的**顺序**变了，读侧的 `resolve_claim`（§9.38）保留为兜底：不是所有工件都经写侧生成（手工放的、旧版写的）。两层都留着，但只有写侧那层有资格默认生效。
+    ④ 现场复现了（这点先前只能靠单测）：修完之后那一轮，RD 与 QA 依然在粘全角括注，SA 打印 `note: worker-side shape warning: evidence claim /tmp/…/unittest.log`（本轮重新读取核对）：… was read as path /tmp/…/unittest.log`，而 `dev iter1` **照样 pass**。§9.38 那种白烧一次派发的假 FAIL 没有再出现。
+    ⑤ 顺手修的一个真 bug：`notes = report.notes` 是**赋值**，把先前合并进来的写侧警告覆盖掉了——测试第一次跑就抓到（`a_worker_side_shape_warning_rides_the_verdict`）。写侧警告与读侧认账是两批来源，必须 `extend`。
+
+40. **FAIL 归因：验证者哑火不是产物的罪（2026-11-04 实测烧掉两轮预算之后）**：
+    ① §9.33 那条路由规则有一个我把两件事混在一起的错：只要验证类 stage 判 FAIL 就回跳写者。但 `review iter1: fail (empty result, worker stop: round budget exhausted)` 说的是 **QA 自己那一回合没交出东西**，产物根本没被可信地看过。回跳给 RD 之后，RD 连着两轮在替一个它改不动的东西辩护（`verdict: 2. worker stop: round budget exhausted…`），最后撞 dev 的上限，整轮非零退出。
+    ② 规则收成一句：**回合类 issue**（空结果 / abort / `worker stop:` / 没回铃）原地重派同一个 peer，**不扣返工额度**；只有**产物类 issue**（缺文件、类型不符、要求没满足）才回跳写者。归因函数是纯的（`verdict_is_about_the_turn`），单测把两侧形状都钉住。
+    ③ 为什么不反过来判（「哑火就当产物有问题」）：那等于让一次读取失败给产品定罪。也不能因为 QA 哑火就把它判过——所以是**重派**，不是**改判**。
+    ④ 还欠一层：现在的归因读的是 issue 的**文本前缀**。更稳的是给 `Verdict` 一个结构化的归因字段（`attribution: Artifact | Turn`），让判定端在生成 issue 的那一刻就标好，而不是让路由去猜措辞。这一格先按文本判，因为改判定的产出形状要动 §9.34 那套 verdict 语义，值得单独想清楚。
+
 ## 10 二期清单
 
 已落地（2026-10-28 起）：~~`ApproveMode::Bus`~~（授权表 + 超时 fail-closed + journal 审计，§9.20）、~~SA 判定升级到「工件 + 证据文件」~~（绝对路径存在性/非空核对，§9.20）、~~bus 重连重放~~（离线 session 停车补投 + 客户端自动重连；RPC 与「写入即死」的帧不重放，§9.21）、~~journal 快照/截断语义~~（检查点 + 归档段 + 崩溃安全轮转，§9.22）、~~多任务并行~~（task 命名空间三处同源 + 前缀寻址，§9.23）、~~openai-responses wire~~（第三条 v1 wire，金身 + fixture 验证，**真端点未实测**，§9.24）、~~journal 投影增量化与轮转触发~~（在线投影 = 全量重放 + 条数/字节双上限，§9.25）、~~一个引擎内真正并发地服务多个 task~~（改为「一 task 一引擎」的 worker 池，单活跃槽不动，§9.26）、~~`BudgetSpent` 的价格表~~（预留 → 结算两段式、按 token 换账单、无价退回名义值并报出来，§9.27；2026-11-03）、~~journal 轮转的**默认策略**~~（活文件 512 条 / 1 MiB 双上限、三态 CLI、生产与测试同一条 `rotate_at_boundary`，§9.28；2026-11-03）、~~证据的类型化~~（`file` / `test_log` / `diff` / `screenshot` 各自可在盘上反驳 + `--evidence-spec` 的 stage 要求，坏表硬失败，§9.29；2026-11-03）、~~审批批复的可靠投递~~（请求 at-least-once + 按 req 幂等 + 台账从 journal 播种，判定仍只一次，§9.30；2026-11-03）、~~批复到底有没有生效~~（回执 `approval_receipt` + `ApprovalAcked` 落账 + 到点撤摊，**没生效的批准不许记成生效**，§9.31；2026-11-03）。
@@ -303,4 +317,4 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
 
 2026-11-04 联跑新添的两格同日落地（§9.33）：验证类 stage 的 FAIL 回跳给写者返工（带额度 `max_reworks`、带原因 `ref.rework`、每关 iter 跨回跳不清零），bash 用 `output_path` 参数交出可核对的 `test_log`（内核把 stdout/stderr 连 `exit: ExitStatus{...}` 一起写进那个文件）。下一格因此有了明确的落点：SA 只要去读那行 `exit:`，「形状」就能升级成「结论」——现在它还只证明「这份文件是测试汇总」。
 
-新划出的边界：`nominal_usd` 的占比应当随 `providers.toml` 填写完整率下降，这条曲线本身值得盯（单价填全之后 `--max-usd` 才是真正的账单上限，名义值只作为「说不清价」的兜底存在）。2026-11-04 补一句并走完它：**只填价不够**——名义值有两个来源（没填价 / 读数不可信，§9.36），而这两个来源现在分开报了（§9.37），报账那一行直接指出下一步该做什么。证据强度这一格同日走完（§9.34），**结论也已经是状态**（§9.35）：`test_runs` 进投影、跨轮转存活，并被收尾报账与返工铃读走。清单上因此留下相关的四件：**同一份日志被多个 stage 引用时不去重**（按 stage 归位是刻意的）、**没有任何闸门把结论当输入**（停损只看钱，要不要让「测试没绿」影响放行得先定它拦的是钱还是进度）、分类账目前只到「来源」这一层——**没有细到 peer × 来源**（`nominal_by_reason` 只按来源合计，看不出「哪个 peer 说不清」，那要改的是这张表的 key 形状）、以及 §9.38 那个认账规则仍然是**读侧补救**——更好的位置是写侧：`serve` 在把 `EVIDENCE` 行折进工件时就校验路径形状，粘了括注当场回灌一句让 worker 自己改，而不是等 SA 在判定那端猜一次字符边界。
+新划出的边界：`nominal_usd` 的占比应当随 `providers.toml` 填写完整率下降，这条曲线本身值得盯（单价填全之后 `--max-usd` 才是真正的账单上限，名义值只作为「说不清价」的兜底存在）。2026-11-04 补一句并走完它：**只填价不够**——名义值有两个来源（没填价 / 读数不可信，§9.36），而这两个来源现在分开报了（§9.37），报账那一行直接指出下一步该做什么。证据强度这一格同日走完（§9.34），**结论也已经是状态**（§9.35）：`test_runs` 进投影、跨轮转存活，并被收尾报账与返工铃读走。形状校验也已挪到写侧（§9.39，`path_tokens` 认得全角括号 + `evidence_warnings` 跟着工件走），读侧的 `resolve_claim` 退成兜底。清单上因此留下相关的四件：**同一份日志被多个 stage 引用时不去重**（按 stage 归位是刻意的）、**没有任何闸门把结论当输入**（停损只看钱，要不要让「测试没绿」影响放行得先定它拦的是钱还是进度）、分类账只到「来源」这一层——**没有细到 peer × 来源**（`nominal_by_reason` 看不出「哪个 peer 说不清」，要改的是这张表的 key 形状）、以及 §9.40 的 FAIL 归因现在读的是 issue 的**文本前缀**——稳的做法是让判定端在生成 issue 那一刻就标好 `attribution: Artifact | Turn`，而不是让路由去猜措辞。

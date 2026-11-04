@@ -7,8 +7,8 @@
 
 ## 1. 自动化测试基线（cargo test）
 
-**Metrics** — src 51 files / 16606 lines · tests 9 files / 3321 lines · 239 tests (lib 187 + bin 4 + integration 48)
-**Integration** — core_loop 5 / discipline 2 / m1_tools 9 / m2_session 6 / m4_bus 15 / m5_pool 5 / sandbox_e2e 4 / wire_anthropic 2
+**Metrics** — src 51 files / 16762 lines · tests 9 files / 3381 lines · 243 tests (lib 190 + bin 4 + integration 49)
+**Integration** — core_loop 5 / discipline 2 / m1_tools 9 / m2_session 6 / m4_bus 15 / m5_pool 6 / sandbox_e2e 4 / wire_anthropic 2
 
 | 组 | 覆盖 |
 |---|---|
@@ -659,3 +659,55 @@ by a verifier that cannot fix the artifact itself
 **顺带修的文档账**：§19–§23 的编号此前被我插错位置（第二轮那节落到文件末尾、§22 空号），本轮按物理
 顺序重编并在 §23 留下说明；§23 结尾那句「`exit:` 还没读」也改成「当时如此，随后由 §19 走完」，
 不把它改写成好像早就做完的样子。
+
+## 25. 2026-11-04 第九、十轮联跑：写侧把住路径形状，以及一次归因错误付出的两轮预算
+
+### 25.1 第九轮：写侧修复生效，但暴露了路由的归因错误
+
+§9.39 落地（`path_tokens` 认得全角括号 + `evidence_warnings` 进工件）后跑一轮。dev iter1 的现场：
+
+```
+[sa] dev iter1: note: worker-side shape warning: evidence claim /tmp/…/README.md`（API was read as path /tmp/…/README.md
+[sa] dev iter1: note: worker-side shape warning: evidence claim /tmp/…/unittest.log`（测试输出落盘：`Ran was read as path /tmp/…/unittest.log
+[sa] dev iter1: pass
+```
+
+RD 依然在粘全角括注（这是模型的真实习惯，不是我构造出来的），但**这一关过了**——§9.38 那种白烧一次
+派发的假 FAIL 没有重现。写侧修复由此从「只有单测」升级为「现场见过」。
+
+同一轮后半段露出我自己的一个错判：
+
+```
+[sa] review iter1: fail (empty result, worker stop: round budget exhausted) -> rework by harness-rd (1 credit(s) left)
+[sa] dev iter2: fail (verdict: 2. `worker stop: round budget exhausted`…) -> re-dispatch
+[sa] dev iter3: fail (verdict: DONE: 第三次收到同一份返工单…) -> re-dispatch
+Error: [sa] iteration cap reached for Dev — 1 of those iterations were rework dispatches asked for by a verifier…
+```
+
+`empty result` 是 **QA 那一回合没交出东西**，产物根本没被可信地看过。我那条「验证 FAIL 就回跳写者」
+把它当成产物的罪，于是 RD 花两轮替一个它改不动的东西辩护，最后撞 dev 的上限。这就是 §9.40：先归因
+（回合类 issue vs 产物类 issue），再决定路由，回合类**原地重派、不扣返工额度**。
+
+### 25.2 第十轮：归因修完之后，一轮干净的收敛
+
+| 检查 | 实测 |
+|---|---|
+| 阶段 | dev iter1 pass → review pass → test pass → build pass → `pipeline complete`，4 颗门铃 |
+| 写侧认账 | test iter1 打出两条 `note: worker-side shape warning: evidence claim … was read as path …`，而这一关照样 pass |
+| 结论 | 四关各打印 `test log … exit 0, ran 22, 22 passed / 0 failed`；收尾四行 `test conclusion … green` |
+| 报账 | `ledger total: 2.0000 usd, of which 2.0000 nominal (no rate 2.0000)` —— §9.37 的分类账现场第二次露面，这次是 `no rate`（本轮没带费率表），与 §22 那次的 `under-reported` 是两种不同的下一步 |
+
+**归因修复本身没在现场复现**：第十轮 QA 没有哑火，所以那条新分支只有单元覆盖
+（`a_broken_turn_is_not_evidence_about_the_artifact` 钉住两侧形状）。这一句必须留着，免得读的人以为
+「跑过了就是验证过了」。
+
+**闸门**：`cargo fmt --check` / `cargo clippy --all-targets -- -D warnings` / `cargo test` 实跑全绿，
+243 tests（lib 190 + bin 4 + integration 49）。本轮新增 3 项：
+`a_full_width_annotation_is_cut_at_the_write_side`（写侧切 + 报警，且散文里的括号不报警）、
+`a_glued_annotation_is_cut_before_it_reaches_the_artifact`（m5_pool：真 worker 把工件写成干净路径 +
+带 `evidence_warnings`）、`a_worker_side_shape_warning_rides_the_verdict`（写侧警告跟着判定落账，
+并且**顺带抓到一个真 bug**：`notes = report.notes` 是赋值，会覆盖掉先合并进来的写侧警告，改成 `extend`）。
+`**Metrics**` / `**Integration**` 各被拦红一次并回写（lib 187→190，m5_pool 5→6）。
+
+**账本形状上没做**：归因现在读 issue 的文本前缀；稳的做法是让判定端在生成 issue 那一刻就标好
+`attribution: Artifact | Turn`（design §10 已列为下一格）。
