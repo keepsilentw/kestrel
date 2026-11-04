@@ -11,7 +11,7 @@
 > 质量闸门保持人工执行（本仓库不挂 CI，见 §9.19⑥）。
 > 二期十一项已于 2026-11-04 在真端点联跑中走完（`pipeline complete`，四阶段全 pass，
 > 审批请求/判定/回执各 5 条成对）；那一次联跑抓出并修掉两个「测试全绿但跑不起来」的缺陷，见 §9.32。
-> **Metrics** — src 51 files / 16485 lines · tests 9 files / 3319 lines · 238 tests (lib 186 + bin 4 + integration 48)
+> **Metrics** — src 51 files / 16606 lines · tests 9 files / 3321 lines · 239 tests (lib 187 + bin 4 + integration 48)
 > **Integration** — core_loop 5 / discipline 2 / m1_tools 9 / m2_session 6 / m4_bus 15 / m5_pool 5 / sandbox_e2e 4 / wire_anthropic 2
 > 规模已过 plan 预算（10-13k）的上沿：多出来的部分几乎都花在「取消安全」与「对账」这两条纪律上。
 > 上面两行数字由 `tests/discipline.rs::metrics_lines_match_the_tree` 对照源码树重算校验——
@@ -256,7 +256,7 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
     ⑤ `test_log` 的汇总表补上标准库 unittest 的两种汇总行（`Ran N tests` / `FAILED (failures=…)`）：demo 的 RD 只能用它（沙箱无网络 ⇒ 装不了 pytest），而那张表原先只认 cargo / pytest / jest / maven，一份真跑过的日志会被判成「不是测试日志」。跑失败也是跑过——结论归判定词，形状归类型（§9.29）。
     ⑥ demo 侧把 `dev` 那格改成 `["file", "test_log"]`：写者必须自己交出「真跑过测试」的盘上形状，验证者才有东西可反驳。
 
-    ⑦ 强制 `review: ["diff"]` 那一轮（§19）实测出一个新发现：**返工派发会吃掉写者自己的 iter 预算**。dev 从 iter1（通过）被回跳到 iter2、iter3，第三次直接撞 `iteration cap reached for Dev`——那句话把真实原因藏了起来，读的人会以为「模型又不稳」，而该改的是那条永不满足的验收标准。上限现在会说明它**怎么**撞上的（几次 iter 是验证者要来的返工），因为「上限到了」和「上限为什么到了」是两件需要分开说的事。
+    ⑦ 强制 `review: ["diff"]` 那一轮（smoke §23.2）实测出一个新发现：**返工派发会吃掉写者自己的 iter 预算**。dev 从 iter1（通过）被回跳到 iter2、iter3，第三次直接撞 `iteration cap reached for Dev`——那句话把真实原因藏了起来，读的人会以为「模型又不稳」，而该改的是那条永不满足的验收标准。上限现在会说明它**怎么**撞上的（几次 iter 是验证者要来的返工），因为「上限到了」和「上限为什么到了」是两件需要分开说的事。
 
 34. **证据自己携带结论：`test_log` 从「有形状」走到「跑没跑过」（2026-11-04，§9.33 留下的那一格）**：
     ① 读的是已经在那儿的东西。`output_path` 落的日志第二行就是内核写的 `exit: ExitStatus { code: Some(0), signal: None }`，各 runner 的汇总行在文件尾——所以头尾各读一段（`SPAN_BYTES`），不把整份日志吃进内存。计数按三家形状取：`N passed` / `N failed`（cargo、pytest）、`Ran N tests`（unittest）、`failures=` / `errors=`（unittest 的失败汇总），失败侧取总和：这一层的用途是**反驳**，漏报比误报贵。
@@ -265,7 +265,7 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
     ④ 结论落 journal：`Verdict` 加 `test_runs: Vec<TestRun>{path, exit_code, exit_signal, passed, failed, ran}`（`#[serde(default)]`，**没有该字段的老行仍然必须能重放**——不变式 5 不能因为加一格就读不了历史，`verdict_test_runs_roundtrip_and_old_lines_still_replay` 同时钉这两件事）。SA 判定时把每份日志的结论打到 stdout：`[sa] dev iter2: test log … -> exit 0, ran 25, 25 passed / 0 failed`，人读日志就知道这一关的结论是从哪份文件来的。
     ⑤ 没做的：`test_runs` 只随 `result_committed` 落账，**不参与投影**（预算停损、丢铃巡检、崩溃对账都不看它），也不跨 stage 去重同一份日志的引用。这两件要等「结论成为状态」的那天再说——现在它是证据，不是账。
 
-    ⑥ 真端点验证（smoke §20）：收敛那一轮四关都打印 `test log … -> exit 0, ran 32, 32 passed / 0 failed`，`result_committed` 里带着同样的数；前面一轮暴露的是**档位**问题（RD 把日志写进 `evidence:` 那行，档位是 `file`，于是 `test_log` 那一格没人顶），不是这层误判——修在提示词（要交测试日志必须另起一行 `EVIDENCE test_log <abs>`）。教训归一句：SA 只核对文件**声称的那种东西**，所以「声明档位」这件事必须是命令式的，不能是可选的。
+    ⑥ 真端点验证（smoke §19）：收敛那一轮四关都打印 `test log … -> exit 0, ran 32, 32 passed / 0 failed`，`result_committed` 里带着同样的数；前面一轮暴露的是**档位**问题（RD 把日志写进 `evidence:` 那行，档位是 `file`，于是 `test_log` 那一格没人顶），不是这层误判——修在提示词（要交测试日志必须另起一行 `EVIDENCE test_log <abs>`）。教训归一句：SA 只核对文件**声称的那种东西**，所以「声明档位」这件事必须是命令式的，不能是可选的。
 
 35. **结论成为状态：`test_runs` 进投影（2026-11-04，§9.34 ⑤ 自己点出来的那一格）**：
     ① 形状：`StateSnapshot.tests: Vec<StageTest>{task, stage, runs}`，按 `(task, stage)` **覆盖**而不是追加。这不是「省空间」的美化，而是语义：投影回答的是「现在这一关的测试结论是什么」，历史本来就活在一条条形如 `result_committed` 的记录里。一份什么都没数出来的提交会把这一关的结论**撤掉**——留着上一轮那个更好看的数字，就是让状态说谎（本轮实测：dev 那次 `round budget exhausted` 的提交带着空 runs，投影里最终只有 iter2 那份 27/0）。
@@ -286,7 +286,14 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
     ① 来源是两个而不是一个：`BudgetSpent{priced:false}` 只可能是**没有价**（预留被记成名义的那条路按构造就是查不到费率，所以不需要新字段），`BudgetSettled{priced:false}` 说的是**有价但这个读数顶不起账单**。老记录没有来源字段：读出来按 `NoRate` 处理，不猜成「少报」，也不当成 0。
     ② 形状：`NominalReason{NoRate, UnderReported}` + 投影里的 `nominal_by_reason`（**总额仍在 `nominal_usd`**，分类是加上去的一本账，不是替换——迁移期两份必须加起来一致，这条由测试直接断言，否则分类只是装饰）。归零即删键：报账不会写出「under-reported 0.0000」这种空话。
     ③ 跨轮转存活：`Checkpoint.nominal_by_reason`（`#[serde(default)]`），`nominal_money_says_which_reason_it_is` 里顺手验了捕获 → JSON 往返 → 重放等于在线。截断之后如果只剩一个总数，「说不清」就真的说不清了。
-    ④ 现场那一行（带费率表的联跑，smoke §24）：`ledger total: 0.1167 usd, of which 0.0960 nominal (under-reported 0.0960)`。看账的人因此分得清下一步该做什么：`no rate` 去补价，`under-reported` 去修读数（或换端点）——这两种「不省钱」的动作完全不同。
+    ④ 现场那一行（带费率表的联跑，smoke §22）：`ledger total: 0.1167 usd, of which 0.0960 nominal (under-reported 0.0960)`。看账的人因此分得清下一步该做什么：`no rate` 去补价，`under-reported` 去修读数（或换端点）——这两种「不省钱」的动作完全不同。
+
+38. **假 FAIL：括注被当成文件名的一部分（2026-11-04 强制轮转那一轮现场抓出）**：
+    ① 现象：`review iter1: fail (evidence missing: /tmp/kestrel-worktree/unittest.log（其内含汇总行)` → 路由成一次返工 → `iteration cap reached for Dev — 1 of those iterations were rework dispatches…`。那份日志明明在盘上、`exit 0`、76 例全过。根因是 worker 把中文括注直接粘在路径后面没有空格，抽取器把整串当成路径；「missing」在那一刻是**准确**的，也是**错的**。
+    ② 为什么不静默宽容：只改提示词（「路径单独写完，说明写在别处」）是对的，但救不了已经写坏的声明；而把任意可疑字符都剥掉会把 `x(1).log` 这类真文件名也咬掉。所以认账条件收到三条：字面路径**不存在**才试前缀；前缀必须是**文件**（不许认成目录，那是拿「声明写得烂」换一次假通过）；认下来之后**仍按声称的类型核对**（该过 `test_log` 就得过）。
+    ③ 认了要说出来，而且要落账：`EvidenceReport.notes` → `Verdict.notes`（`#[serde(default)]`，老 journal 行照旧可读），SA 现场打印 `note: evidence X resolved to Y — the trailing annotation is not part of the path`。理由与 §9.34 同一一条：复现一次判定要连「当初把哪句声明认成了哪个文件」一起复现，不然真相源里只留下一个结果，不留下得出它的读法。
+    ④ 代价是实测出来的：这一条假 FAIL 白烧一次派发（预留 0.032 usd 名义）+ 一次返工额度 + dev 的 iteration 预算，最后以非零退出收场。「判定严格」与「判定可用」的差别就在这一类细节上：严格不能建立在字符串巧合上。
+    ⑤ 没做的事：本轮修复**没能在真端点上再现场复现一次**（接下来那一轮 RD 没有再粘括注，notes 为空）。所以它是单元级钉住的（`an_annotation_glued_to_the_path_is_repaired_and_said_out_loud` 三个分支：认账、前缀不存在不认、前缀是目录不认），现场那一次是事故本身。把这件事写成「已实弹验证」是假的。
 
 ## 10 二期清单
 
@@ -296,4 +303,4 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
 
 2026-11-04 联跑新添的两格同日落地（§9.33）：验证类 stage 的 FAIL 回跳给写者返工（带额度 `max_reworks`、带原因 `ref.rework`、每关 iter 跨回跳不清零），bash 用 `output_path` 参数交出可核对的 `test_log`（内核把 stdout/stderr 连 `exit: ExitStatus{...}` 一起写进那个文件）。下一格因此有了明确的落点：SA 只要去读那行 `exit:`，「形状」就能升级成「结论」——现在它还只证明「这份文件是测试汇总」。
 
-新划出的边界：`nominal_usd` 的占比应当随 `providers.toml` 填写完整率下降，这条曲线本身值得盯（单价填全之后 `--max-usd` 才是真正的账单上限，名义值只作为「说不清价」的兜底存在）。2026-11-04 补一句并走完它：**只填价不够**——名义值有两个来源（没填价 / 读数不可信，§9.36），而这两个来源现在分开报了（§9.37），报账那一行直接指出下一步该做什么。证据强度这一格同日走完（§9.34），**结论也已经是状态**（§9.35）：`test_runs` 进投影、跨轮转存活，并被收尾报账与返工铃读走。清单上因此留下相关的三件：**同一份日志被多个 stage 引用时不去重**（按 stage 归位是刻意的）、**没有任何闸门把结论当输入**（停损只看钱，要不要让「测试没绿」影响放行得先定它拦的是钱还是进度）、以及分类账目前只到「来源」这一层——**没有细到 peer × 来源**（`nominal_by_reason` 只按来源合计，看不出「哪个 peer 说不清」，那要改的是这张表的 key 形状）。
+新划出的边界：`nominal_usd` 的占比应当随 `providers.toml` 填写完整率下降，这条曲线本身值得盯（单价填全之后 `--max-usd` 才是真正的账单上限，名义值只作为「说不清价」的兜底存在）。2026-11-04 补一句并走完它：**只填价不够**——名义值有两个来源（没填价 / 读数不可信，§9.36），而这两个来源现在分开报了（§9.37），报账那一行直接指出下一步该做什么。证据强度这一格同日走完（§9.34），**结论也已经是状态**（§9.35）：`test_runs` 进投影、跨轮转存活，并被收尾报账与返工铃读走。清单上因此留下相关的四件：**同一份日志被多个 stage 引用时不去重**（按 stage 归位是刻意的）、**没有任何闸门把结论当输入**（停损只看钱，要不要让「测试没绿」影响放行得先定它拦的是钱还是进度）、分类账目前只到「来源」这一层——**没有细到 peer × 来源**（`nominal_by_reason` 只按来源合计，看不出「哪个 peer 说不清」，那要改的是这张表的 key 形状）、以及 §9.38 那个认账规则仍然是**读侧补救**——更好的位置是写侧：`serve` 在把 `EVIDENCE` 行折进工件时就校验路径形状，粘了括注当场回灌一句让 worker 自己改，而不是等 SA 在判定那端猜一次字符边界。

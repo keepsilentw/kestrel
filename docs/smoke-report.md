@@ -7,7 +7,7 @@
 
 ## 1. 自动化测试基线（cargo test）
 
-**Metrics** — src 51 files / 16485 lines · tests 9 files / 3319 lines · 238 tests (lib 186 + bin 4 + integration 48)
+**Metrics** — src 51 files / 16606 lines · tests 9 files / 3321 lines · 239 tests (lib 187 + bin 4 + integration 48)
 **Integration** — core_loop 5 / discipline 2 / m1_tools 9 / m2_session 6 / m4_bus 15 / m5_pool 5 / sandbox_e2e 4 / wire_anthropic 2
 
 | 组 | 覆盖 |
@@ -437,7 +437,7 @@ journal 与工件会互相印证一个假结论。现在到点即撤摊并广播
 `test_log` 这类证据在 demo 里落不成盘。dev iter1 那次「轮预算耗尽无判定词」是模型行为，与 §7 的
 遗留说法一致。
 
-## 20. 2026-11-04 第三轮联跑：证据带上结论，以及一次「声明档位」的翻车
+## 19. 2026-11-04 第三轮联跑：证据带上结论，以及一次「声明档位」的翻车
 
 §9.34 落地后（`read_test_run` 读 `exit:` 行 + 数 `N passed`/`N failed`/`failures=`，
 `Verdict.test_runs` 随判定落 journal），用最终二进制连跑两轮。
@@ -472,7 +472,7 @@ journal 行没有该字段仍可读，缺席读成空而不是 0）、以及上�
 key 紧跟着的那个值（剥 `:`/`=`/空白与 `Some(`），读不到就是 `None`。这行代码的 bug 恰好是
 这一格最反对的那类错误：把缺席当结论。
 
-## 21. 2026-11-04 第四轮联跑：结论进了投影，并且有人读它
+## 20. 2026-11-04 第四轮联跑：结论进了投影，并且有人读它
 
 §9.35（`StateSnapshot.tests` + `Checkpoint.tests` + 两个读者）落地后，再跑一轮真端点。
 
@@ -482,7 +482,7 @@ key 紧跟着的那个值（剥 `:`/`=`/空白与 `Some(`），读不到就是 `
 | 落账的形状 | 5 条 `result_committed` 里，**失败那条 `test_runs` 是空的**（`no PASS/DONE/FAIL verdict…`，什么都没数出来），另外四条各带 `{passed: 27, failed: 0, exit_code: 0}` |
 | 投影的覆盖语义 | 收尾只打印 **4** 行结论而不是 5 行：dev 那关被 iter2 那份通过覆盖掉了 iter1 那份空结论——状态回答「现在是什么」，历史仍在那五条记录里 |
 | 读者之一（报账） | `[sa] test conclusion [demo] Dev: green — exit 0, ran 27, 27 passed / 0 failed`（Review/Test/Build 同）；读的是 `journal.projection()`，与预算停损同一份状态 |
-| 读者之二（返工铃） | `ref.rework.last_test = {green, runs}`；本轮没走到返工（四关一次过），所以这一条是**单元级**验证（`the_test_conclusion_is_state_not_just_payload` + §19.2 那轮的实弹路由），不假装现场发生过 |
+| 读者之二（返工铃） | `ref.rework.last_test = {green, runs}`；本轮没走到返工（四关一次过），所以这一条是**单元级**验证（`the_test_conclusion_is_state_not_just_payload` + §23.2 那轮的实弹路由），不假装现场发生过 |
 | 独立复核 | `python3 -m unittest test_lru_cache` → `Ran 27 tests in 0.002s / OK`，与投影里那 27/0 一致 |
 
 **闸门**：`cargo fmt --check` / `cargo clippy --all-targets -- -D warnings` / `cargo test` 实跑全绿，
@@ -493,7 +493,7 @@ key 紧跟着的那个值（剥 `:`/`=`/空白与 `Some(`），读不到就是 `
 **轮转没在现场被触发**（33 条 < 默认 512），检查点带结论这件事只有单元级覆盖（构造检查点 →
 JSON 往返 → 重放等于在线）。要现场验它得跑到 512 条记录，那是另一轮的量级，不在今天这一格内。
 
-## 23. 2026-11-04 第五轮联跑（带费率表）：账单与「顶不起账单的读数」第一次同场分岔
+## 21. 2026-11-04 第五轮联跑（带费率表）：账单与「顶不起账单的读数」第一次同场分岔
 
 前置：`--prices` 指向一份**仓库外**的实验件（provider/model 与 `cost` 齐全；单价是任意取整的
 合成数字 `input 0.2 / output 0.8` per MTok，**不是任何市场报价**；`key` 是占位符——SA 只从这里
@@ -524,9 +524,9 @@ JSON 往返 → 重放等于在线）。要现场验它得跑到 512 条记录�
 **没做的事**：没有改动任何人的 `~/.kestrel/providers.toml`（单价跟着 provider 住，那是用户的配置层）；
 费率实验件写在仓库外，跑完即删，docs 里留下它的形状与那句「单价是合成数字，不是市场报价」。
 
-## 24. 2026-11-04 第六轮联跑（带费率表）：说不清的钱，现在说得出为什么说不清
+## 22. 2026-11-04 第六轮联跑（带费率表）：说不清的钱，现在说得出为什么说不清
 
-§9.37（`NominalReason` + 投影里的 `nominal_by_reason` + 检查点携带）落地后再跑一轮，费率实验件同 §23
+§9.37（`NominalReason` + 投影里的 `nominal_by_reason` + 检查点携带）落地后再跑一轮，费率实验件同 §21
 （仓库外、合成单价、跑完即删）。
 
 | 检查 | 实测 |
@@ -547,18 +547,21 @@ JSON 往返 → 重放等于在线）。要现场验它得跑到 512 条记录�
 
 **闸门**：`cargo fmt --check` / `cargo clippy --all-targets -- -D warnings` / `cargo test` 实跑全绿，
 238 tests（lib 186 + bin 4 + integration 48）。新增 1 项 `nominal_money_says_which_reason_it_is`
-（两个来源分开、与总额一致、老行按 NoRate、检查点 JSON 往返后重放相等），并把 §23 那条
+（两个来源分开、与总额一致、老行按 NoRate、检查点 JSON 往返后重放相等），并把 §21 那条
 `booking_a_priced_reservation_back_as_nominal_keeps_the_money` 升级为带来源标记的形状。
 
 **没做**：分类只到「来源」这一层，还没细到 **peer × 来源**（看不出是哪个 peer 说不清，本轮靠逐次派发的
 打印看得出来）；以及**没有把费率实验件放进仓库**——单价跟着 provider 住，仓库里不该有一份假价。
 
-## 19. 2026-11-04 第二轮联跑：`test_log` 真的可交了，FAIL 路由真的会回跳
+## 23. 2026-11-04 第二轮联跑：`test_log` 第一次可交，FAIL 路由第一次回跳
+
+> 编号说明：本节记的是**第二轮**联跑，物理位置却排在最后——是我给它选错了插入锚点，不是内容
+> 后补。按发生顺序它应排在 §18 与 §19 之间；内容一字未改，编号与内部小节号已按物理位置改成 23。
 
 §18 之后接着落地 design §9.33（bash `output_path` + 验证 FAIL 回跳写者 + unittest 汇总行）。
 这一节的规矩和 §18 一样：**只写盘上真发生过的**。两轮，各证一件事。
 
-### 19.1 第一轮：默认证据表把 `dev` 提到 `file+test_log`
+### 23.1 第一轮：默认证据表把 `dev` 提到 `file+test_log`
 
 `roles/sa.evidence.json` 从此要求写者交出「真跑过测试」的盘上形状。开工首行即打印
 `evidence requirements: build:file, dev:file+test_log, review:file, test:file`。
@@ -570,7 +573,7 @@ JSON 往返 → 重放等于在线）。要现场验它得跑到 512 条记录�
 | 按类型核对 | dev 工件的 `evidence` 里两份都是 `kind: "test_log"` 且核对通过（`Ran 25 tests in 0.004s / OK` 命中新加的 `Ran ` 标记；`4 passed.` 命中既有的 `passed`）。**没有 shell 重定向参与**：RD 试 `> log` 那类命令仍会被 tokenizer 拒，这次它走的是工具参数 |
 | 独立复核 | `python3 -m unittest discover -s /tmp/kestrel-worktree` → `Ran 25 tests / OK`，与工件声明一致 |
 
-### 19.2 第二轮：故意让验证过不了，看路由往哪儿派
+### 23.2 第二轮：故意让验证过不了，看路由往哪儿派
 
 临时把 review 提到 `["diff"]`（`KESTREL_DEMO_EVIDENCE_SPEC=<tmp>/kestrel-evidence-diff.json ./harness/run-demo.sh`，
 表内容 `{"dev":["file","test_log"],"review":["diff"],"test":["file"],"build":["file"]}`，写在 repo 外：
@@ -599,11 +602,60 @@ JSON 往返 → 重放等于在线）。要现场验它得跑到 512 条记录�
 `**Integration**` 两行今天被 `discipline` 拦红三次（加测试、再加测试、改完源码行数变了），每次都照它
 给的数字回写——这道闸门拦的是写代码的人自己。
 
-**用最终二进制在干净工作树上复跑了一遍**（19.1/19.2 跑的是改动过程中的构建）：dev iter1 fail（8 回合内
+**用最终二进制在干净工作树上复跑了一遍**（23.1/23.2 跑的是改动过程中的构建）：dev iter1 fail（8 回合内
 无判定词）→ dev iter2 pass → review / test / build 各 iter1 pass → `pipeline complete`；journal 42 条
 （`stage_written`/`bell_sent`/`budget_spent`/`bell_received`/`result_committed`/`usage_reported` 各 5，审批
 三件套各 4），RD 工件的 `test_log` 那一格核对通过，盘上 `unittest.log` 写的是 `Ran 37 tests in 0.003s /
 OK`——我独立重跑 `unittest discover` 得到同一句，不是引用谁的输出。
 
-**仍没做**：`exit:` 那一行已经在日志里了，SA 还没有去读它——`test_log` 仍然只证明形状、不证明结论
-（design §10 那条边界段落，现在有了明确的下一步落点）。
+**当时的下一步**：`exit:` 那一行已经在日志里了，SA 还没有去读它——`test_log` 只证明形状、不证明结论。
+这句话在本节写下时是实情，随后由 §19（第三轮）走完：现在 `read_test_run` 会读那行 `exit:`，
+跑挂的日志能顶回那句 `DONE`，计数随判定落账（design §9.34）。留在这里是因为它就是当时的状态，
+不要把它改成好像早就做完的样子。
+
+## 24. 2026-11-04 第七、八轮联跑：轮转第一次在现场发生，以及一个白烧预算的假 FAIL
+
+把 §9.28 的默认阈值临时压到 24 条（`KESTREL_DEMO_ROTATE_AFTER=24`），目的是让**截断这件事在真端点上
+真的发生一次**——在此之前，轮转路径只有合成数据单测覆盖过。带费率表（同 §21 那份仓库外的合成单价件）。
+
+### 24.1 第七轮：现场抓出一个假 FAIL
+
+轮转确实发生了（`journal rotated: 15 record(s) archived into harness/journal.seg0-15.jsonl, live file
+now 16 record(s)`），但 pipeline 最终非零退出：
+
+```
+review iter1: fail (evidence missing: /tmp/kestrel-worktree/unittest.log（其内含汇总行) -> rework by harness-rd
+Error: [sa] iteration cap reached for Dev — 1 of those iterations were rework dispatches asked for
+by a verifier that cannot fix the artifact itself
+```
+
+那份日志在盘上、`exit 0`、76 例全过。根因是 worker 把中文括注粘在路径后面（没有空格），抽取器把整串
+当成文件名——`evidence missing` 在那一刻既准确又错误。代价实测：一次派发（0.032 usd 名义预留）
++ 一次返工额度 + dev 的 iteration 预算，最后以失败收场（design §9.38）。
+
+### 24.2 第八轮：修完之后，轮转发生在 pipeline 中间而账一分不差
+
+| 检查 | 实测 |
+|---|---|
+| 阶段 | dev iter1 pass → review pass → **test iter1 中途轮转** → test pass → build pass → `pipeline complete` |
+| 轮转位置 | 归档 15 条 / 活文件 16 条起算；段名 `journal.seg0-15.jsonl` 就是它覆盖的区间 |
+| 归档内容 | 段内 15 条：`stage_written`/`bell_sent`/`budget_spent`/`bell_received`/`usage_reported`/`budget_settled` 各 1 + 审批三件套各 3 |
+| 活文件 | 首条是 `snapshot (covers 15)`，其后 22 条含 4 条 `result_committed`（**一条不少**） |
+| 检查点带的东西 | `spent_usd {harness-rd: 0.00445}`（dev 那笔已在归档前缀里结算过）、`in_flight 0`、`reserved []` |
+| 账对得上 | `ledger total: 0.1004 usd, of which 0.0960 nominal (under-reported 0.0960)` = 0.0044（dev 按 token 算的账单）+ 3 × 0.0320（QA 三关按名义） |
+| 结论跨轮转 | 四关各打印 `test log … exit 0, ran 76, 76 passed / 0 failed`；收尾四行 `test conclusion … green` |
+
+这次折叠切在 dev 的 `result_committed` **之前**（那条落在活文件里），所以检查点里 `tests` 是空的——
+不是丢了结论：结论在活文件的那四条 `result_committed` 里，投影 = 检查点 + 活文件，收尾才打印得出四行。
+这一点先前我差点读成缺陷，是数了段内/活文件里的 `result_committed` 条数（合计 4）才确认无恙。
+
+**认账修复没能在现场复现**：第八轮 RD 没有再粘括注（四条判定的 `notes` 全为空），所以 §9.38 那个
+`resolve_claim` 目前只有单元级覆盖（`an_annotation_glued_to_the_path_is_repaired_and_said_out_loud`
+的三个分支：认账、前缀不存在不认、前缀是目录不认）。现场那一次是事故本身，不是验证。
+
+**闸门**：`cargo fmt --check` / `cargo clippy --all-targets -- -D warnings` / `cargo test` 实跑全绿，
+239 tests（lib 187 + bin 4 + integration 48）。`**Metrics**` 这次被拦红两次（分类账、认账）并回写。
+
+**顺带修的文档账**：§19–§23 的编号此前被我插错位置（第二轮那节落到文件末尾、§22 空号），本轮按物理
+顺序重编并在 §23 留下说明；§23 结尾那句「`exit:` 还没读」也改成「当时如此，随后由 §19 走完」，
+不把它改写成好像早就做完的样子。
