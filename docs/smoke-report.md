@@ -7,7 +7,7 @@
 
 ## 1. 自动化测试基线（cargo test）
 
-**Metrics** — src 51 files / 16298 lines · tests 9 files / 3319 lines · 237 tests (lib 185 + bin 4 + integration 48)
+**Metrics** — src 51 files / 16485 lines · tests 9 files / 3319 lines · 238 tests (lib 186 + bin 4 + integration 48)
 **Integration** — core_loop 5 / discipline 2 / m1_tools 9 / m2_session 6 / m4_bus 15 / m5_pool 5 / sandbox_e2e 4 / wire_anthropic 2
 
 | 组 | 覆盖 |
@@ -523,6 +523,35 @@ JSON 往返 → 重放等于在线）。要现场验它得跑到 512 条记录�
 
 **没做的事**：没有改动任何人的 `~/.kestrel/providers.toml`（单价跟着 provider 住，那是用户的配置层）；
 费率实验件写在仓库外，跑完即删，docs 里留下它的形状与那句「单价是合成数字，不是市场报价」。
+
+## 24. 2026-11-04 第六轮联跑（带费率表）：说不清的钱，现在说得出为什么说不清
+
+§9.37（`NominalReason` + 投影里的 `nominal_by_reason` + 检查点携带）落地后再跑一轮，费率实验件同 §23
+（仓库外、合成单价、跑完即删）。
+
+| 检查 | 实测 |
+|---|---|
+| 阶段 | dev iter2 pass → review / test / build 各 iter1 pass → `pipeline complete` |
+| 账单那一份 | `dev iter2: settled 0.0021 usd for 4330 in / 1578 out tokens`；`ledger harness-rd: 0.0207 usd ; tokens in 53279 / out 12507` |
+| 说不清那一份 | 三关都是 `reported 0 input tokens with 3156/2408/1587 out — … books the reservation 0.0320 usd as NOMINAL`；`ledger harness-qa: 0.0960 usd ; tokens in 0 / out 7151` |
+| **新的那一行** | `ledger total: 0.1167 usd, of which 0.0960 nominal (under-reported 0.0960)` |
+| 结论状态 | 四关各打印 `test log … -> exit 0, ran 53, 53 passed / 0 failed`（§9.35 那本账还在报） |
+
+这一行值钱在哪：`no rate` 与 `under-reported` 的下一步动作完全不同——前者是去 `providers.toml`
+补价，后者是去修读数或换端点，**补价根本不解决问题**。合并成一个数字时，读账的人只能猜；分开报之后
+不需要猜。分类与总额的一致性由 `nominal_money_says_which_reason_it_is` 直接断言
+（`sum(by_reason) == sum(nominal_usd)`），分类不是装饰。
+
+老记录的读法也钉住了：没有来源字段的 `BudgetSettled{priced:false}` 一律算 `NoRate`，**不猜成
+「少报」**——猜了就等于用今天的知识改写历史账本。
+
+**闸门**：`cargo fmt --check` / `cargo clippy --all-targets -- -D warnings` / `cargo test` 实跑全绿，
+238 tests（lib 186 + bin 4 + integration 48）。新增 1 项 `nominal_money_says_which_reason_it_is`
+（两个来源分开、与总额一致、老行按 NoRate、检查点 JSON 往返后重放相等），并把 §23 那条
+`booking_a_priced_reservation_back_as_nominal_keeps_the_money` 升级为带来源标记的形状。
+
+**没做**：分类只到「来源」这一层，还没细到 **peer × 来源**（看不出是哪个 peer 说不清，本轮靠逐次派发的
+打印看得出来）；以及**没有把费率实验件放进仓库**——单价跟着 provider 住，仓库里不该有一份假价。
 
 ## 19. 2026-11-04 第二轮联跑：`test_log` 真的可交了，FAIL 路由真的会回跳
 

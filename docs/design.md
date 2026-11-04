@@ -11,7 +11,7 @@
 > 质量闸门保持人工执行（本仓库不挂 CI，见 §9.19⑥）。
 > 二期十一项已于 2026-11-04 在真端点联跑中走完（`pipeline complete`，四阶段全 pass，
 > 审批请求/判定/回执各 5 条成对）；那一次联跑抓出并修掉两个「测试全绿但跑不起来」的缺陷，见 §9.32。
-> **Metrics** — src 51 files / 16298 lines · tests 9 files / 3319 lines · 237 tests (lib 185 + bin 4 + integration 48)
+> **Metrics** — src 51 files / 16485 lines · tests 9 files / 3319 lines · 238 tests (lib 186 + bin 4 + integration 48)
 > **Integration** — core_loop 5 / discipline 2 / m1_tools 9 / m2_session 6 / m4_bus 15 / m5_pool 5 / sandbox_e2e 4 / wire_anthropic 2
 > 规模已过 plan 预算（10-13k）的上沿：多出来的部分几乎都花在「取消安全」与「对账」这两条纪律上。
 > 上面两行数字由 `tests/discipline.rs::metrics_lines_match_the_tree` 对照源码树重算校验——
@@ -282,6 +282,12 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
     ④ 语义落在折叠层而不是打印层：`under_reports_input()`（0 输入 + 有输出；「什么都没报」不算少报，那走「没有价」那条路，不重复计一次）。records 侧 `booking_a_priced_reservation_back_as_nominal_keeps_the_money` 钉住三件事——钱按预留留在账上、名义那一份跟着涨、配对键消耗掉不被二次结算烧穿。
     ⑤ 剩下的没做：**名义值有两个来源（没填价 / 读数不可信），但在账本上合并成同一个数**。收尾只说 `of which 0.0960 nominal`，理由活在逐次派发的打印与 journal 历史里。要分开报，就得给 `BudgetSettled` 一个名义来源标记（`nominal_reason`）并让它参与折叠——那是账本形状的改变，不该顺手做。
 
+37. **名义钱有了来源分类：说不清的钱要说清为什么说不清（2026-11-04，§9.36 ⑤ 那一格）**：
+    ① 来源是两个而不是一个：`BudgetSpent{priced:false}` 只可能是**没有价**（预留被记成名义的那条路按构造就是查不到费率，所以不需要新字段），`BudgetSettled{priced:false}` 说的是**有价但这个读数顶不起账单**。老记录没有来源字段：读出来按 `NoRate` 处理，不猜成「少报」，也不当成 0。
+    ② 形状：`NominalReason{NoRate, UnderReported}` + 投影里的 `nominal_by_reason`（**总额仍在 `nominal_usd`**，分类是加上去的一本账，不是替换——迁移期两份必须加起来一致，这条由测试直接断言，否则分类只是装饰）。归零即删键：报账不会写出「under-reported 0.0000」这种空话。
+    ③ 跨轮转存活：`Checkpoint.nominal_by_reason`（`#[serde(default)]`），`nominal_money_says_which_reason_it_is` 里顺手验了捕获 → JSON 往返 → 重放等于在线。截断之后如果只剩一个总数，「说不清」就真的说不清了。
+    ④ 现场那一行（带费率表的联跑，smoke §24）：`ledger total: 0.1167 usd, of which 0.0960 nominal (under-reported 0.0960)`。看账的人因此分得清下一步该做什么：`no rate` 去补价，`under-reported` 去修读数（或换端点）——这两种「不省钱」的动作完全不同。
+
 ## 10 二期清单
 
 已落地（2026-10-28 起）：~~`ApproveMode::Bus`~~（授权表 + 超时 fail-closed + journal 审计，§9.20）、~~SA 判定升级到「工件 + 证据文件」~~（绝对路径存在性/非空核对，§9.20）、~~bus 重连重放~~（离线 session 停车补投 + 客户端自动重连；RPC 与「写入即死」的帧不重放，§9.21）、~~journal 快照/截断语义~~（检查点 + 归档段 + 崩溃安全轮转，§9.22）、~~多任务并行~~（task 命名空间三处同源 + 前缀寻址，§9.23）、~~openai-responses wire~~（第三条 v1 wire，金身 + fixture 验证，**真端点未实测**，§9.24）、~~journal 投影增量化与轮转触发~~（在线投影 = 全量重放 + 条数/字节双上限，§9.25）、~~一个引擎内真正并发地服务多个 task~~（改为「一 task 一引擎」的 worker 池，单活跃槽不动，§9.26）、~~`BudgetSpent` 的价格表~~（预留 → 结算两段式、按 token 换账单、无价退回名义值并报出来，§9.27；2026-11-03）、~~journal 轮转的**默认策略**~~（活文件 512 条 / 1 MiB 双上限、三态 CLI、生产与测试同一条 `rotate_at_boundary`，§9.28；2026-11-03）、~~证据的类型化~~（`file` / `test_log` / `diff` / `screenshot` 各自可在盘上反驳 + `--evidence-spec` 的 stage 要求，坏表硬失败，§9.29；2026-11-03）、~~审批批复的可靠投递~~（请求 at-least-once + 按 req 幂等 + 台账从 journal 播种，判定仍只一次，§9.30；2026-11-03）、~~批复到底有没有生效~~（回执 `approval_receipt` + `ApprovalAcked` 落账 + 到点撤摊，**没生效的批准不许记成生效**，§9.31；2026-11-03）。
@@ -290,4 +296,4 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
 
 2026-11-04 联跑新添的两格同日落地（§9.33）：验证类 stage 的 FAIL 回跳给写者返工（带额度 `max_reworks`、带原因 `ref.rework`、每关 iter 跨回跳不清零），bash 用 `output_path` 参数交出可核对的 `test_log`（内核把 stdout/stderr 连 `exit: ExitStatus{...}` 一起写进那个文件）。下一格因此有了明确的落点：SA 只要去读那行 `exit:`，「形状」就能升级成「结论」——现在它还只证明「这份文件是测试汇总」。
 
-新划出的边界：`nominal_usd` 的占比应当随 `providers.toml` 填写完整率下降，这条曲线本身值得盯（单价填全之后 `--max-usd` 才是真正的账单上限，名义值只作为「说不清价」的兜底存在）。2026-11-04 补一句：**只填价不够**——名义值现在有两个来源（没填价 / 读数不可信，§9.36），少报 input 的端点会一直留在名义侧，这是对的，但看账的人必须知道它为什么还在。证据强度这一格同日走完（§9.34），**结论也已经是状态**（§9.35）：`test_runs` 进投影、跨轮转存活，并被收尾报账与返工铃读走。清单上因此留下四件相关的：**名义值的两个来源在账本上合并成一个数**（要分开报，得给 `BudgetSettled` 一个名义来源标记并参与折叠，那是账本形状的改变，不该顺手做）、**同一份日志被多个 stage 引用时不去重**（按 stage 归位是刻意的）、**没有任何闸门把结论当输入**（停损只看钱），以及上面那条「看账的人要知道它为什么还在」。
+新划出的边界：`nominal_usd` 的占比应当随 `providers.toml` 填写完整率下降，这条曲线本身值得盯（单价填全之后 `--max-usd` 才是真正的账单上限，名义值只作为「说不清价」的兜底存在）。2026-11-04 补一句并走完它：**只填价不够**——名义值有两个来源（没填价 / 读数不可信，§9.36），而这两个来源现在分开报了（§9.37），报账那一行直接指出下一步该做什么。证据强度这一格同日走完（§9.34），**结论也已经是状态**（§9.35）：`test_runs` 进投影、跨轮转存活，并被收尾报账与返工铃读走。清单上因此留下相关的三件：**同一份日志被多个 stage 引用时不去重**（按 stage 归位是刻意的）、**没有任何闸门把结论当输入**（停损只看钱，要不要让「测试没绿」影响放行得先定它拦的是钱还是进度）、以及分类账目前只到「来源」这一层——**没有细到 peer × 来源**（`nominal_by_reason` 只按来源合计，看不出「哪个 peer 说不清」，那要改的是这张表的 key 形状）。
