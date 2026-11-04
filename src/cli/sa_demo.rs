@@ -11,13 +11,14 @@ use anyhow::Context;
 use crate::bus::frame::Envelope;
 use crate::bus::rpc::BusClient;
 use crate::cli::evidence::{
-    Evidence, EvidenceKind, check_evidence, evidence_from_answer, missing_requirements,
+    Evidence, EvidenceKind, check_evidence, describe_run, evidence_from_answer,
+    missing_requirements,
 };
 use crate::cli::serve::{approval_command, approval_receipt_from_frame, decision_name};
 use crate::cli::task::artifact_path;
 use crate::core::ops::ApprovalDecision;
 use crate::journal::Journal;
-use crate::journal::records::{JournalRecord, Stage, ThinBell, Verdict};
+use crate::journal::records::{JournalRecord, Stage, TestRun, ThinBell, Verdict};
 use crate::permissions::{Decision, PermissionEngine};
 use crate::provider::config::Registry;
 use crate::provider::wire::{CostPerMTok, Usage};
@@ -32,6 +33,10 @@ pub struct DemoSaArgs {
     pub per_dispatch_usd: f64,
     pub max_usd: f64,
     pub max_iterations: u64,
+    /// 一次 pipeline 允许把「验证没过」的活儿退回给写者几次。验证类 stage 的 FAIL
+    /// 归因在被验证的产物上，而产物在写者手里（design §9.32④）——回跳要有额度，
+    /// 否则一条永不满足的验收标准可以在 dev↔review 之间来回打铃打到预算停损。
+    pub max_reworks: u64,
     /// How long to wait for a worker's result bell before declaring the bell
     /// lost (the worker keeps the turn; the SA falls back to disk inspection).
     pub bell_timeout: Duration,
@@ -377,9 +382,26 @@ pub fn rotate_at_boundary(
     }
 }
 
-/// 一个 stage 的派发结果：收敛（pass）。
+/// 一个 stage 的派发结果：收敛，或者「这一关没过，但缺陷不在验证者手里」。
 enum StageOutcome {
     Pass,
+    /// 验证类 stage FAIL：产物要由写者返工，本 stage 等返工完再重跑。
+    Rework,
+}
+
+/// 「这一关的 FAIL 该派给谁」——路由规则，不是判定强度。
+///
+/// Dev 的 FAIL 就是「你还没做成」，回派给同一个写者（原地 iter+1）。Review / Test /
+/// Build 的 FAIL 说的是「被验证的产物不行」，而验证者没有写范围（`qa.toml` 的
+/// `write_roots = []`），再给它一颗铃只会得到同一份 FAIL——本轮的盘上证据就是 QA
+/// 连着三次说「RD 未做任何返工」（design §9.32④）。
+///
+/// 「铃丢了」不走这条：那是投递问题，原地重派同一个 peer 才对。
+fn rework_target(stage: Stage) -> Option<Stage> {
+    match stage {
+        Stage::Dev => None,
+        _ => Some(Stage::Dev),
+    }
 }
 
 /// dispatch → wait bell → reconcile（读盘为准）→ 推进/回派，直至 release。
@@ -468,13 +490,27 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
         );
     }
 
-    for stage in stages {
+    // 走「索引 + 每关自己的 iter」而不是 `for stage`：验证没过时要把活儿退回写者、
+    // 返工完再重新验证（§9.32④）。回跳之后各关的重试次数必须接着上次算——清零等于
+    // 没有上限，一条永不满足的验收标准就能把 pipeline 转到预算停损为止。
+    let mut iters = [1u64; 4];
+    let writer_idx = stages
+        .iter()
+        .position(|s| *s == Stage::Dev)
+        .unwrap_or_default();
+    let mut rework: Option<serde_json::Value> = None;
+    let mut reworks_left = args.max_reworks;
+    let mut idx = 0usize;
+    while idx < stages.len() {
+        let stage = stages[idx];
         let target = args.peer_for(stage);
         let stage_name = format!("{stage:?}").to_lowercase();
-        let mut iter = 1u64;
+        let mut iter = iters[idx];
+        // 返工说明随这一关的每颗铃带出去（原地重派也带着，别让它中途丢掉）。
+        let rework_note = rework.clone();
 
         // 值循环：Pass = stage 收敛；Fail/重试走 continue（iter 已自增）。
-        let _outcome: StageOutcome = loop {
+        let outcome: StageOutcome = loop {
             // --- 预算停损：账本先看，超限 STOP escalate（退出码非 0）。
             // O(1) 投影，不是每次派发都重放整个活文件（不变式 5：两者由同一次折叠产
             // 生，`projection_equals_a_full_replay_after_every_append` 钉住这条）
@@ -498,7 +534,22 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
                 );
             }
             if iter > args.max_iterations {
-                anyhow::bail!("[sa] iteration cap reached for {stage:?}");
+                // 上限要说清是**怎么**撞上的：写者的 iter 里混着验证 FAIL 换来的返工
+                // 派发（2026-11-04 强制 `review:diff` 那一轮实测：dev iter 从 1 涨到 4，
+                // 而「返工」那两次不是 RD 自己没做成）。只说 cap reached 会把人引向
+                // 「模型不稳」，真正该改的是那条验收标准。
+                let reworks_used = args.max_reworks.saturating_sub(reworks_left);
+                anyhow::bail!(
+                    "[sa] iteration cap reached for {stage:?}{}",
+                    if stage == Stage::Dev && reworks_used > 0 {
+                        format!(
+                            " — {reworks_used} of those iterations were rework dispatches asked \
+                             for by a verifier that cannot fix the artifact itself"
+                        )
+                    } else {
+                        String::new()
+                    }
+                );
             }
 
             // --- 先写盘，再拉铃（规则 1：顺序即纪律）。
@@ -512,11 +563,19 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
                 stage,
                 check: Some(stage_name.clone()),
                 iteration: iter,
-                r#ref: serde_json::json!({
-                    "task": args.task,
-                    "artifacts": args.artifacts,
-                    "worktree": args.worktree,
-                }),
+                r#ref: {
+                    let mut bell_ref = serde_json::json!({
+                        "task": args.task,
+                        "artifacts": args.artifacts,
+                        "worktree": args.worktree,
+                    });
+                    // 「上一关为什么没过」进铃的 ref：写者拿到的是可核对的失败原因
+                    // （连同一个判定工件路径），不是「再试一次」这种措辞。
+                    if let Some(note) = &rework_note {
+                        bell_ref["rework"] = note.clone();
+                    }
+                    bell_ref
+                },
             };
             journal.append(&JournalRecord::BellSent {
                 task: args.task_id.clone(),
@@ -655,6 +714,15 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
             // 不等于 stage 收敛——空结果、abort、worker 侧 stop=error 都是 fail，
             // 而「有文件」也不等于「有这一关要求的证据」。
             let verdict = verdict_from_artifact(&artifact, requirements.required_for(stage));
+            // 把「这一次测试到底过了几条、failed 几条、退了几」打到 stdout：判定行只
+            // 说 pass/fail，读日志的人要能看见结论是从哪份文件读出来的（§9.34）。
+            for run in &verdict.test_runs {
+                println!(
+                    "[sa] {stage_name} iter{iter}: test log {} -> {}",
+                    run.path,
+                    describe_run(run)
+                );
+            }
             journal.append(&JournalRecord::ResultCommitted {
                 task: args.task_id.clone(),
                 stage,
@@ -677,6 +745,32 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
                 println!("[sa] {stage_name} iter{iter}: pass");
                 break StageOutcome::Pass;
             }
+            // FAIL 之后「派给谁」是路由问题，不是判定强度：验证类 stage 说不达标，
+            // 说的是**被验证的产物**，而验证者没有写范围，再给它一颗铃只会得到同一份
+            // FAIL。返工要有额度（`max_reworks`），额度用尽就把它说成显式失败。
+            if rework_target(stage) == Some(Stage::Dev) {
+                if reworks_left == 0 {
+                    anyhow::bail!(
+                        "[sa] {stage_name} iter{iter}: fail ({}) and the rework budget is spent \
+                         — re-dispatching the verifier would only repeat this verdict",
+                        verdict.issues.join(", ")
+                    );
+                }
+                reworks_left -= 1;
+                rework = Some(serde_json::json!({
+                    "from": format!("{stage_name} iter{iter}"),
+                    "issues": verdict.issues.clone(),
+                    "verdict_artifact": artifact.display().to_string(),
+                }));
+                println!(
+                    "[sa] {stage_name} iter{iter}: fail ({}) -> rework by {} ({} credit(s) left)",
+                    verdict.issues.join(", "),
+                    args.peer_for(Stage::Dev),
+                    reworks_left
+                );
+                iter += 1;
+                break StageOutcome::Rework;
+            }
             println!(
                 "[sa] {stage_name} iter{iter}: fail ({}) -> re-dispatch",
                 verdict.issues.join(", ")
@@ -684,6 +778,23 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
             iter += 1;
             continue;
         };
+        iters[idx] = iter;
+        match outcome {
+            StageOutcome::Pass => {
+                if stage == Stage::Dev {
+                    // 写者交活了，那份返工说明就此作废：带着它进下一关，只会让 QA
+                    // 去追一个已经过去的失败。
+                    rework = None;
+                }
+                idx += 1;
+            }
+            StageOutcome::Rework => {
+                // 返工是写者的**下一次**派发，不是把已通过的那一轮重跑：工件名按
+                // iter 走，复用同一个 iter 会覆盖掉盘上那一份已经通过的产物。
+                iters[writer_idx] += 1;
+                idx = writer_idx;
+            }
+        }
     }
     report_ledger(&journal, &ledger);
     println!("[sa] pipeline complete");
@@ -954,12 +1065,14 @@ pub fn verdict_from_artifact(path: &Path, required: &[EvidenceKind]) -> Verdict 
         return Verdict {
             pass: false,
             issues: vec![format!("artifact missing: {}", path.display())],
+            ..Default::default()
         };
     };
     let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
         return Verdict {
             pass: false,
             issues: vec![format!("artifact is not valid JSON: {}", path.display())],
+            ..Default::default()
         };
     };
     let mut issues = Vec::new();
@@ -993,6 +1106,7 @@ pub fn verdict_from_artifact(path: &Path, required: &[EvidenceKind]) -> Verdict 
     // 「这里有个文件」只证明有东西；声称 `test_log`/`diff`/`screenshot` 就多了一个
     // 能在盘上被反驳的属性——没有测试汇总行的日志不是测试日志，改名的 txt 不是截图。
     // stage 要求看的还是**核对通过**的类型：一份普通文件顶不出 `test_log` 那一格。
+    let mut test_runs: Vec<TestRun> = Vec::new();
     if converged {
         let mut evidence = evidence_from_artifact(&json);
         if evidence.is_empty() {
@@ -1004,6 +1118,9 @@ pub fn verdict_from_artifact(path: &Path, required: &[EvidenceKind]) -> Verdict 
         } else {
             let report = check_evidence(&evidence);
             issues.extend(report.issues);
+            // 每份 test_log 读出来的结论随判定一起落 journal（§9.34）：事后能问
+            // 「那一次到底过了几条」，而不是只有一句 pass。
+            test_runs = report.test_runs;
             for kind in missing_requirements(&report.verified_kinds, required) {
                 issues.push(format!(
                     "no verified {} evidence: this stage requires one",
@@ -1015,6 +1132,7 @@ pub fn verdict_from_artifact(path: &Path, required: &[EvidenceKind]) -> Verdict 
     Verdict {
         pass: issues.is_empty(),
         issues,
+        test_runs,
     }
 }
 
@@ -1133,6 +1251,22 @@ mod tests {
         ));
     }
 
+    /// 路由规则本身要能单独测——m4_bus / m5_pool 验的是「铃送没送到」，不是
+    /// 「这一关没过该派给谁」（design §9.32④）。
+    #[test]
+    fn a_verifier_fail_routes_back_to_the_writer() {
+        // Dev 的 FAIL 是「你还没做成」：原地重派同一个写者，不该跳到别处。
+        assert_eq!(rework_target(Stage::Dev), None, "dev fails in place");
+        // 验证类 stage 的 FAIL 说的是「产物不行」：回跳给写者，返工后重跑这一关。
+        for stage in [Stage::Review, Stage::Test, Stage::Build] {
+            assert_eq!(
+                rework_target(stage),
+                Some(Stage::Dev),
+                "{stage:?} 的产物在写者手里，回派验证者只是重复同一次判定"
+            );
+        }
+    }
+
     /// task id 是 journal 记录、门铃、工件名三处**同源**的命名空间；peer 由 stage
     /// 决定并可被第二条 pipeline 改写。§9.11④ 的 bug 正是这三处各拼一遍 format!。
     #[test]
@@ -1146,6 +1280,7 @@ mod tests {
             per_dispatch_usd: 0.5,
             max_usd: 6.0,
             max_iterations: 3,
+            max_reworks: 2,
             bell_timeout: Duration::from_secs(300),
             worktree: None,
             approvals: None,
@@ -1197,6 +1332,55 @@ mod tests {
         path
     }
 
+    /// 一句 `DONE` 配一份**跑挂了**的测试日志：日志反驳判定词，stage 不能过。
+    /// 这是 §9.34 的全部意义——「过了几条、failed 几条」不再只活在模型的一段话里。
+    #[test]
+    fn a_done_claim_with_a_failing_test_log_is_rebutted() {
+        let log = write_artifact(
+            "unittest.log",
+            "command: python3 -m unittest test_lru_cache\n\
+             exit: ExitStatus { code: Some(1), signal: None }\n\
+             --- stdout ---\nRan 26 tests in 0.011s\n\nFAILED (failures=2)\n",
+        );
+        let src = evidence_file("lru_cache.py");
+        let art = write_artifact(
+            "rebutted.json",
+            &format!(
+                r#"{{"result":"DONE: shipped and green","evidence":[{{"kind":"file","path":"{}"}},{{"kind":"test_log","path":"{}"}}],"aborted":false,"stop":{{"type":"stop"}}}}"#,
+                src.display(),
+                log.display()
+            ),
+        );
+        let v = verdict_from_artifact(&art, &[EvidenceKind::File, EvidenceKind::TestLog]);
+        assert!(!v.pass, "跑挂的日志必须能顶回那句 DONE: {:?}", v.issues);
+        assert!(
+            v.issues.iter().any(|i| i.contains("did not pass")),
+            "{:?}",
+            v.issues
+        );
+        assert_eq!(v.test_runs.len(), 1, "{:?}", v.test_runs);
+        assert_eq!(v.test_runs[0].exit_code, Some(1));
+        assert_eq!(v.test_runs[0].failed, Some(2));
+
+        // 反过来：同一份工件把日志换成真过的，就该过——这一层不是「有 exit 行就 FAIL」。
+        let ok = write_artifact(
+            "unittest-ok.log",
+            "command: python3 -m unittest test_lru_cache\n\
+             exit: ExitStatus { code: Some(0), signal: None }\n\
+             --- stdout ---\nRan 26 tests in 0.011s\n\nOK\n",
+        );
+        let art = write_artifact(
+            "shipped.json",
+            &format!(
+                r#"{{"result":"DONE: shipped and green","evidence":[{{"kind":"file","path":"{}"}},{{"kind":"test_log","path":"{}"}}],"aborted":false,"stop":{{"type":"stop"}}}}"#,
+                src.display(),
+                ok.display()
+            ),
+        );
+        let v = verdict_from_artifact(&art, &[EvidenceKind::File, EvidenceKind::TestLog]);
+        assert!(v.pass, "{:?}", v.issues);
+        assert_eq!(v.test_runs[0].exit_code, Some(0));
+    }
     /// 一份 role 目录 + 一份 providers.toml：账本的两个输入。
     /// `priced` 决定 registry 里那个 model 有没有写 cost。
     fn scratch_prices(tag: &str) -> (PathBuf, PathBuf) {

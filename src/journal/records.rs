@@ -18,11 +18,54 @@ pub enum Stage {
     Release,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// 一次 stage 判定的产出。`test_runs` 是 2026-11-04 加的第二格：证据不只证明
+/// 「有一份像测试日志的东西」，还把它数出来的结论带上盘（design §9.34）。
+/// `#[serde(default)]` 让改动之前的 journal 仍然可重放。
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Verdict {
     pub pass: bool,
     #[serde(default)]
     pub issues: Vec<String>,
+    /// 本轮核对过的测试日志（每份一条）。空 = 这一关没有可数出来的测试证据。
+    #[serde(default)]
+    pub test_runs: Vec<TestRun>,
+}
+
+/// 一份测试日志读出来的结论。字段全可缺：`None` 说的是「这份日志里没写」，
+/// 不是「0 条通过」——把缺席当 0 就是把「说不清」记成「没问题」。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TestRun {
+    pub path: String,
+    /// 内核 `output_path` 落的那行 `exit: ExitStatus { code: Some(0), signal: None }`。
+    /// 别的来源（worker 自己 tee 的）没有这行，那就是 `None`。
+    #[serde(default)]
+    pub exit_code: Option<i64>,
+    #[serde(default)]
+    pub exit_signal: Option<i64>,
+    #[serde(default)]
+    pub passed: Option<u64>,
+    #[serde(default)]
+    pub failed: Option<u64>,
+    /// unittest 的 `Ran 26 tests`。
+    #[serde(default)]
+    pub ran: Option<u64>,
+}
+
+impl TestRun {
+    /// 「这一次跑挂了」——只在盘上真读得出来时下断言，绝不从「读不出来」推「没事」。
+    pub fn failed_run(&self) -> bool {
+        self.exit_signal.is_some()
+            || self.exit_code.is_some_and(|c| c != 0)
+            || self.failed.is_some_and(|f| f > 0)
+    }
+
+    /// 读得出结论（退出码或计数）就算它带结论；只有汇总行的旧日志不带。
+    pub fn carries_verdict(&self) -> bool {
+        self.exit_code.is_some()
+            || self.exit_signal.is_some()
+            || self.passed.is_some()
+            || self.failed.is_some()
+    }
 }
 
 /// 薄消息 (harness-v3 §5.2): 门铃正文只含 {role, stage, check, iteration, ref}。
@@ -496,6 +539,7 @@ mod tests {
                 verdict: Verdict {
                     pass: true,
                     issues: vec![],
+                    test_runs: vec![],
                 },
             },
         ];
@@ -755,6 +799,7 @@ mod tests {
                 verdict: Verdict {
                     pass: true,
                     issues: vec![],
+                    test_runs: vec![],
                 },
             },
         ];
@@ -770,6 +815,7 @@ mod tests {
                 verdict: Verdict {
                     pass: true,
                     issues: vec![],
+                    test_runs: vec![],
                 },
             },
         ];
@@ -855,5 +901,52 @@ mod tests {
             "检查点带过来的 0.5 预留被结算换成 0.12，而不是加在旁边: {:?}",
             rep.state.spent_usd
         );
+    }
+
+    /// `Verdict.test_runs` 是这一轮新加的字段。除往返一致之外，更要紧的是**没有这个
+    /// 字段的老 journal 行仍然必须能重放**（不变式 5：真相源不能因为加了一格就读不了
+    /// 历史）；而读回来的「缺席」是空列表，不是「0 条失败」。
+    #[test]
+    fn verdict_test_runs_roundtrip_and_old_lines_still_replay() {
+        let line = r#"{"type":"result_committed","task":"t","stage":"dev","verdict":{"pass":true,"issues":[]}}"#;
+        let old: JournalRecord = serde_json::from_str(line).unwrap();
+        let JournalRecord::ResultCommitted { verdict, .. } = &old else {
+            panic!("expected a result_committed line");
+        };
+        assert!(
+            verdict.test_runs.is_empty(),
+            "老行的缺字段读成空: {:?}",
+            verdict.test_runs
+        );
+
+        // `JournalRecord` 不实现 PartialEq（它带 Value/浮点，等值比较本来就没意义），
+        // 所以这里比的是「读回来的 verdict」与「序列化文本逐字节一致」。
+        let verdict = Verdict {
+            pass: false,
+            issues: vec!["did not pass".into()],
+            test_runs: vec![TestRun {
+                path: "/tmp/unittest.log".into(),
+                exit_code: Some(1),
+                exit_signal: None,
+                passed: Some(24),
+                failed: Some(2),
+                ran: Some(26),
+            }],
+        };
+        let fresh = JournalRecord::ResultCommitted {
+            task: "t".into(),
+            stage: Stage::Dev,
+            verdict: verdict.clone(),
+        };
+        let text = serde_json::to_string(&fresh).unwrap();
+        let back: JournalRecord = serde_json::from_str(&text).unwrap();
+        let JournalRecord::ResultCommitted {
+            verdict: read_back, ..
+        } = &back
+        else {
+            panic!("roundtrip changed the record kind");
+        };
+        assert_eq!(read_back, &verdict, "读出来的结论要能原样落盘再读回");
+        assert_eq!(serde_json::to_string(&back).unwrap(), text);
     }
 }

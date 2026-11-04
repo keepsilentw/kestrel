@@ -546,6 +546,119 @@ async fn edit_requires_a_read_of_the_same_version() {
     std::fs::remove_dir_all(&ws).ok();
 }
 
+/// `output_path`（design §9.32④）：内核把这一条命令的输出落到**写根内**的文件，
+/// worker 才拿得出可以按类型核对的 `test_log`。用 shell 重定向做不到——`cmd > f`
+/// 整条在 tokenizer 里解析失败 → Ask → 被拒，被拒的是判定层，不是文件系统。
+#[tokio::test]
+async fn bash_output_path_lands_a_log_inside_the_write_root() {
+    let root = std::env::temp_dir().join(format!("kestrel-bashlog-{}", std::process::id()));
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::create_dir_all(&root).unwrap();
+    let mut ctx = ctx_for(root.clone(), kestrel::tools::ApproveMode::HeadlessDeny);
+    ctx.engine = Arc::new(kestrel::permissions::PermissionEngine::new(PolicyTable {
+        default: Decision::Allow,
+        rules: vec![],
+        forbidden_prefixes: vec![],
+    }));
+    ctx.fs = kestrel::sandbox::FsPolicy {
+        writable_roots: vec![root.clone()],
+        ..Default::default()
+    };
+    let registry = ToolRegistry::new(vec![Arc::new(kestrel::tools::bash::Bash)]);
+
+    // 1) 跑成的命令：汇总行与退出状态都要在文件里，模型也要被告知落在哪。
+    let log = root.join("unittest.log");
+    let r = one_call(
+        &registry,
+        &ctx,
+        "bash",
+        serde_json::json!({
+            "command": "printf 'Ran 26 tests in 0.011s\\n\\nOK\\n'",
+            "output_path": log.to_str().unwrap(),
+        }),
+    )
+    .await;
+    assert!(!r.is_error, "{:?}", r.content_text());
+    assert!(
+        r.content_text().contains("[output written to"),
+        "落点要说给模型: {:?}",
+        r.content_text()
+    );
+    let landed = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        landed.contains("Ran 26 tests") && landed.contains("exit:"),
+        "{landed}"
+    );
+    // 那份文件必须真能按类型核对（走 SA 用的同一份代码，不是测试里的比喻）。
+    let claim = kestrel::cli::evidence::Evidence {
+        path: log.to_str().unwrap().into(),
+        kind: kestrel::cli::evidence::EvidenceKind::TestLog,
+    };
+    assert!(
+        kestrel::cli::evidence::check_evidence(&[claim])
+            .issues
+            .is_empty(),
+        "内核落的日志要过 test_log 那一档核对"
+    );
+
+    // 2) 跑挂的命令**也**要落盘：最想看日志的正是这一次。
+    let failing = root.join("failing.log");
+    let r = one_call(
+        &registry,
+        &ctx,
+        "bash",
+        serde_json::json!({
+            "command": "test -f /definitely/not/here",
+            "output_path": failing.to_str().unwrap(),
+        }),
+    )
+    .await;
+    assert!(r.is_error, "非零退出仍是错误回灌");
+    let landed = std::fs::read_to_string(&failing).unwrap();
+    assert!(
+        landed.contains("code: Some(1)"),
+        "退出状态要落进日志，否则日志说不出这一次是成是败: {landed}"
+    );
+
+    // 3) 越界的 output_path：Blocked，不是 Ask——审批不能放宽角色的写范围（§5）。
+    let outside = std::env::temp_dir().join(format!(
+        "kestrel-bashlog-outside-{}.log",
+        std::process::id()
+    ));
+    let r = one_call(
+        &registry,
+        &ctx,
+        "bash",
+        serde_json::json!({"command": "echo hi", "output_path": outside.to_str().unwrap()}),
+    )
+    .await;
+    assert!(
+        r.is_error && r.content_text().contains("outside writable roots"),
+        "{:?}",
+        r.content_text()
+    );
+    assert!(!outside.exists(), "被拒的调用不能留下文件");
+
+    // 4) 父目录不存在：不猜、不建，并把后果说清楚（与 write 工具同一条纪律）。
+    let missing = root.join("nope/inner.log");
+    let r = one_call(
+        &registry,
+        &ctx,
+        "bash",
+        serde_json::json!({"command": "echo hi", "output_path": missing.to_str().unwrap()}),
+    )
+    .await;
+    assert!(
+        r.content_text().contains("output NOT written")
+            && r.content_text().contains("does not exist"),
+        "{:?}",
+        r.content_text()
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_file(&outside).ok();
+}
+
 /// Acceptance 6: a non-unique anchor is refused instead of silently rewriting
 /// the first occurrence.
 #[tokio::test]

@@ -370,6 +370,7 @@ mod tests {
             verdict: Verdict {
                 pass: true,
                 issues: vec![],
+                test_runs: vec![],
             },
         })
         .unwrap();

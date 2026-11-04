@@ -186,6 +186,7 @@ async fn crash_reconciliation_avoids_redispatch() {
                 verdict: Verdict {
                     pass: true,
                     issues: vec![],
+                    test_runs: vec![],
                 },
             })
             .unwrap();
@@ -303,6 +304,7 @@ fn the_default_rotation_policy_changes_no_conclusion() {
     let pass = Verdict {
         pass: true,
         issues: vec![],
+        test_runs: vec![],
     };
     let mut rotations = 0;
 

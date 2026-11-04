@@ -142,10 +142,14 @@ fn parse_evidence_span(rest: &str) -> Vec<Evidence> {
 
 /// 一次核对的产出：不能成立的条目 + **确实成立的那些类型**（stage 要求要看后者，
 /// 不能只看「有条目没报错」——一个 `file` 档的证据永远满足不了 `test_log` 的要求）。
+use crate::journal::records::TestRun;
+
 #[derive(Debug, Default, PartialEq)]
 pub struct EvidenceReport {
     pub issues: Vec<String>,
     pub verified_kinds: Vec<EvidenceKind>,
+    /// 核对过的 `test_log` 各自读出来的结论（design §9.34）。没声称 test_log 的不进这里。
+    pub test_runs: Vec<TestRun>,
 }
 
 /// 按类型核对证据。`issues` 为空意味着每一条都按它**声称的类型**在盘上成立。
@@ -190,7 +194,21 @@ pub fn check_evidence(items: &[Evidence]) -> EvidenceReport {
                 Ok(bytes) => {
                     let text = String::from_utf8_lossy(&bytes);
                     if find_marker(&text, TEST_SUMMARY_MARKERS).is_some() {
-                        None
+                        // 形状成立只是第一层。再读出它**数的结论**（§9.34）：内核落的日志
+                        // 带 `exit:` 行，各家 runner 有各自的计数行形状——读得出多少记多少，
+                        // 读不出来的字段留 `None`（缺席不是 0）。
+                        let run = read_test_run(path, &text);
+                        let broken = run.failed_run();
+                        let described = describe_run(&run);
+                        report.test_runs.push(run);
+                        if broken {
+                            Some(format!(
+                                "evidence {} is a test log that did not pass ({described})",
+                                item.path
+                            ))
+                        } else {
+                            None
+                        }
                     } else {
                         Some(format!(
                             "evidence {} is not a test log (no summary line: {})",
@@ -287,6 +305,8 @@ const TEST_SUMMARY_MARKERS: &[&str] = &[
     "BUILD SUCCESS", // maven / gradle
     "BUILD FAILURE",
     "no tests ran", // pytest 空跑——仍然是「跑过测试」的证据
+    "Ran ",         // python 标准库 unittest: `Ran 26 tests in 0.011s`
+    "failures=",    // unittest 的失败汇总行 `FAILED (failures=1, errors=2)`
 ];
 
 const KNOWN_KINDS: &str = "file | test_log | diff | screenshot";
@@ -303,6 +323,119 @@ fn marker_list(markers: &[&str]) -> String {
 fn looks_like_diff(text: &str) -> bool {
     text.contains("diff --git")
         || (text.contains("--- ") && text.contains("+++ ") && text.contains("@@"))
+}
+
+/// 从一份测试日志里读出**结论**（§9.34）。`exit:` 行在文件头（那是内核 `output_path`
+/// 写的第二行），计数行在尾部（runner 的汇总总在最后），所以两处各读一段，不把整份
+/// 日志吃进内存。读不出来的字段是 `None`——缺席不等于 0 条通过。
+pub fn read_test_run(path: &Path, tail: &str) -> TestRun {
+    let head = read_head(path, SPAN_BYTES)
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .unwrap_or_default();
+    let (exit_code, exit_signal) = parse_exit_line(&head);
+    // 三家形状：cargo/pytest 用「N failed」，unittest 用「failures=/errors=」。取总和：
+    // 同一份日志里同时出现两种写法的 runner 我没有，宁可多加一条「没过」也不漏——
+    // 这一层的用途是**反驳**，漏报比误报贵。
+    let failed = [
+        number_before(tail, "failed"),
+        key_number(tail, "failures"),
+        key_number(tail, "errors"),
+    ]
+    .into_iter()
+    .flatten()
+    .reduce(|a, b| a + b);
+    let mut run = TestRun {
+        path: path.display().to_string(),
+        exit_code,
+        exit_signal,
+        passed: number_before(tail, "passed"),
+        // 明确写了 `0 failed` 就记 Some(0)：「日志说零失败」和「日志没说」是两件事。
+        failed,
+        ran: number_before(tail, "tests"),
+    };
+    // unittest 的成功汇总只有 `Ran N tests` 加一行 `OK`，它不打 passed 计数。这一行在
+    // unittest 自己的语义里就是「跑出来的 N 条都过了、零失败」——按它补，不算猜。
+    if run.passed.is_none() && run.failed.is_none() && run.ran.is_some() && unittest_ok_line(tail) {
+        run.passed = run.ran;
+        run.failed = Some(0);
+    }
+    run
+}
+
+/// unittest 的成功汇总行：整行 `OK`，或 `OK (skipped=3)`。不按 `contains` 匹配——
+/// 正文里出现 "OK" 两个字母不算这行的语义。
+fn unittest_ok_line(text: &str) -> bool {
+    text.lines()
+        .any(|l| l.trim() == "OK" || l.trim().starts_with("OK ("))
+}
+
+/// 报给判定用的一句话：先说退出状态，再说数出来的条数。
+pub fn describe_run(run: &TestRun) -> String {
+    let mut bits: Vec<String> = Vec::new();
+    match (run.exit_code, run.exit_signal) {
+        (Some(code), None) => bits.push(format!("exit {code}")),
+        (None, Some(sig)) => bits.push(format!("killed by signal {sig}")),
+        (Some(code), Some(sig)) => bits.push(format!("exit {code} / signal {sig}")),
+        (None, None) => bits.push("no exit status recorded".to_string()),
+    }
+    if let Some(ran) = run.ran {
+        bits.push(format!("ran {ran}"));
+    }
+    bits.push(format!(
+        "{} passed / {} failed",
+        run.passed
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "?".into()),
+        run.failed
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "?".into()),
+    ));
+    bits.join(", ")
+}
+
+/// 内核那一行：`exit: ExitStatus { code: Some(1), signal: None }`。`None` 就真的是
+/// 「没有这个读数」，不当 0。
+fn parse_exit_line(head: &str) -> (Option<i64>, Option<i64>) {
+    let Some(line) = head.lines().find(|l| l.starts_with("exit: ")) else {
+        return (None, None);
+    };
+    (key_number_i64(line, "code"), key_number_i64(line, "signal"))
+}
+
+/// `<数字> <词>`：取**最后**一次出现——汇总行总在文件末尾，前面的同名数字是过程输出。
+fn number_before(text: &str, word: &str) -> Option<u64> {
+    let mut prev: Option<u64> = None;
+    let mut found: Option<u64> = None;
+    for tok in text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+        if tok == word {
+            found = prev;
+        }
+        prev = tok.parse().ok();
+    }
+    found
+}
+
+/// `key=数字`（unittest 的 `failures=1`、`errors=2`）。
+fn key_number(text: &str, key: &str) -> Option<u64> {
+    key_number_i64(text, key).and_then(|n| u64::try_from(n).ok())
+}
+
+fn key_number_i64(text: &str, key: &str) -> Option<i64> {
+    let at = text.find(key)? + key.len();
+    let rest = &text[at..];
+    // 只吃「key 紧跟着的那个值」：先剥掉 `:`/`=` 与空白，再剥掉 `Some(`。往后扫第一个
+    // 数字是不行的——`code: None, signal: Some(9)` 会把 9 当成退出码，于是「没有读数」
+    // 被记成「退出码 9」，把缺席当成结论。
+    let rest = rest.trim_start_matches(|c: char| c.is_whitespace() || c == ':' || c == '=');
+    let rest = rest.strip_prefix("Some(").unwrap_or(rest);
+    let digits: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '-')
+        .collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse().ok()
 }
 
 fn image_format(bytes: &[u8]) -> Option<&'static str> {
@@ -478,6 +611,18 @@ mod tests {
         let rep = check_evidence(&[claim]);
         assert!(rep.issues.is_empty(), "{:?}", rep.issues);
         assert_eq!(rep.verified_kinds, vec![EvidenceKind::TestLog]);
+        // 数出来的结论也要在（这一格之后，判定不只知道「有日志」，还知道过了几条）。
+        assert_eq!(rep.test_runs.len(), 1, "{:?}", rep.test_runs);
+        assert_eq!(rep.test_runs[0].passed, Some(12));
+        assert_eq!(
+            rep.test_runs[0].failed,
+            Some(0),
+            "日志明确写了 0 failed 就记 Some(0)——「说零失败」不等于「没说起失败」"
+        );
+        assert_eq!(
+            rep.test_runs[0].exit_code, None,
+            "不是内核落的：没有 exit 行"
+        );
 
         let bogus = scratch("log", "note.txt", b"DONE: everything is fine, trust me\n");
         let mut claim = bogus.clone();
@@ -486,6 +631,91 @@ mod tests {
         assert_eq!(rep.issues.len(), 1, "{:?}", rep.issues);
         assert!(rep.issues[0].contains("not a test log"), "{:?}", rep.issues);
         assert!(rep.verified_kinds.is_empty(), "没通过就不能算这类证据");
+
+        // 标准库 unittest 的汇总行长这样（demo 的 RD 只能用它：沙箱 `network = none`
+        // 装不了 pytest，见 design §9.32②）。汇总表原先只认 cargo / pytest / jest /
+        // maven，于是「跑过了 26 例」这份真日志会被判成不是测试日志。
+        let unittest = scratch(
+            "log",
+            "unittest.log",
+            b"..........................\nRan 26 tests in 0.011s\n\nOK\n",
+        );
+        let mut claim = unittest.clone();
+        claim.kind = EvidenceKind::TestLog;
+        let rep = check_evidence(&[claim]);
+        assert!(rep.issues.is_empty(), "{:?}", rep.issues);
+        assert_eq!(rep.verified_kinds, vec![EvidenceKind::TestLog]);
+        assert_eq!(rep.test_runs[0].ran, Some(26));
+        // unittest 只打 `Ran N tests` + 一行 `OK`，不打 passed 计数——按它自己的语义补。
+        assert_eq!(rep.test_runs[0].passed, Some(26));
+        assert_eq!(rep.test_runs[0].failed, Some(0));
+
+        // 这一格翻掉了（§9.34）：以前「跑失败也是跑过——形状归类型、结论归判定词」，
+        // 现在日志自己带结论，于是它能**反驳**worker 那句 DONE。
+        let unittest_failed = scratch(
+            "log",
+            "unittest-fail.log",
+            b"F\nERROR: boom\nRan 3 tests in 0.002s\n\nFAILED (failures=1, errors=1)\n",
+        );
+        let mut claim = unittest_failed.clone();
+        claim.kind = EvidenceKind::TestLog;
+        let rep = check_evidence(&[claim]);
+        assert_eq!(rep.issues.len(), 1, "{:?}", rep.issues);
+        assert!(
+            rep.issues[0].contains("did not pass") && rep.issues[0].contains("2 failed"),
+            "结论要从这份文件里读出来: {:?}",
+            rep.issues
+        );
+        let run = &rep.test_runs[0];
+        assert_eq!(run.ran, Some(3));
+        assert_eq!(run.failed, Some(2), "failures=1 与 errors=1 都要算进来");
+    }
+
+    /// 内核 `output_path` 落的那份日志第二行是 `exit: ExitStatus { … }`。读它：非零退出
+    /// 或被信号杀死都不能算过。没有这一行的（worker 自己 tee 的）只看计数，**不猜**。
+    #[test]
+    fn a_landed_test_log_carries_its_exit_status() {
+        let ok = scratch(
+            "exit",
+            "ok.log",
+            b"command: python3 -m unittest test_lru_cache\nexit: ExitStatus { code: Some(0), signal: None }\n--- stdout ---\nRan 26 tests in 0.011s\n\nOK\n",
+        );
+        let mut claim = ok.clone();
+        claim.kind = EvidenceKind::TestLog;
+        let rep = check_evidence(&[claim]);
+        assert!(rep.issues.is_empty(), "{:?}", rep.issues);
+        assert_eq!(rep.test_runs[0].exit_code, Some(0));
+
+        let bad = scratch(
+            "exit",
+            "bad.log",
+            b"command: python3 -m unittest test_lru_cache\nexit: ExitStatus { code: Some(1), signal: None }\n--- stdout ---\nRan 26 tests in 0.011s\n\nFAILED (failures=1)\n",
+        );
+        let mut claim = bad.clone();
+        claim.kind = EvidenceKind::TestLog;
+        let rep = check_evidence(&[claim]);
+        assert_eq!(rep.issues.len(), 1, "{:?}", rep.issues);
+        assert!(rep.issues[0].contains("exit 1"), "{:?}", rep.issues);
+
+        // 被信号杀死：没有退出码，但 `signal: Some(9)` 同样不能算过（OOM-kill 的
+        // 日志看起来「跑完了」，只有这一行说它没有）。
+        let killed = scratch(
+            "exit",
+            "killed.log",
+            b"command: python3 -m pytest\nexit: ExitStatus { code: None, signal: Some(9) }\n--- stdout ---\n5 passed in 0.31s\n",
+        );
+        let mut claim = killed.clone();
+        claim.kind = EvidenceKind::TestLog;
+        let rep = check_evidence(&[claim]);
+        assert_eq!(
+            rep.issues.len(),
+            1,
+            "信号杀死的日志不能算过: {:?}",
+            rep.issues
+        );
+        assert!(rep.issues[0].contains("signal 9"), "{:?}", rep.issues);
+        assert_eq!(rep.test_runs[0].exit_code, None);
+        assert_eq!(rep.test_runs[0].exit_signal, Some(9));
     }
 
     #[test]

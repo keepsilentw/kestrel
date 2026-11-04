@@ -283,6 +283,9 @@ async fn main() -> anyhow::Result<()> {
                 per_dispatch_usd: d.nominal_usd,
                 max_usd: d.max_usd,
                 max_iterations: 3,
+                // 与 max_iterations 同为编译期默认值（demo 的两个上限都不是钱的上限，
+                // 钱由 --max-usd 管）：回跳额度见 design §9.32④。
+                max_reworks: 2,
                 bell_timeout: Duration::from_secs(d.bell_timeout_secs),
                 worktree: d.worktree,
                 approvals: d.approvals,
