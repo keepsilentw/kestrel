@@ -372,6 +372,7 @@ mod tests {
                 issues: vec![],
                 test_runs: vec![],
                 notes: vec![],
+                attribution: Default::default(),
             },
         })
         .unwrap();

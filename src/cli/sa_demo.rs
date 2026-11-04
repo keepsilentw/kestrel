@@ -18,6 +18,7 @@ use crate::cli::serve::{approval_command, approval_receipt_from_frame, decision_
 use crate::cli::task::artifact_path;
 use crate::core::ops::ApprovalDecision;
 use crate::journal::Journal;
+use crate::journal::records::Attribution;
 use crate::journal::records::{JournalRecord, Stage, TestRun, ThinBell, Verdict};
 use crate::permissions::{Decision, PermissionEngine};
 use crate::provider::config::Registry;
@@ -777,8 +778,10 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
             // FAIL 之后「派给谁」是路由问题，不是判定强度：验证类 stage 说不达标，
             // 说的是**被验证的产物**，而验证者没有写范围，再给它一颗铃只会得到同一份
             // FAIL。返工要有额度（`max_reworks`），额度用尽就把它说成显式失败。
+            // 归因是判定那一刻就写进 `verdict.attribution` 的字段（§9.41），路由只是读它——
+            // 不在这里重新解释 issue 的措辞，否则改一句文案就会悄悄改掉路由。
             if rework_target(stage) == Some(Stage::Dev)
-                && !verdict_is_about_the_turn(&verdict.issues)
+                && verdict.attribution == Attribution::Artifact
             {
                 if reworks_left == 0 {
                     anyhow::bail!(
@@ -825,10 +828,9 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
             // 走到这里有两种：Dev 自己的 FAIL（「你还没做成」），或验证者那一回合坏了
             // （空结果 / abort / stop=error）。后者的产物**还没被可信地看过**，重派验证者、
             // 不扣返工额度——把 QA 的哑火算到 RD 头上，只会换来两轮辩护。
-            let why = if verdict_is_about_the_turn(&verdict.issues) {
-                "the verifier's own turn is broken, so the artifact was never credibly seen"
-            } else {
-                "the writer did not finish the job"
+            let why = match verdict.attribution {
+                Attribution::Turn => "this turn broke, so the artifact was never credibly seen",
+                Attribution::Artifact => "the writer did not finish the job",
             };
             println!(
                 "[sa] {stage_name} iter{iter}: fail ({}) -> re-dispatch {target} ({why})",
@@ -877,15 +879,26 @@ fn under_reports_input(usage: &Usage) -> bool {
 ///
 /// 2026-11-04 实测出来的这一格：`review iter1: fail (empty result, worker stop: round budget
 /// exhausted)` 被路由成「RD 返工」，RD 连着两轮都在替一个它改不动的东西辩护，白烧掉 dev 的
-/// iteration 预算，最后撞上限。验证者这一回合本身不可信时，**不能**拿它的结论去定罪产物——
-/// 重派验证者才是那一条正确的动作，也不该因此扣掉返工额度。
-fn verdict_is_about_the_turn(issues: &[String]) -> bool {
-    issues.iter().any(|i| {
+/// iteration 预算，最后撞上限。验证者这一回合本身不可信时，**不能**拿它的结论去定罪产物。
+///
+/// 这件事只在**判定产出的那一刻**说得清，所以它写成 `Verdict.attribution` 落进 journal
+/// （§9.41）：路由读的是那个字段，不是这里拼出来的措辞。分类规则一旦住在路由里，
+/// 改一句 issue 文案就能悄悄改掉路由，而没有任何测试会为此变红。
+fn attribute(issues: &[String]) -> Attribution {
+    if issues.iter().any(|i| {
         i == "empty result"
             || i == "worker aborted"
             || i.starts_with("worker stop:")
             || i.starts_with("no result bell")
-    })
+            || i.starts_with("artifact missing:")
+            || i.starts_with("artifact is not valid JSON:")
+    }) {
+        Attribution::Turn
+    } else {
+        // 分不出来源就归给产物：那是更贵的一侧——宁可多问写者一次，
+        // 也不因为「读不懂」而把这一关放过去。
+        Attribution::Artifact
+    }
 }
 
 fn report_ledger(journal: &Journal, ledger: &PriceLedger) {
@@ -1183,6 +1196,8 @@ pub fn verdict_from_artifact(path: &Path, required: &[EvidenceKind]) -> Verdict 
         return Verdict {
             pass: false,
             issues: vec![format!("artifact missing: {}", path.display())],
+            // 工件没落地 = 这一关的产出本身没出来，不能拿去定罪被审的产物。
+            attribution: Attribution::Turn,
             ..Default::default()
         };
     };
@@ -1190,6 +1205,7 @@ pub fn verdict_from_artifact(path: &Path, required: &[EvidenceKind]) -> Verdict 
         return Verdict {
             pass: false,
             issues: vec![format!("artifact is not valid JSON: {}", path.display())],
+            attribution: Attribution::Turn,
             ..Default::default()
         };
     };
@@ -1264,6 +1280,7 @@ pub fn verdict_from_artifact(path: &Path, required: &[EvidenceKind]) -> Verdict 
     }
     Verdict {
         pass: issues.is_empty(),
+        attribution: attribute(&issues),
         issues,
         test_runs,
         notes,
@@ -1402,21 +1419,53 @@ mod tests {
     }
 
     #[test]
-    fn a_broken_turn_is_not_evidence_about_the_artifact() {
-        let issues = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
-        // 验证者这一回合本身不可信：空结果 / abort / stop=error。
-        assert!(verdict_is_about_the_turn(&issues(&[
-            "empty result",
-            "worker stop: round budget exhausted",
-        ])));
-        assert!(verdict_is_about_the_turn(&issues(&["worker aborted"])));
-        // 产物没交对才是写者的账。
-        assert!(!verdict_is_about_the_turn(&issues(&[
-            "no verified test_log evidence: this stage requires one"
-        ])));
-        assert!(
-            !verdict_is_about_the_turn(&issues(&["evidence missing: /tmp/x.log"])),
-            "缺文件是产物的账，不是回合的账"
+    fn the_verdict_carries_its_own_attribution() {
+        // 归因写在判定产出的那一刻（§9.41），所以这里测的是**产出端**：从真工件长出来的
+        // verdict 必须自带正确的 attribution，路由那端只是读它。改一句 issue 的措辞不该
+        // 改掉路由——那正是分类住在路由里时的毛病。
+
+        // 回合坏掉：工件在、result 是空的、worker 侧 stop = error。
+        let broken = write_artifact(
+            "broken-turn.json",
+            r#"{"result":"","aborted":false,"stop":{"type":"error","message":"round budget exhausted"}}"#,
+        );
+        let v = verdict_from_artifact(&broken, &[]);
+        assert!(!v.pass);
+        assert_eq!(v.attribution, Attribution::Turn, "{:?}", v.issues);
+
+        // 产物坏掉：说了 DONE，点名的文件不在盘上。
+        let gone = evidence_file("attr-lru.py");
+        std::fs::remove_file(&gone).unwrap();
+        let art = write_artifact(
+            "attr-artifact.json",
+            &format!(
+                r#"{{"result":"DONE: shipped","evidence":[{{"kind":"file","path":"{}"}}],"aborted":false,"stop":{{"type":"stop"}}}}"#,
+                gone.display()
+            ),
+        );
+        let v = verdict_from_artifact(&art, &[]);
+        assert!(!v.pass);
+        assert_eq!(
+            v.attribution,
+            Attribution::Artifact,
+            "缺文件是产物的账，不是回合的账: {:?}",
+            v.issues
+        );
+
+        // 工件根本没落地：这一关的产出没出来，不能拿去定罪被审的产物。
+        let v = verdict_from_artifact(
+            std::path::Path::new(&format!(
+                "/tmp/kestrel-never-written-artifact-{}.json",
+                std::process::id()
+            )),
+            &[],
+        );
+        assert_eq!(v.attribution, Attribution::Turn);
+
+        // 分不出来源时落在**更贵的一侧**：宁可多问写者一次，也不因为读不懂而放过。
+        assert_eq!(
+            attribute(&["no verified test_log evidence: this stage requires one".to_string()]),
+            Attribution::Artifact
         );
     }
 

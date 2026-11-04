@@ -33,8 +33,34 @@ pub struct Verdict {
     /// 重启之后没人知道当初 SA 把哪句声明认成了哪个文件，就没法复现那次判定。
     #[serde(default)]
     pub notes: Vec<String>,
+    /// 这次 FAIL（若有过）说的是**产物**还是**验证者那一回合**。路由读它，不再读
+    /// issue 的措辞（§9.41）：分类在判定产出的那一刻做，因为只有那里知道自己凭什么说
+    /// 这句话。默认 `Artifact` 是刻意的下限——分不出来源时宁可多问写者一次，
+    /// 也绝不因为「读不懂」而放过去。
+    #[serde(default)]
+    pub attribution: Attribution,
 }
 
+/// FAIL 的归属。`Turn` = 这次判定本身不可信（空结果、abort、worker 侧 stop=error、
+/// 没回铃）：产物**没被可信地看过**，不能拿它定罪谁。`Artifact` = 判定读了盘并且得出了
+/// 关于产物的结论。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Attribution {
+    #[default]
+    Artifact,
+    Turn,
+}
+
+impl Attribution {
+    /// 返工铃与报账用的一句话。
+    pub fn label(&self) -> &'static str {
+        match self {
+            Attribution::Artifact => "the artifact",
+            Attribution::Turn => "the verifying turn itself",
+        }
+    }
+}
 /// 一份测试日志读出来的结论。字段全可缺：`None` 说的是「这份日志里没写」，
 /// 不是「0 条通过」——把缺席当 0 就是把「说不清」记成「没问题」。
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -679,6 +705,7 @@ mod tests {
                     issues: vec![],
                     test_runs: vec![],
                     notes: vec![],
+                    attribution: Default::default(),
                 },
             },
         ];
@@ -940,6 +967,7 @@ mod tests {
                     issues: vec![],
                     test_runs: vec![],
                     notes: vec![],
+                    attribution: Default::default(),
                 },
             },
         ];
@@ -957,6 +985,7 @@ mod tests {
                     issues: vec![],
                     test_runs: vec![],
                     notes: vec![],
+                    attribution: Default::default(),
                 },
             },
         ];
@@ -1063,6 +1092,11 @@ mod tests {
             "老行的缺字段读成空: {:?}",
             verdict.test_runs
         );
+        assert_eq!(
+            verdict.attribution,
+            Attribution::Artifact,
+            "老行没有归因字段：落在产物那一侧（更贵的默认），不是猜个「回合」把这一关放过去"
+        );
 
         // `JournalRecord` 不实现 PartialEq（它带 Value/浮点，等值比较本来就没意义），
         // 所以这里比的是「读回来的 verdict」与「序列化文本逐字节一致」。
@@ -1070,6 +1104,7 @@ mod tests {
             pass: false,
             issues: vec!["did not pass".into()],
             notes: vec![],
+            attribution: Attribution::Artifact,
             test_runs: vec![TestRun {
                 path: "/tmp/unittest.log".into(),
                 exit_code: Some(1),
@@ -1233,6 +1268,7 @@ mod tests {
                 issues: vec![],
                 test_runs: runs,
                 notes: vec![],
+                attribution: Default::default(),
             },
         }
     }
