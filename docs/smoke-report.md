@@ -7,7 +7,7 @@
 
 ## 1. 自动化测试基线（cargo test）
 
-**Metrics** — src 51 files / 16212 lines · tests 9 files / 3319 lines · 235 tests (lib 183 + bin 4 + integration 48)
+**Metrics** — src 51 files / 16298 lines · tests 9 files / 3319 lines · 237 tests (lib 185 + bin 4 + integration 48)
 **Integration** — core_loop 5 / discipline 2 / m1_tools 9 / m2_session 6 / m4_bus 15 / m5_pool 5 / sandbox_e2e 4 / wire_anthropic 2
 
 | 组 | 覆盖 |
@@ -492,6 +492,37 @@ key 紧跟着的那个值（剥 `:`/`=`/空白与 `Some(`），读不到就是 `
 
 **轮转没在现场被触发**（33 条 < 默认 512），检查点带结论这件事只有单元级覆盖（构造检查点 →
 JSON 往返 → 重放等于在线）。要现场验它得跑到 512 条记录，那是另一轮的量级，不在今天这一格内。
+
+## 23. 2026-11-04 第五轮联跑（带费率表）：账单与「顶不起账单的读数」第一次同场分岔
+
+前置：`--prices` 指向一份**仓库外**的实验件（provider/model 与 `cost` 齐全；单价是任意取整的
+合成数字 `input 0.2 / output 0.8` per MTok，**不是任何市场报价**；`key` 是占位符——SA 只从这里
+读 cost，拨号仍走 worker 自己的 `~/.kestrel/providers.toml`）。`run-demo.sh` 为此新增
+`KESTREL_DEMO_PRICES`（没设 = 不传 flag，走用户层默认）。
+
+| 时刻 | SA 打印 | 这一行走的是哪条路 |
+|---|---|---|
+| dev iter1 | `settled 0.0175 usd for 55228 in / 8117 out tokens` | DeepSeek 报了 input ⇒ 按 token 结算成真账单（§9.27 那条路径第一次在真端点上算出钱，不再停在名义值） |
+| dev iter2 | `settled 0.0016 usd for 3180 in / 1226 out tokens` | 同上，随后 `test log … exit 0, ran 34, 34 passed / 0 failed` → pass |
+| review iter1 | `harness-qa reported 0 input tokens with 8197 out — the gateway under-reports (§9.7), so this books the reservation 0.0320 usd as NOMINAL instead of a bill that would read too cheap` | BigModel 的 0 输入读数顶不起账单：结算照做（配对键消耗）、钱按预留落、名义那一份跟着涨 |
+| test / build | 同上一条（`4453 out` / `1684 out`） | 同一判断在每一关都独立成立，不是一次性的 |
+| 收尾 | `ledger harness-qa: 0.0960 usd ; tokens in 0 / out 14334` ; `ledger harness-rd: 0.0192 usd ; tokens in 58408 / out 9343` ; `ledger total: 0.1152 usd, of which 0.0960 nominal` | 两本账分开的样子第一次看得见：rd 那 0.0192 是**算出来的**，qa 那 0.0960 是**说不清的**；token 读数即使不可信也照样留档 |
+
+`pipeline complete`，退出码 0；开工首行不再有 `budget stays NOMINAL for …`（两端都有价了），
+分岔发生在结算那一刻而不是开工那一刻——这正是 §9.36 想钉的位置。
+
+**闸门**：`cargo fmt --check` / `cargo clippy --all-targets -- -D warnings` / `cargo test` 实跑全绿，
+237 tests（lib 185 + bin 4 + integration 48）。本轮新增 2 项：`a_zero_input_reading_is_not_a_bill`
+（三种读数：0 输入有输出 = 少报；报了输入 = 不算少报；什么都没报 ≠ 少报，那条走「没有价」）、
+`booking_a_priced_reservation_back_as_nominal_keeps_the_money`（钱留在账上、名义那份跟着涨、配对键
+消耗掉不被二次结算烧穿）。
+
+**账本上看不见的东西**（design §10 已记）：`nominal_usd` 现在混着两个来源——没填价、与读数不可信。
+收尾只说 `of which 0.0960 nominal`，理由活在逐次派发的打印与 journal 历史里。要分开报就得给
+`BudgetSettled` 加一个名义来源标记并让它参与折叠，那是账本形状的改变，不顺手做。
+
+**没做的事**：没有改动任何人的 `~/.kestrel/providers.toml`（单价跟着 provider 住，那是用户的配置层）；
+费率实验件写在仓库外，跑完即删，docs 里留下它的形状与那句「单价是合成数字，不是市场报价」。
 
 ## 19. 2026-11-04 第二轮联跑：`test_log` 真的可交了，FAIL 路由真的会回跳
 

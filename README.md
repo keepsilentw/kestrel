@@ -2,7 +2,7 @@
 
 为星型多 Agent harness 写的 Rust harness kernel：引擎 + wire 层 + 工具/权限/沙箱 + 会话 + 总线/journal + CLI/配置。设计文档（中文）见本仓库 `docs/design.md`。
 
-**Metrics** — src 51 files / 16212 lines · tests 9 files / 3319 lines · 235 tests (lib 183 + bin 4 + integration 48)
+**Metrics** — src 51 files / 16298 lines · tests 9 files / 3319 lines · 237 tests (lib 185 + bin 4 + integration 48)
 
 Status: M0-M4 complete + 二期开工（`ApproveMode::Bus`、SA 判定含证据核对、bus 停车补投与自动重连、journal 快照/截断与在线投影、多任务 task 命名空间、openai-responses wire、worker 池、预算按 token 结算的价格表、journal 轮转的默认策略、按类型核对的证据与 stage 要求表、审批请求的 at-least-once 投递与按 req 幂等、验证 FAIL 回跳写者、bash `output_path` 交出可核对的 test_log）——这批改动 2026-11-04 走完真端点联跑（`pipeline complete`；那两轮联跑抓出并修掉三个「测试全绿但跑不起来」的缺陷，见 docs/design.md §9.32 / §9.33）。fmt / clippy `-D warnings` / test 三闸门全绿（人工执行：本仓库不挂 CI）。上面那行数字由 `tests/discipline.rs` 与源码树对照校验：改完代码不更新它，闸门就红。
 
@@ -59,6 +59,9 @@ cargo build && ./harness/run-demo.sh      # hub + RD + QA + demo-sa 四进程
 => 派发前先按该模型的最坏情况（整窗输入 + 满 `max_out` 输出）预留额度做停损，结果铃
 回来后按实际 token 结算换掉预留；**任何一端缺席** => 每次派发记 `--nominal-usd`
 （默认 0.5）的名义值，SA 开工即印出哪些 peer 没有价，绝不把「没人填价」记成「这次免费」。
+**有价但读数不可信**（端点报了 output 却不报 input，BigModel 就是这个形状）=> 结算照做（预留得配对
+掉），但按**名义**落账并当场打印理由：一张少掉整个输入侧的「账单」比名义值更危险，因为它看起来是
+算出来的。那个字符估算只用来决定「要不要压上下文」，绝不当钱的来源（§9.36）。
 `priced` 标记与金额一起落 journal，所以事后能复现「这笔钱当时按什么算」——这是不变式 5
 （journal 是真相）对钱的延伸。把 `cost` 写成 `{input = 0.0, output = 0.0}` 不算「免费」，
 等同没填：按 0 记账的停损等于没有停损。

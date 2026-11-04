@@ -11,7 +11,7 @@
 > 质量闸门保持人工执行（本仓库不挂 CI，见 §9.19⑥）。
 > 二期十一项已于 2026-11-04 在真端点联跑中走完（`pipeline complete`，四阶段全 pass，
 > 审批请求/判定/回执各 5 条成对）；那一次联跑抓出并修掉两个「测试全绿但跑不起来」的缺陷，见 §9.32。
-> **Metrics** — src 51 files / 16212 lines · tests 9 files / 3319 lines · 235 tests (lib 183 + bin 4 + integration 48)
+> **Metrics** — src 51 files / 16298 lines · tests 9 files / 3319 lines · 237 tests (lib 185 + bin 4 + integration 48)
 > **Integration** — core_loop 5 / discipline 2 / m1_tools 9 / m2_session 6 / m4_bus 15 / m5_pool 5 / sandbox_e2e 4 / wire_anthropic 2
 > 规模已过 plan 预算（10-13k）的上沿：多出来的部分几乎都花在「取消安全」与「对账」这两条纪律上。
 > 上面两行数字由 `tests/discipline.rs::metrics_lines_match_the_tree` 对照源码树重算校验——
@@ -275,6 +275,13 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
     ⑤ 刻意没有的第三个读者：让预算停损或放行闸门去读它。判定层在当场就已经拦下失败的日志（§9.34），再加一道闸门是把同一件事判两次，还会让「钱的上限」混进「测试的结论」这两本账。要做的话，得先想清楚它拦的是钱还是进度。
     ⑥ 还没做的：同一份日志被 4 个 stage 各引用一次时**不去重**（投影里就是 4 条，各自回答自己那一关）。跨 stage 去重要等到「结论按 artifact 而不是按 stage 归位」那天——现在按 stage 归位是有意的：每一关交出的那份东西才算这一关的结论。
 
+36. **有价不等于能算账：少报的读数按名义落账（2026-11-04 实测触发）**：填上费率表跑联跑，两条路在同一次运行里分岔——
+    ① DeepSeek（RD）报了 input，结算就真的按 token 走：`settled 0.0175 usd for 55228 in / 8117 out tokens`，收尾账本 `harness-rd: 0.0192 usd ; tokens in 58408 / out 9343`。这是 §9.27 那条「预留 → 结算」第一次在真端点上被算成钱，而不是停在名义值。
+    ② BigModel（QA）**不报 input**（§9.7 实测的同一个形状），本轮读数是 `0 in / 8197 out`。如果照价结算，出来的是一张少掉整个输入侧的账单——它比名义值更危险，因为看着像算过的。所以：结算照做（预留必须配对掉，否则同一笔派发可能被再计一次），但**按名义落账**并把理由打出来：`reported 0 input tokens with 8197 out — the gateway under-reports (§9.7), so this books the reservation 0.0320 usd as NOMINAL instead of a bill that would read too cheap`。
+    ③ 为什么不用 §9.7 那套字符估算来补 input 然后照价结算：那个估算的存在理由是「要不要压上下文」，是一个阈值判断，误差被阈值吸收；把它当钱的来源，等于让一个没人验证过的数字进入停损。宁可按预留额（最坏情况）多计。**读数必须是端点报的**，这是这一格的界线。
+    ④ 语义落在折叠层而不是打印层：`under_reports_input()`（0 输入 + 有输出；「什么都没报」不算少报，那走「没有价」那条路，不重复计一次）。records 侧 `booking_a_priced_reservation_back_as_nominal_keeps_the_money` 钉住三件事——钱按预留留在账上、名义那一份跟着涨、配对键消耗掉不被二次结算烧穿。
+    ⑤ 剩下的没做：**名义值有两个来源（没填价 / 读数不可信），但在账本上合并成同一个数**。收尾只说 `of which 0.0960 nominal`，理由活在逐次派发的打印与 journal 历史里。要分开报，就得给 `BudgetSettled` 一个名义来源标记（`nominal_reason`）并让它参与折叠——那是账本形状的改变，不该顺手做。
+
 ## 10 二期清单
 
 已落地（2026-10-28 起）：~~`ApproveMode::Bus`~~（授权表 + 超时 fail-closed + journal 审计，§9.20）、~~SA 判定升级到「工件 + 证据文件」~~（绝对路径存在性/非空核对，§9.20）、~~bus 重连重放~~（离线 session 停车补投 + 客户端自动重连；RPC 与「写入即死」的帧不重放，§9.21）、~~journal 快照/截断语义~~（检查点 + 归档段 + 崩溃安全轮转，§9.22）、~~多任务并行~~（task 命名空间三处同源 + 前缀寻址，§9.23）、~~openai-responses wire~~（第三条 v1 wire，金身 + fixture 验证，**真端点未实测**，§9.24）、~~journal 投影增量化与轮转触发~~（在线投影 = 全量重放 + 条数/字节双上限，§9.25）、~~一个引擎内真正并发地服务多个 task~~（改为「一 task 一引擎」的 worker 池，单活跃槽不动，§9.26）、~~`BudgetSpent` 的价格表~~（预留 → 结算两段式、按 token 换账单、无价退回名义值并报出来，§9.27；2026-11-03）、~~journal 轮转的**默认策略**~~（活文件 512 条 / 1 MiB 双上限、三态 CLI、生产与测试同一条 `rotate_at_boundary`，§9.28；2026-11-03）、~~证据的类型化~~（`file` / `test_log` / `diff` / `screenshot` 各自可在盘上反驳 + `--evidence-spec` 的 stage 要求，坏表硬失败，§9.29；2026-11-03）、~~审批批复的可靠投递~~（请求 at-least-once + 按 req 幂等 + 台账从 journal 播种，判定仍只一次，§9.30；2026-11-03）、~~批复到底有没有生效~~（回执 `approval_receipt` + `ApprovalAcked` 落账 + 到点撤摊，**没生效的批准不许记成生效**，§9.31；2026-11-03）。
@@ -283,4 +290,4 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
 
 2026-11-04 联跑新添的两格同日落地（§9.33）：验证类 stage 的 FAIL 回跳给写者返工（带额度 `max_reworks`、带原因 `ref.rework`、每关 iter 跨回跳不清零），bash 用 `output_path` 参数交出可核对的 `test_log`（内核把 stdout/stderr 连 `exit: ExitStatus{...}` 一起写进那个文件）。下一格因此有了明确的落点：SA 只要去读那行 `exit:`，「形状」就能升级成「结论」——现在它还只证明「这份文件是测试汇总」。
 
-新划出的边界：`nominal_usd` 的占比应当随 `providers.toml` 填写完整率下降，这条曲线本身值得盯（单价填全之后 `--max-usd` 才是真正的账单上限，名义值只作为「说不清价」的兜底存在）。证据强度这一格已于同日走完（§9.34），**结论也已经是状态**（§9.35）：`test_runs` 进投影、跨轮转存活，并被收尾报账与返工铃读走。清单上因此只剩相关的两件：**同一份日志被多个 stage 引用时不去重**（按 stage 归位是刻意的），以及**没有任何闸门把结论当输入**——停损只看钱，要不要让「测试没绿」影响放行，先要想清楚它拦的到底是钱还是进度。
+新划出的边界：`nominal_usd` 的占比应当随 `providers.toml` 填写完整率下降，这条曲线本身值得盯（单价填全之后 `--max-usd` 才是真正的账单上限，名义值只作为「说不清价」的兜底存在）。2026-11-04 补一句：**只填价不够**——名义值现在有两个来源（没填价 / 读数不可信，§9.36），少报 input 的端点会一直留在名义侧，这是对的，但看账的人必须知道它为什么还在。证据强度这一格同日走完（§9.34），**结论也已经是状态**（§9.35）：`test_runs` 进投影、跨轮转存活，并被收尾报账与返工铃读走。清单上因此留下四件相关的：**名义值的两个来源在账本上合并成一个数**（要分开报，得给 `BudgetSettled` 一个名义来源标记并参与折叠，那是账本形状的改变，不该顺手做）、**同一份日志被多个 stage 引用时不去重**（按 stage 归位是刻意的）、**没有任何闸门把结论当输入**（停损只看钱），以及上面那条「看账的人要知道它为什么还在」。
