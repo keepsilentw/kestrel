@@ -14,7 +14,10 @@ prompt_file = "../systems/rd.md"   # 相对 role 文件所在目录（harness/ro
 policy_file = "writer.policy.json"
 # 派发工作树由环境给出（run-demo.sh 导出），role 文件本身不钉死某台机器的路径。
 write_roots = ["$KESTREL_WORKTREE:-/tmp/kestrel-worktree"]
-read_only_islands = ["$KESTREL_WORKTREE:-/tmp/kestrel-worktree/.git"]
+# 注意 `${VAR:-default}` 的花括号写法：裸写 `$VAR:-default` 时 `:-` 会吞掉整条
+# 后缀，env 一旦设过，这里就变成 worktree 本身——整个工作树落进只读岛，RD 一个
+# 文件都写不下去（design §9.32）。
+read_only_islands = ["${KESTREL_WORKTREE:-/tmp/kestrel-worktree}/.git"]
 # 反向审批：沙箱拒绝 / 策略 Ask 时问 SA（ApproveMode::Bus）。SA 无授权表或
 # 沉默 60s 都按 deny 处理——worker 不会因等待审批而挂住回合。
 approve = "bus"

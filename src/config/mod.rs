@@ -190,32 +190,61 @@ fn canon(base: &Path, p: &Path) -> anyhow::Result<PathBuf> {
     Ok(joined)
 }
 
-/// Expand a leading `$NAME` reference in a role path: `$NAME`,
-/// `$NAME:-default`, or `$NAME/rest`. An unset variable with no default is a
-/// hard error naming the spelling: a role that silently lost its write root
-/// would move the sandbox without anyone deciding to.
+/// Expand a leading `$NAME` reference in a role path: `$NAME`, `$NAME/rest`,
+/// `$NAME:-default`, or the braced `${NAME}` / `${NAME:-default}` followed by a
+/// path. An unset variable with no default is a hard error naming the spelling:
+/// a role that silently lost its write root would move the sandbox without
+/// anyone deciding to.
+///
+/// The braced form exists because the bare one cannot express "default first,
+/// then more path": in `$NAME:-default` the `:-` owns the REST of the string, so
+/// `$WT:-/tmp/wt/.git` silently drops `.git` the moment `WT` is set — which left
+/// the whole RD worktree inside its own read-only island and made the demo
+/// unable to write a single file (design §9.32).
 fn expand_env_path(raw: &Path, lookup: &dyn Fn(&str) -> Option<String>) -> anyhow::Result<PathBuf> {
     let text = raw.to_string_lossy().into_owned();
-    let Some(rest) = text.strip_prefix('$') else {
-        return Ok(raw.to_path_buf());
+    let (name, default, tail) = match text.strip_prefix("${") {
+        Some(braced) => {
+            let Some(end) = braced.find('}') else {
+                anyhow::bail!("role path {text:?}: unterminated `${{...}}` reference");
+            };
+            let (head, rest) = braced.split_at(end);
+            let rest = &rest[1..];
+            let (name, default) = match head.split_once(":-") {
+                Some((n, d)) => (n, Some(d.to_string())),
+                None => (head, None),
+            };
+            (name, default, rest.to_string())
+        }
+        None => {
+            let Some(rest) = text.strip_prefix('$') else {
+                return Ok(raw.to_path_buf());
+            };
+            let name_len = rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(rest.len());
+            let (name, after) = rest.split_at(name_len);
+            match after.strip_prefix(":-") {
+                Some(d) => (name, Some(d.to_string()), String::new()),
+                None => (name, None, after.to_string()),
+            }
+        }
     };
-    let name_len = rest
-        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-        .unwrap_or(rest.len());
-    let (name, tail) = rest.split_at(name_len);
+    // A braced name is delimited by `}` rather than by `/`, so it needs its own
+    // check: `${a.b}` must not be read as a variable named `a.b`.
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        anyhow::bail!("role path {text:?}: invalid variable name {name:?}");
+    }
     if name.is_empty() {
         anyhow::bail!("role path {text:?}: empty variable name after '$'");
     }
-    // `:-` takes the REST of the string as the fallback (so a fallback may
-    // itself be a path); without it, a `/` after the name continues the path.
-    let (default, tail) = match tail.strip_prefix(":-") {
-        Some(d) => (d.to_string(), String::new()),
-        None => (String::new(), tail.to_string()),
-    };
-    let value = match (lookup(name), default.is_empty()) {
+    // An empty fallback (`$WT:-`) is not a declared default: a root of "" would
+    // make every path on the machine a prefix match, so it stays a hard error.
+    let default = default.filter(|d| !d.is_empty());
+    let value = match (lookup(name), default) {
         (Some(v), _) => v,
-        (None, false) => default,
-        (None, true) => anyhow::bail!(
+        (None, Some(d)) => d,
+        (None, None) => anyhow::bail!(
             "role path {text:?}: environment variable {name} is not set and declares no \
              default (`${name}:-<fallback>`)"
         ),
@@ -319,6 +348,36 @@ mod tests {
             PathBuf::from("/tmp/wt"),
             "the environment wins over the fallback"
         );
+        // ...and *only* then: the bare form cannot carry a path after the
+        // fallback, so `$WT:-/tmp/wt/.git` used to lose `.git` whenever WT was
+        // set. Braces delimit the reference so the tail survives either way.
+        assert_eq!(
+            expand_env_path(&PathBuf::from("${WT:-/tmp/fallback}/.git"), &lookup).unwrap(),
+            PathBuf::from("/tmp/wt/.git"),
+            "the environment wins, and the tail is not swallowed"
+        );
+        assert_eq!(
+            expand_env_path(&PathBuf::from("${MISSING:-/tmp/wt}/.git"), &lookup).unwrap(),
+            PathBuf::from("/tmp/wt/.git")
+        );
+        assert_eq!(
+            expand_env_path(&PathBuf::from("${WT}/.git"), &lookup).unwrap(),
+            PathBuf::from("/tmp/wt/.git")
+        );
+        // An empty fallback is not a declared default: a root of "" would match
+        // every path on the machine, so both spellings stay hard errors.
+        assert!(
+            expand_env_path(&PathBuf::from("${MISSING:-}/x"), &lookup).is_err(),
+            "an empty fallback does not open the root"
+        );
+        assert!(
+            expand_env_path(&PathBuf::from("${WT"), &lookup).is_err(),
+            "an unterminated brace is not guessed at"
+        );
+        assert!(
+            expand_env_path(&PathBuf::from("${a.b}/x"), &lookup).is_err(),
+            "a braced name is still an identifier"
+        );
         // literal paths are untouched
         assert_eq!(
             expand_env_path(&PathBuf::from("systems/rd.md"), &lookup).unwrap(),
@@ -335,6 +394,34 @@ mod tests {
             expand_env_path(&PathBuf::from("$-x"), &lookup).is_err(),
             "empty variable name is not guessed at"
         );
+    }
+
+    /// The roles shipped with the demo are the ones people actually run, and an
+    /// island that covers its own write root silently revokes it: RD spent three
+    /// iterations unable to write a single file (design §9.32). The library now
+    /// has the syntax to express "root, minus .git" — this makes sure the role
+    /// file uses it.
+    #[test]
+    fn shipped_roles_do_not_island_away_their_own_write_root() {
+        let roles = Path::new(env!("CARGO_MANIFEST_DIR")).join("harness/roles");
+        for name in ["rd.toml", "qa.toml", "sa.toml"] {
+            let path = roles.join(name);
+            let cfg =
+                RoleConfig::load(&path).unwrap_or_else(|e| panic!("load {}: {e}", path.display()));
+            let fs = cfg
+                .fs_policy(&roles)
+                .unwrap_or_else(|e| panic!("fs_policy {name}: {e}"));
+            for root in &fs.writable_roots {
+                for island in &fs.read_only_within {
+                    assert!(
+                        !root.starts_with(island),
+                        "{name}: read-only island {island:?} covers its write root \
+                         {root:?} — nothing in it is writable, which is not what an \
+                         island is for"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
