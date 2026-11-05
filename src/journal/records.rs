@@ -201,8 +201,11 @@ pub enum JournalRecord {
     },
     /// The worker's own token measurement, straight off its result bell. It is
     /// the raw reading; the money is derived from it by the ledger (`BudgetSettled`)
-    /// at the rate the registry declares, never by the worker itself. Kept as an
-    /// audit record: when the bill and the reading disagree, both are on disk.
+    /// at the rate the registry declares, never by the worker itself. The reading
+    /// is also what feeds the projection's per-peer token totals — NOT the
+    /// settlement: a peer with no rate never gets settled (§9.36's `None` arm), so
+    /// counting tokens at settlement would report `0 / 0` for a run that burned
+    /// tens of thousands of them. Money and usage keep separate sources.
     UsageReported {
         peer: String,
         usage: crate::provider::wire::Usage,
@@ -540,16 +543,19 @@ impl Folder {
             }
             // 结算换掉同坐标的预留：钱只计一次，多出来的部分退回去。找不到预留
             // 的结算（重复投递、或该 stage 早已结了账）不记账——宁可漏计一次重复
-            // 的，也不把一笔派发烧成两笔。
+            // 的，也不把一笔派发烧成两笔。这里**不**累加 token：结算是「钱的动作」，
+            // 用量住在 UsageReported 那一格，两者分开才不会有「没有费率 => 没用东西」。
             JournalRecord::BudgetSettled {
                 task,
                 peer,
                 stage,
                 iteration,
-                usage,
                 usd,
                 priced,
                 nominal_reason,
+                // `usage` 留在这条记录里是审计（结算对着哪份读数算的钱），但折叠不读它：
+                // 用量的来源只有 `UsageReported` 那一格。
+                usage: _,
             } => {
                 let key = budget_key(task, peer, *stage, *iteration);
                 if let Some((prior_usd, prior_priced)) = self.reserved.remove(&key) {
@@ -568,18 +574,22 @@ impl Folder {
                         // 老记录没有这个字段：按「没有价」处理，而不是按 0 或猜别的。
                         self.shift_nominal(nominal_reason.unwrap_or(NominalReason::NoRate), *usd);
                     }
-                    self.tokens
-                        .entry(peer.clone())
-                        .or_default()
-                        .accumulate(usage);
                 }
             }
-            // Approvals and usage are audit records: they never move the stage
-            // projection, and a replay must not count them as bells.
+            // Approvals are audit records: they never move the stage projection,
+            // and a replay must not count them as bells.
             JournalRecord::ApprovalRequested { .. }
             | JournalRecord::ApprovalDecided { .. }
-            | JournalRecord::ApprovalAcked { .. }
-            | JournalRecord::UsageReported { .. } => {}
+            | JournalRecord::ApprovalAcked { .. } => {}
+            // 用量读数是**用量**的真相，不是钱的真相。没有费率时结算根本不会发生，
+            // 所以这一格必须自己把 token 记进投影——否则收尾那行会印出
+            // `tokens in 0 / out 0`，把一次烧掉两万多 token 的运行说成什么都没花。
+            JournalRecord::UsageReported { peer, usage } => {
+                self.tokens
+                    .entry(peer.clone())
+                    .or_default()
+                    .accumulate(usage);
+            }
             JournalRecord::Snapshot { checkpoint, .. } => {
                 // hard reset of the fold: the prefix is already inside the
                 // checkpoint, and its in-flight set replaces whatever we had.
@@ -880,6 +890,10 @@ mod tests {
     fn settlement_replaces_the_reservation() {
         let records = vec![
             JournalRecord::reserved("t", "rd", Stage::Dev, 1, 0.5, true),
+            JournalRecord::UsageReported {
+                peer: "rd".into(),
+                usage: usage(100, 20),
+            },
             JournalRecord::settled("t", "rd", Stage::Dev, 1, usage(100, 20), 0.12, true),
         ];
         let rep = reconcile(&records);
@@ -889,7 +903,11 @@ mod tests {
             rep.state.spent_usd
         );
         assert!(rep.state.nominal_usd.is_empty(), "按价结算的不是名义值");
-        assert_eq!(rep.state.tokens["rd"], usage(100, 20));
+        assert_eq!(
+            rep.state.tokens["rd"],
+            usage(100, 20),
+            "用量来自读数那条，不是结算那条"
+        );
         assert!(rep.state.reserved.is_empty(), "配对键随结算消耗掉");
     }
 
@@ -933,7 +951,53 @@ mod tests {
         ];
         let rep = reconcile(&records);
         assert_eq!(rep.state.spent_usd.get("rd").copied().unwrap_or(0.0), 0.0);
-        assert!(rep.state.tokens.is_empty(), "被丢弃的结算不留 token 痕迹");
+        assert!(
+            rep.state.tokens.is_empty(),
+            "结算不再是用量的来源：被丢弃的结算既不记钱也不记 token"
+        );
+    }
+
+    /// 没有费率的运行也要报得出用量（2026-11-05 真端点联跑抓到的那一格）：那条路径
+    /// 根本不落 `BudgetSettled`，所以用量若只在结算时累加，收尾那行就印成
+    /// `tokens in 0 / out 0`——把一次烧掉两万多 token 的运行说成什么都没花。
+    /// 钱的部分不变：仍按名义计一次。
+    #[test]
+    fn a_nominal_run_reports_the_tokens_it_read() {
+        let records = vec![
+            JournalRecord::reserved("t", "rd", Stage::Dev, 1, 0.5, false),
+            JournalRecord::UsageReported {
+                peer: "rd".into(),
+                usage: usage(5_646, 6_210),
+            },
+        ];
+        let rep = reconcile(&records);
+        assert_eq!(
+            rep.state.tokens["rd"],
+            usage(5_646, 6_210),
+            "读数进账，与有没有费率无关"
+        );
+        assert!(
+            (rep.state.nominal_usd["rd"] - 0.5).abs() < 1e-9,
+            "钱仍按名义计一次: {:?}",
+            rep.state.nominal_usd
+        );
+
+        // 一份读数配两次结算（重复投递）也只能算一次用量
+        let doubled = vec![
+            JournalRecord::reserved("t", "qa", Stage::Test, 1, 0.2, true),
+            JournalRecord::UsageReported {
+                peer: "qa".into(),
+                usage: usage(10, 5),
+            },
+            JournalRecord::settled("t", "qa", Stage::Test, 1, usage(10, 5), 0.02, true),
+            JournalRecord::settled("t", "qa", Stage::Test, 1, usage(10, 5), 0.02, true),
+        ];
+        let rep = reconcile(&doubled);
+        assert_eq!(
+            rep.state.tokens["qa"],
+            usage(10, 5),
+            "重复结算不烧第二笔用量"
+        );
     }
 
     /// 一次派发的预留与结算坐标必须完全对齐；iteration 不同就是另一次派发。
@@ -1012,6 +1076,10 @@ mod tests {
             JournalRecord::Snapshot {
                 covers: 1,
                 checkpoint,
+            },
+            JournalRecord::UsageReported {
+                peer: "rd".into(),
+                usage: usage(30, 12),
             },
             JournalRecord::settled("t", "rd", Stage::Dev, 1, usage(30, 12), 0.12, true),
         ];
@@ -1137,6 +1205,10 @@ mod tests {
     fn booking_a_priced_reservation_back_as_nominal_keeps_the_money() {
         let records = vec![
             JournalRecord::reserved("t", "qa", Stage::Test, 1, 0.160_768, true),
+            JournalRecord::UsageReported {
+                peer: "qa".into(),
+                usage: usage(0, 671),
+            },
             JournalRecord::settled_as_nominal(
                 "t",
                 "qa",
