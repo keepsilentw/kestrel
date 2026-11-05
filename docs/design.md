@@ -15,11 +15,12 @@
 > 随后换成**真实费率**（用户层 `providers.toml`，取峰时价的理由见 §9.43），名义值只剩一个来源：网关少报读数；
 > 最后一步把钱的单位从「写在名字里的 usd」改成「价目表声明的 currency」，两份价目表按厂商原文记（§9.44），
 > 并把 SA 后端从百炼 Token Plan 换成小米 MiMo——`-p` 单发两轮实测通过、官方 元 价也查到并记进配置（§9.44⑥⑧），
-> 只有星型联跑仍不派发 SA 这一点没变。
+> 只有星型联跑仍不派发 SA 这一点没变。同日第七轮把 QA 换到智谱的 OpenAI 兼容表面：
+> **名义值第一次归零**（`of which 0.0000 nominal`），顺带抓出「空账印成 `-0.0000`」这一格并钳掉（§9.45）。
 > 质量闸门保持人工执行（本仓库不挂 CI，见 §9.19⑥）。
 > 二期十一项已于 2026-11-04 在真端点联跑中走完（`pipeline complete`，四阶段全 pass，
 > 审批请求/判定/回执各 5 条成对）；那一次联跑抓出并修掉两个「测试全绿但跑不起来」的缺陷，见 §9.32。
-> **Metrics** — src 51 files / 17251 lines · tests 9 files / 3383 lines · 247 tests (lib 194 + bin 4 + integration 49)
+> **Metrics** — src 51 files / 17338 lines · tests 9 files / 3383 lines · 249 tests (lib 196 + bin 4 + integration 49)
 > **Integration** — core_loop 5 / discipline 2 / m1_tools 9 / m2_session 6 / m4_bus 15 / m5_pool 6 / sandbox_e2e 4 / wire_anthropic 2
 > 规模已过 plan 预算（10-13k）的上沿：多出来的部分几乎都花在「取消安全」与「对账」这两条纪律上。
 > 上面两行数字由 `tests/discipline.rs::metrics_lines_match_the_tree` 对照源码树重算校验——
@@ -110,7 +111,7 @@ flowchart TD
 | user | `~/.kestrel/providers.toml` | 唯一归属地（key 三态：字面量 / `$ENV` / `!cmd`） |
 | env | 仅被显式 `$VAR` 引用 | 无隐式 ANTHROPIC_* 回退 |
 
-每角色一个 TOML = 「一角色一后端」：SA→mimo-v2.6-flash、RD→deepseek-v4-flash、QA→glm-5.3-flash（示例见 `harness/roles/`）。对照 CC 方案（harness-v3 §6.2 的 settings 优先级对抗 + 钉全集仪式）此处 provider 归属在类型层唯一，无需仪式。SA 这一格 2026-11-05 从百炼 Token Plan 换成小米 MiMo，理由与「仍未实测」的边界见 §9.44⑤⑥。
+每角色一个 TOML = 「一角色一后端」：SA→mimo-v2.6-flash、RD→deepseek-v4-flash、QA→glm-5.3-flash（示例见 `harness/roles/`）。对照 CC 方案（harness-v3 §6.2 的 settings 优先级对抗 + 钉全集仪式）此处 provider 归属在类型层唯一，无需仪式。SA 这一格 2026-11-05 从百炼 Token Plan 换成小米 MiMo，理由与「仍未实测」的边界见 §9.44⑤⑥。「后端」是 provider+wire 这一对而不是模型：同日 QA 从 `zhipu-anthropic` 换到 `zhipu-openai`（同一颗 GLM-5.3-Flash 的 OpenAI 兼容表面，`api = "openai-completions"`），模型与 `input_image` 都没动，动的是「读数能不能算成钱」（§9.45）——所以换 wire 是改一行 role 配置，不是改代码。
 
 工具审批走同一条优先级链：`--approve all|none|bus`（runtime）> role 的 `[permissions].approve` > `none`（拒绝，fail-closed）。此前 `serve` 硬编码 HeadlessDeny，worker 永远走不到「沙箱拒绝 → 审批 → 脱沙箱重试」这条回路；现在 role 可以声明三态（demo 里 RD = `bus` 且 `approver = "harness-sa"`，QA 保持缺省拒绝）。runtime 只覆盖**模式**，不覆盖 role 声明的 `approve_timeout_secs`（`with_role_deadline`）——一个 CLI flag 不该顺手把审批等待改成无限。
 
@@ -351,6 +352,14 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
     ⑧ 端点本身**已经实测过两次**（`-p` 单发，2026-11-05）：纯文本流 `turn_complete usage in=17 / out=23`；带 bash 工具回合 `tool_begin{command:"echo kestrel-mimo-tool-ok"} → tool_end（沙箱内执行）→ turn_complete in=534 / out=68`，`stop=stop` 且**input usage 照报**（与 BigModel 那条 §9.7 的少报端点不同，这一台不会掉进 §9.36 的「读数不可信」分支）。仍要说清没覆盖的部分：demo 的星型联跑**不派发 SA**，所以 MiMo 没有走过门铃/工件/证据那条路，`harness/roles/sa.toml` 只是把后端指向了它。现场记录见 smoke-report §32。
 
     ⑧ 单位这件事是**跑过的**，不是改完名就宣布完成：第六轮联跑（真实费率、直接记元）走完四关，`dev iter1: settled 0.0401 cny for 3458 in / 4143 out tokens`（2×3458 + 8×4143 每百万 = 0.04006 元，与印出的数一致），收尾 `ledger total: 3.5153 cny, of which 3.4752 nominal (under-reported 3.4752)`——3.4752 = 3 × 1.1584，即 QA 三次都按峰时最坏情况的预留落名义账。现场记录见 smoke-report §31。
+
+45. **QA 换 OpenAI 兼容表面：名义值第一次归零，以及 `-0.0000` 那一格（2026-11-05 第七轮）**：
+    ① §9.43 之后报账里剩下的唯一名义来源是「网关少报读数」：BigModel 的 anthropic 兼容表面不在 `message_start` 回 input usage（§9.7），于是每次 QA 派发都被判「这份读数顶不起一张账单」，按最坏情况的预留落名义账（§9.36）。上一轮的数字是 `3.4752 nominal / 3.5153 total`——**九成七的钱说不清**，而真实花费远小于它。
+    ② 出路不是估一个 input token 数补上（§9.7 那套字符估算的用途是判断要不要压上下文，拿来当钱就是伪装成读数，正是 §9.36 拒绝的那件事），而是**换一个会报的 wire**：同一个模型、同一个 key、同一条价目表，`api = "openai-completions"` + `base_url = https://open.bigmodel.cn/api/paas/v4`。第七轮实测：`harness-qa: 0.1455 cny ; tokens in 126841 / out 6778 ; cache read 108800`——输入侧第一次有数，缓存命中也第一次进入账单（0.23 元/百万那一档）。
+    ③ 收尾一行第一次没有任何名义：`ledger total: 0.1806 cny, of which 0.0000 nominal`，而且后面那对括号（`no rate` / `under-reported` 的分类账）整段消失——§9.37 设计的「说不清的钱要说清为什么」，在一条全清白的账上就该什么都不说。整条 pipeline 报出来的钱从 3.5153 元降到 0.1806 元：不是价格变了，是**终于按实际读数算而不是按最坏情况猜**。
+    ④ 但那一行一开始印的是 `of which -0.0000 nominal`。查出来不是账算错：`f64` 的 `Iterator::sum` 用 `-0.0` 做单位元（有符号零要守 IEEE 的符号规则），所以**对空集合求和得到 `-0.0`**，`format!("{:.4}", -0.0)` 就是 `-0.0000`。「一分名义钱都没花」被渲染成「倒欠了钱」——报账那一行的全部意义是让人读得懂，这种读感不能交给标准库决定。修法是 `money()`：绝对值小于显示精度一半（4 位小数 => 5e-5）按零渲染，**真负数照原样印**（那是折叠出了 bug，藏起来比露出来危险）。回归测试 `a_zero_ledger_line_does_not_read_as_a_debt`。
+    ⑤ 顺带一个形状修正：`chat_url` 原来只会把 base_url 当产品根补 `/v1/chat/completions`，而智谱这条表面的版本号**已经在根上**（`/api/paas/v4`），照旧拼就成了 `/v4/v1/chat/completions`，实测 404。现在认三种形状：写全的路径原样用、末段是 `v<数字>` 的补 `/chat/completions`、其余补 `/v1/chat/completions`（`chat_url_accepts_a_versioned_root_and_a_full_path` 钉住三种，含 `v1beta` 这种不是版本段的反例）。这不是加猜测：base_url 本来就住在 provider 那一层，调用方写了哪个端点就按哪个走。
+    ⑥ 仍未覆盖：`stream_include_usage = true` 这颗 compat 位是照 §9.7 对百炼的实测加的，BigModel 这条**没做过「不加会怎样」的反证**——值得拿一条不带它的 provider 再跑一轮，确认它不是靠猜留下的。QA 的多模态取证（`input_image`）这一轮也没被任何 stage 用到：demo 交出的证据全是文本文件，「能看图」这件事到目前为止只有 §2 那轮 smoke 验过端点能吃图，没验过流程。
 
 ## 10 二期清单
 

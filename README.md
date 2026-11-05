@@ -2,9 +2,9 @@
 
 为星型多 Agent harness 写的 Rust harness kernel：引擎 + wire 层 + 工具/权限/沙箱 + 会话 + 总线/journal + CLI/配置。设计文档（中文）见本仓库 `docs/design.md`。
 
-**Metrics** — src 51 files / 17251 lines · tests 9 files / 3383 lines · 247 tests (lib 194 + bin 4 + integration 49)
+**Metrics** — src 51 files / 17338 lines · tests 9 files / 3383 lines · 249 tests (lib 196 + bin 4 + integration 49)
 
-Status: M0-M4 complete + 二期开工（`ApproveMode::Bus`、SA 判定含证据核对、bus 停车补投与自动重连、journal 快照/截断与在线投影、多任务 task 命名空间、openai-responses wire、worker 池、预算按 token 结算的价格表、journal 轮转的默认策略、按类型核对的证据与 stage 要求表、审批请求的 at-least-once 投递与按 req 幂等、验证 FAIL 回跳写者、bash `output_path` 交出可核对的 test_log）——这批改动 2026-11-04 走完真端点联跑（`pipeline complete`；那两轮联跑抓出并修掉三个「测试全绿但跑不起来」的缺陷，见 docs/design.md §9.32 / §9.33）。2026-11-05 又跑六次联跑：第二次四关一次过，抓出报账的两处「说不清」——没有费率的运行把 token 印成 `0 / 0`、同一颗审批请求的两张矛盾回执先到先得（§9.42，两处都已修）；第三次带一份测试费率表（`--prices`），§9.27 的两段式结算与 §9.36 的「读数不可信」分支第一次同时在真端点落地；第四次换成**真实费率**（官方页当天读数 + USD/CNY 换算 + `context_window`/`max_out` 收成官方 1M/384K 与 1M/128K，写进用户层 `providers.toml`，见 §9.43），报账只剩一个名义来源：`0.0732 usd, of which 0.0667 nominal (under-reported 0.0667)`——`no rate` 归零；第五次故意只给 RD 填价，把「没有结算」那条分支走回现场，用量列在没有 `budget_settled` 的情况下仍然印出 `tokens in 0 / out 8503`（§9.42② 的实证，见 smoke-report §30）；第六次把第四次那套换算整段拿掉——**直接记厂商原文的人民币**，钱的单位由 provider 的 `currency` 声明而不是写在 flag 与字段名里（§9.44；SA 后端同日从百炼 Token Plan 换成小米 MiMo，`-p` 单发两轮实测通过、官方 元 价也查到并记进配置，见 §9.44⑥⑧ 与 smoke-report §32），`ledger total: 3.5153 cny, of which 3.4752 nominal (under-reported 3.4752)`。fmt / clippy `-D warnings` / test 三闸门全绿（人工执行：本仓库不挂 CI）。上面那行数字由 `tests/discipline.rs` 与源码树对照校验：改完代码不更新它，闸门就红。
+Status: M0-M4 complete + 二期开工（`ApproveMode::Bus`、SA 判定含证据核对、bus 停车补投与自动重连、journal 快照/截断与在线投影、多任务 task 命名空间、openai-responses wire、worker 池、预算按 token 结算的价格表、journal 轮转的默认策略、按类型核对的证据与 stage 要求表、审批请求的 at-least-once 投递与按 req 幂等、验证 FAIL 回跳写者、bash `output_path` 交出可核对的 test_log）——这批改动 2026-11-04 走完真端点联跑（`pipeline complete`；那两轮联跑抓出并修掉三个「测试全绿但跑不起来」的缺陷，见 docs/design.md §9.32 / §9.33）。2026-11-05 又跑七次联跑：第二次四关一次过，抓出报账的两处「说不清」——没有费率的运行把 token 印成 `0 / 0`、同一颗审批请求的两张矛盾回执先到先得（§9.42，两处都已修）；第三次带一份测试费率表（`--prices`），§9.27 的两段式结算与 §9.36 的「读数不可信」分支第一次同时在真端点落地；第四次换成**真实费率**（官方页当天读数 + USD/CNY 换算 + `context_window`/`max_out` 收成官方 1M/384K 与 1M/128K，写进用户层 `providers.toml`，见 §9.43），报账只剩一个名义来源：`0.0732 usd, of which 0.0667 nominal (under-reported 0.0667)`——`no rate` 归零；第五次故意只给 RD 填价，把「没有结算」那条分支走回现场，用量列在没有 `budget_settled` 的情况下仍然印出 `tokens in 0 / out 8503`（§9.42② 的实证，见 smoke-report §30）；第六次把第四次那套换算整段拿掉——**直接记厂商原文的人民币**，钱的单位由 provider 的 `currency` 声明而不是写在 flag 与字段名里（§9.44；SA 后端同日从百炼 Token Plan 换成小米 MiMo，`-p` 单发两轮实测通过、官方 元 价也查到并记进配置，见 §9.44⑥⑧ 与 smoke-report §32），`ledger total: 3.5153 cny, of which 3.4752 nominal (under-reported 3.4752)`；第七次把 QA 换到 GLM 的 **OpenAI 兼容表面**，input usage 回来了，名义值第一次整段清零：`0.1806 cny, of which 0.0000 nominal`（§9.45、smoke-report §33；顺带修掉「空账印成 `-0.0000`」）。fmt / clippy `-D warnings` / test 三闸门全绿（人工执行：本仓库不挂 CI）。上面那行数字由 `tests/discipline.rs` 与源码树对照校验：改完代码不更新它，闸门就红。
 
 ## Quick start
 
@@ -63,6 +63,9 @@ demo 传 `cny`）、`--roles-dir`/`--prices`（预算价格表，见下）、
 **有价但读数不可信**（端点报了 output 却不报 input，BigModel 就是这个形状）=> 结算照做（预留得配对
 掉），但按**名义**落账并当场打印理由：一张少掉整个输入侧的「账单」比名义值更危险，因为它看起来是
 算出来的。那个字符估算只用来决定「要不要压上下文」，绝不当钱的来源（§9.36）。
+这一格 2026-11-05 被走通了：同一颗模型、同一份价目表，换到它自己的 **OpenAI 兼容表面**
+（`api = "openai-completions"`，`base_url` 指 `/api/paas/v4`）就报 input usage 了，报账里的名义值
+当场归零（§9.45、smoke-report §33）。换 wire 不是省钱手段，是让读数配得上账单。
 
 收尾那一行把「说不清的钱」按来源分开报（§9.37）：
 `ledger total: 0.8000 cny, of which 0.7000 nominal (under-reported 0.7000)`。
@@ -75,6 +78,9 @@ provider 可以写 `currency = "cny"`，账本读它并当场印出来——所�
 因此叫 `cost` 而不是 `usd`（旧行 `usd` 仍可读，`old_usd_keyed_lines_still_replay` 钉住）。
 `no rate` 是**该补价**，`under-reported` 是**该修读数或换端点**——两种「不省钱」的下一步完全不同，
 不该挤在同一个数字里。
+零就写零：`f64` 的 `sum()` 对**空集合**给的是 `-0.0`，所以名义账全清白时那一行一度印成
+`of which -0.0000 nominal`，读起来像「倒欠了钱」。这行字的职责是让人读得懂，渲染由 `money()` 兜住：
+显示精度以下按零处理，**真负数照原样印**——那是折叠出了 bug，不该被格式掩盖（§9.45④）。
 `priced` 标记与金额一起落 journal，所以事后能复现「这笔钱当时按什么算」——这是不变式 5
 （journal 是真相）对钱的延伸。把 `cost` 写成 `{input = 0.0, output = 0.0}` 不算「免费」，
 等同没填：按 0 记账的停损等于没有停损。

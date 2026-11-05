@@ -4,8 +4,11 @@ peer_id = "harness-qa"
 bus_socket = "~/.kestrel/harness/bus.sock"
 
 [llm]
-provider = "zhipu-anthropic"     # 多模态：验收要看截图/视觉证据
+provider = "zhipu-openai"        # 同一个 GLM-5.3-Flash，走 OpenAI 兼容表面
 model = "glm-5.3-flash"
+# 2026-11-05：模型与多模态能力不变，换的只是 wire。anthropic 那条不回 input
+# usage（§9.7），于是 QA 每次派发都被判「读数不可信」按名义落账（§9.36）；
+# chat 这条回 prompt_tokens，账单才算得出来。换 wire 不是省钱手段，是让钱说得出口。
 
 [system]
 prompt_file = "../systems/qa.md"   # 相对 role 文件所在目录（harness/roles/）

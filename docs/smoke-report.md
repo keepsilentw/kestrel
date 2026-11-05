@@ -7,7 +7,7 @@
 
 ## 1. 自动化测试基线（cargo test）
 
-**Metrics** — src 51 files / 17251 lines · tests 9 files / 3383 lines · 247 tests (lib 194 + bin 4 + integration 49)
+**Metrics** — src 51 files / 17338 lines · tests 9 files / 3383 lines · 249 tests (lib 196 + bin 4 + integration 49)
 **Integration** — core_loop 5 / discipline 2 / m1_tools 9 / m2_session 6 / m4_bus 15 / m5_pool 6 / sandbox_e2e 4 / wire_anthropic 2
 
 | 组 | 覆盖 |
@@ -885,3 +885,36 @@ Error: [sa] iteration cap reached for Dev — 1 of those iterations were rework 
 
 **闸门**：本轮只改用户层配置与文档，无源码变更；`cargo fmt --check` / `cargo clippy --all-targets -- -D warnings` /
 `cargo test` 复跑全绿，247 tests（lib 194 + bin 4 + integration 49），`**Metrics**` 两行不变。
+
+## 33. 2026-11-05 第七轮联跑：QA 换 OpenAI 兼容表面，名义值归零
+
+`harness/roles/qa.toml` 的 `[llm]` 从 `zhipu-anthropic` 换成 `zhipu-openai`（同一颗 GLM-5.3-Flash，
+`api = "openai-completions"`，`base_url = https://open.bigmodel.cn/api/paas/v4`）。换之前先用 `-p` 单发
+确认这条表面回 input usage：`turn_complete usage in=24 / out=72`。全新 worktree，其余全默认。
+
+| 检查 | 实测 |
+|---|---|
+| 阶段 | dev / review / test / build 各 iter1 pass → `pipeline complete`（`ran 15, 15 passed / 0 failed`） |
+| QA 第一次拿到真账单 | `ledger harness-qa: 0.1455 cny ; tokens in 126841 / out 6778 ; cache read 108800`——输入侧有数了，缓存命中第一次进账单（0.23 元/百万那一档） |
+| RD | `settled 0.0351 cny for 4071 in / 3373 out tokens`；预留 5.072 元（1M×1 + 128K×2 形状，峰时价）被结算换掉 |
+| 名义值 | `ledger total: 0.1806 cny, of which 0.0000 nominal`，**后面那对括号整段消失**（`no rate` 与 `under-reported` 两个来源都没有了）——design §9.36 那种「说不清」第一次清零 |
+| 钱少了 20 倍 | §31 那轮 `3.5153 cny`（其中 3.4752 说不清）→ 这轮 `0.1806 cny` 全清白。价格没变，是终于按实际读数算而不是按最坏情况猜 |
+| 形状坑 | `/api/paas/v4` 这根已经带版本号，旧 `chat_url` 会拼成 `/v4/v1/chat/completions`（实测 404）。改成认三种形状并加测试 |
+| 打印坑 | 第一版收尾行印的是 `of which -0.0000 nominal`——`f64::sum()` 对**空集合**给 `-0.0`。`money()` 把显示精度以下按零渲染，真负数照印（§9.45④） |
+| 审批 | 本轮 0 请求（RD 没试图跑策略外的命令） |
+
+**同一天早先那次被我自己打断的运行里，§9.42④ 的升级路径第一次在现场发生**。下面两行是当时从 stdout
+抄录的原文；那一轮的日志与 journal 都已被后续运行和清理临时文件抹掉，所以**这是一条不可复算的记录**：
+
+```
+[sa] approval receipt dc2e618e-…: applied=false (no open request dc2e618e-…)
+[sa] approval receipt dc2e618e-…: applied=true (the waiting tool was woken) — upgrades the earlier applied=false for the same req
+```
+这正是 §27 抓到的那个形状（at-least-once 重投 → 两张矛盾回执），差别是这次账本按事实强弱合并并且把矛盾说出来了。
+**这条记录的限度要说清**：它来自一次被我提前终止的运行（我用 `head` 截管道，SIGPIPE 打断了 demo），
+现场只剩 stdout 的两行，没有可复算的 journal；合并逻辑本身的证明仍是
+`a_contradicting_receipt_upgrades_without_downgrading`。下一次联跑如果遇到同样的时序，值得留着 journal 再看一次。
+
+**闸门**：`cargo fmt --check` / `cargo clippy --all-targets -- -D warnings` / `cargo test` 全绿，
+249 tests（lib 196 + bin 4 + integration 49）。净新增 2 项（`chat_url_accepts_a_versioned_root_and_a_full_path`、
+`a_zero_ledger_line_does_not_read_as_a_debt`），`src` 17251→17338 行；`**Metrics**` 又被拦红一次并回写三处。
