@@ -910,6 +910,25 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 把金额渲染成四位小数，并且**零就写零**。
+///
+/// 起因是 2026-11-05 第七轮联跑（全端点都有价、名义值本该归零）报出的一行：
+/// `ledger total: 0.1806 cny, of which -0.0000 nominal`。那个负号不是算错的账：
+/// `f64` 的 `Iterator::sum` 单位元是 `-0.0`（有符号零要守 IEEE 的符号规则），所以
+/// **对空集合求和得到的是 -0.0**，`format!("{:.4}", -0.0)` 就印成 `-0.0000`。
+/// 「一分名义钱都没花」被渲染成「倒欠了钱」——报账那一行的全部意义就是让人读得懂，
+/// 这种读感不能留给标准库决定。
+///
+/// 钳位只吞掉显示精度以下的量（4 位小数 => 5e-5），**真负数照原样印**：那说明折叠
+/// 出了 bug，藏起来比露出来危险。
+fn money(amount: f64) -> String {
+    if amount.abs() < 0.00005 {
+        "0.0000".to_string()
+    } else {
+        format!("{amount:.4}")
+    }
+}
+
 /// 收尾报账：花了多少、其中多少仍是名义值、换出了多少 token。`--max-cost` 到底是
 /// 「账单上限」还是「名义上限」，由这行说清楚，不靠人记住这次有没有传 `--roles-dir`。
 /// 这份读数能不能按 token 算成账单。
@@ -983,7 +1002,7 @@ fn report_ledger(journal: &Journal, ledger: &PriceLedger, unit: &str) {
     let reasons: Vec<String> = state
         .nominal_by_reason
         .iter()
-        .map(|(reason, amount)| format!("{} {amount:.4}", reason.label()))
+        .map(|(reason, amount)| format!("{} {}", reason.label(), money(*amount)))
         .collect();
     for (peer, cost) in &state.spent {
         let tokens = state.tokens.get(peer).copied().unwrap_or_default();
@@ -993,7 +1012,8 @@ fn report_ledger(journal: &Journal, ledger: &PriceLedger, unit: &str) {
             .filter(|((_, p, _, _), _)| p == peer)
             .count();
         println!(
-            "[sa] ledger {peer}: {cost:.4} {unit}{}{} ; tokens in {} / out {}{}",
+            "[sa] ledger {peer}: {} {unit}{}{} ; tokens in {} / out {}{}",
+            money(*cost),
             if ledger.is_priced(peer) {
                 ""
             } else {
@@ -1014,7 +1034,9 @@ fn report_ledger(journal: &Journal, ledger: &PriceLedger, unit: &str) {
         );
     }
     println!(
-        "[sa] ledger total: {total:.4} {unit}, of which {nominal_total:.4} nominal{}",
+        "[sa] ledger total: {} {unit}, of which {} nominal{}",
+        money(total),
+        money(nominal_total),
         if reasons.is_empty() {
             String::new()
         } else {
@@ -1992,6 +2014,20 @@ mod tests {
         assert_eq!(reseeded.acked_len(), 1, "回执从活文件里读回来");
         assert!(reseeded.unacked().is_empty(), "重启后不该再补投一次");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 名义账归零之后那一行要印 `0.0000`，不是 `-0.0000`：`f64` 的 `sum()` 对空集合
+    /// 给的是 `-0.0`（第七轮联跑现场：`of which -0.0000 nominal`），而「没花名义钱」
+    /// 被读成「倒欠了钱」是报账那一行不能犯的错误。真负数照印——那是折叠的 bug，
+    /// 藏起来比露出来危险。
+    #[test]
+    fn a_zero_ledger_line_does_not_read_as_a_debt() {
+        assert_eq!(money(-0.0), "0.0000", "空账的单位元不是负号");
+        assert_eq!(money(0.0), "0.0000");
+        assert_eq!(money(1e-9), "0.0000", "显示精度以下的量按零处理");
+        assert_eq!(money(-1e-9), "0.0000");
+        assert_eq!(money(0.1806), "0.1806");
+        assert_eq!(money(-0.0001), "-0.0001", "真负数照印，不钳位");
     }
 
     /// 真端点联跑抓到的一格（2026-11-05）：投递是 at-least-once，所以同一颗 `req`

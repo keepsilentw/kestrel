@@ -13,8 +13,28 @@ use super::wire::{
 
 pub struct OpenAiChatWire;
 
+/// Two spellings of an "OpenAI-compatible" root exist in the wild:
+/// ① a product root that needs the version inserted (`https://api.openai.com`
+///    => `/v1/chat/completions`), and ② a root whose last segment **already is**
+///    the version — BigModel's documented surface is
+///    `https://open.bigmodel.cn/api/paas/v4` + `/chat/completions`, and reading
+///    it as `/v4/v1/chat/completions` is a hard 404 (verified against the live
+///    endpoint 2026-11-05).
+/// Recognising an already-complete path is not guessing: the caller wrote which
+/// endpoint it serves, and `base_url` lives with the provider on purpose.
 fn chat_url(base_url: &str) -> String {
     let base = base_url.trim_end_matches('/');
+    if base.ends_with("/chat/completions") {
+        return base.to_string();
+    }
+    let last = base.rsplit('/').next().unwrap_or_default();
+    if last.len() >= 2
+        && let Some(rest) = last.strip_prefix('v')
+        && !rest.is_empty()
+        && rest.chars().all(|c| c.is_ascii_digit())
+    {
+        return format!("{base}/chat/completions");
+    }
     format!("{base}/v1/chat/completions")
 }
 
@@ -497,6 +517,37 @@ mod tests {
             }
         }
         assert!(matches!(done, Some(StopReason::Stop)));
+    }
+
+    #[test]
+    fn chat_url_accepts_a_versioned_root_and_a_full_path() {
+        // ① 产品根：版本由这里补上（OpenAI 本家与各种代理型网关的形状）
+        assert_eq!(chat_url("http://x"), "http://x/v1/chat/completions");
+        assert_eq!(chat_url("http://x/"), "http://x/v1/chat/completions");
+        assert_eq!(
+            chat_url("https://api.deepseek.com"),
+            "https://api.deepseek.com/v1/chat/completions"
+        );
+        // ② 最后一段已经是版本号：BigModel 的 /api/paas/v4 是文档里写明的形状，
+        // 再补一个 /v1 就是 404（2026-11-05 实测：/v4/v1/chat/completions 返回 404）
+        assert_eq!(
+            chat_url("https://open.bigmodel.cn/api/paas/v4"),
+            "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+        );
+        assert_eq!(
+            chat_url("https://open.bigmodel.cn/api/paas/v4/"),
+            "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+        );
+        // 已经写全的路径原样用——幂等，不是猜
+        assert_eq!(
+            chat_url("https://gw.example.com/v1/chat/completions"),
+            "https://gw.example.com/v1/chat/completions"
+        );
+        // 版本号位置上的普通段不被误认（"v1beta" 不是版本段，"com" 也不是）
+        assert_eq!(
+            chat_url("https://gw.example.com/v1beta"),
+            "https://gw.example.com/v1beta/v1/chat/completions"
+        );
     }
 
     #[test]
