@@ -1055,8 +1055,25 @@ pub struct ApprovalLedger {
     /// req -> 请求它的那条 session（重启后要把未回执的批复送回去，得知道送给谁）
     requests: BTreeMap<String, String>,
     decisions: BTreeMap<String, String>,
-    /// 已经拿到回执的 req：回执是唯一能区分「批复丢了」与「批了但没人听」的东西
-    acked: std::collections::BTreeSet<String>,
+    /// 已经拿到回执的 req -> **这张账上最强的那个 `applied`**。回执是唯一能区分
+    /// 「批复丢了」与「批了但没人听」的东西，而投递是 at-least-once：同一颗 req
+    /// 可能收到两张回执（第一份批复唤醒了工具，重投的那份只换来「没有等待者」）。
+    /// 先到先得会把真相留在门外，所以这里按事实强弱合并，只朝一个方向升级。
+    acked: BTreeMap<String, bool>,
+}
+
+/// 一张回执对台账做了什么，也决定它该不该落 journal。
+#[derive(Debug, PartialEq, Eq)]
+pub enum AckOutcome {
+    /// 这颗 req 的第一张回执。
+    Recorded,
+    /// 第二张（或更晚）回执说「生效了」，而账上记的是「没生效」——补一条更正：
+    /// 工具真的被唤醒过，这是比「没人听」更强、也更容易核实的事实。
+    Upgraded,
+    /// 第二张回执没带来更强的事实（重复投递，或试图把生效的降级成没生效）。
+    /// §9.31 的「没生效的批准不许记成生效」反过来同样成立：**生效过的事不许被
+    /// 后来的迟到副本说成没生效**，否则 journal 与 worker 工件会互相打脸。
+    Duplicate,
 }
 
 impl ApprovalLedger {
@@ -1075,8 +1092,8 @@ impl ApprovalLedger {
                 JournalRecord::ApprovalDecided { req, decision, .. } => {
                     ledger.decisions.insert(req, decision);
                 }
-                JournalRecord::ApprovalAcked { req, .. } => {
-                    ledger.acked.insert(req);
+                JournalRecord::ApprovalAcked { req, applied, .. } => {
+                    let _ = ledger.note_ack(&req, applied);
                 }
                 _ => {}
             }
@@ -1091,7 +1108,7 @@ impl ApprovalLedger {
     pub fn unacked(&self) -> Vec<(String, String, String)> {
         self.decisions
             .iter()
-            .filter(|(req, _)| !self.acked.contains(req.as_str()))
+            .filter(|(req, _)| !self.acked.contains_key(req.as_str()))
             .filter_map(|(req, decision)| {
                 self.requests
                     .get(req)
@@ -1100,9 +1117,28 @@ impl ApprovalLedger {
             .collect()
     }
 
-    /// 记一张回执。返回 false = 这个 req 已经回执过了（重复投递），不再落第二张。
-    pub fn note_ack(&mut self, req: &str) -> bool {
-        self.acked.insert(req.to_string())
+    /// 记一张回执，并说出它对这张账做了什么（`Duplicate` = 不该再落第二张）。
+    pub fn note_ack(&mut self, req: &str, applied: bool) -> AckOutcome {
+        match self.acked.get(req) {
+            None => {
+                self.acked.insert(req.to_string(), applied);
+                AckOutcome::Recorded
+            }
+            Some(true) => AckOutcome::Duplicate,
+            Some(false) => {
+                if applied {
+                    self.acked.insert(req.to_string(), true);
+                    AckOutcome::Upgraded
+                } else {
+                    AckOutcome::Duplicate
+                }
+            }
+        }
+    }
+
+    /// 这颗 req 在账上的 `applied`（没有回执过则 `None`）。
+    pub fn applied_of(&self, req: &str) -> Option<bool> {
+        self.acked.get(req).copied()
     }
 
     pub fn acked_len(&self) -> usize {
@@ -1134,6 +1170,9 @@ impl ApprovalLedger {
 /// worker 的回执落进 journal。这是唯一能区分「批复丢了」与「批了但没人听」的东西：
 /// 没有回执，SA 那本账上这两种情形长得一模一样，而它们的处置完全不同（前者该重发，
 /// 后者该记住「这一格已经过期」）。读不懂的回执不记（不猜它说哪颗请求、有没有生效）。
+/// 投递是 at-least-once，所以同一颗 req 可能收到两张回执：账本按事实强弱合并
+/// （`applied=true` 覆盖 `false`，反向不成立），落盘的是合并后的那一条，而不是
+/// 「先到的那一张」——否则 journal 与 worker 工件会对同一颗请求各说一套。
 fn record_receipt(
     journal: &Journal,
     env: &Envelope,
@@ -1146,10 +1185,20 @@ fn record_receipt(
         );
         return Ok(());
     };
-    if !ledger.note_ack(&receipt.req) {
+    let outcome = ledger.note_ack(&receipt.req, receipt.applied);
+    if outcome == AckOutcome::Duplicate {
+        // 没有带来更强的事实：不落第二张。但若它与账上那句相矛盾（迟到副本想把
+        // 「生效过」说成「没生效」），要把矛盾印出来——静默丢弃等于把「批复被投了
+        // 两次」这条线索抹掉。
+        let booked = ledger.applied_of(&receipt.req).unwrap_or(receipt.applied);
         println!(
-            "[sa] approval receipt for {} already recorded (duplicate)",
-            receipt.req
+            "[sa] approval receipt for {} already recorded ({})",
+            receipt.req,
+            if receipt.applied == booked {
+                "duplicate"
+            } else {
+                "later copy says applied=false, ledger keeps the applied=true it already booked"
+            }
         );
         return Ok(());
     }
@@ -1159,13 +1208,18 @@ fn record_receipt(
         applied: receipt.applied,
     })?;
     println!(
-        "[sa] approval receipt {}: applied={}{}",
+        "[sa] approval receipt {}: applied={}{}{}",
         receipt.req,
         receipt.applied,
         if receipt.reason.is_empty() {
             String::new()
         } else {
             format!(" ({})", receipt.reason)
+        },
+        if outcome == AckOutcome::Upgraded {
+            " — upgrades the earlier applied=false for the same req"
+        } else {
+            ""
         }
     );
     Ok(())
@@ -1787,14 +1841,22 @@ mod tests {
             )],
             "判过没回执的批复要能被找出来补投"
         );
-        assert!(ledger3.note_ack("r-3"), "第一张回执");
+        assert_eq!(
+            ledger3.note_ack("r-3", false),
+            AckOutcome::Recorded,
+            "第一张回执"
+        );
         j3.append(&JournalRecord::ApprovalAcked {
             req: "r-3".into(),
             by: "harness-rd".into(),
             applied: false,
         })
         .unwrap();
-        assert!(!ledger3.note_ack("r-3"), "重复回执不再记第二张");
+        assert_eq!(
+            ledger3.note_ack("r-3", false),
+            AckOutcome::Duplicate,
+            "重复回执不再记第二张"
+        );
         assert!(
             ledger3.unacked().is_empty(),
             "回执到过就不该再补投（applied=false 也是回执）"
@@ -1803,6 +1865,67 @@ mod tests {
         let reseeded = ApprovalLedger::seed(&Journal::open(&acked_path).unwrap());
         assert_eq!(reseeded.acked_len(), 1, "回执从活文件里读回来");
         assert!(reseeded.unacked().is_empty(), "重启后不该再补投一次");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 真端点联跑抓到的一格（2026-11-05）：投递是 at-least-once，所以同一颗 `req`
+    /// 会收到两张**互相矛盾**的回执——第一份批复唤醒了还在等的工具（worker 工件记
+    /// `applied:true`），SA 按 req 去重时重投的那一份找不到等待者，只换回
+    /// `applied:false (no open request)`。先到先得会把 journal 写成 `applied:false`，
+    /// 与工件对不上，而哪一张赢只取决于帧到达顺序。台账因此按事实强弱合并：
+    /// 「生效过」盖住「没生效」，反向不成立——§9.31 那句「没生效的批准不许记成生效」
+    /// 的两面是同一条纪律。
+    #[test]
+    fn a_contradicting_receipt_upgrades_without_downgrading() {
+        let dir = std::env::temp_dir().join(format!("kestrel-apack-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("journal.jsonl");
+        let _ = std::fs::remove_file(&path);
+        let j = Journal::create(&path).unwrap();
+        let mut ledger = ApprovalLedger::seed(&j);
+
+        // 「没生效」先到：落一条；随后「生效了」到达：升级，并补一条更正记录
+        assert_eq!(ledger.note_ack("r-9", false), AckOutcome::Recorded);
+        j.append(&JournalRecord::ApprovalAcked {
+            req: "r-9".into(),
+            by: "harness-rd".into(),
+            applied: false,
+        })
+        .unwrap();
+        assert_eq!(
+            ledger.note_ack("r-9", true),
+            AckOutcome::Upgraded,
+            "生效是更强的事实，必须盖过「没人听」"
+        );
+        j.append(&JournalRecord::ApprovalAcked {
+            req: "r-9".into(),
+            by: "harness-rd".into(),
+            applied: true,
+        })
+        .unwrap();
+        assert_eq!(ledger.applied_of("r-9"), Some(true));
+        assert_eq!(ledger.acked_len(), 1, "升级不新增一颗 req");
+
+        // 反方向：记过生效之后，迟到的副本不能把它说成没生效
+        assert_eq!(ledger.note_ack("r-8", true), AckOutcome::Recorded);
+        assert_eq!(
+            ledger.note_ack("r-8", false),
+            AckOutcome::Duplicate,
+            "不把生效的降级"
+        );
+        assert_eq!(ledger.applied_of("r-8"), Some(true));
+        j.append(&JournalRecord::ApprovalAcked {
+            req: "r-8".into(),
+            by: "harness-rd".into(),
+            applied: true,
+        })
+        .unwrap();
+        drop(j);
+
+        // 重启播种读回来的仍是那颗最强的事实（不是文件里最后一条）
+        let reseeded = ApprovalLedger::seed(&Journal::open(&path).unwrap());
+        assert_eq!(reseeded.applied_of("r-9"), Some(true), "播种也按强弱合并");
+        assert_eq!(reseeded.acked_len(), 2, "两颗 req 各自一条账");
         std::fs::remove_dir_all(&dir).ok();
     }
 
