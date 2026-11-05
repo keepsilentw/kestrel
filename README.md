@@ -2,9 +2,9 @@
 
 为星型多 Agent harness 写的 Rust harness kernel：引擎 + wire 层 + 工具/权限/沙箱 + 会话 + 总线/journal + CLI/配置。设计文档（中文）见本仓库 `docs/design.md`。
 
-**Metrics** — src 51 files / 16848 lines · tests 9 files / 3383 lines · 243 tests (lib 190 + bin 4 + integration 49)
+**Metrics** — src 51 files / 17043 lines · tests 9 files / 3383 lines · 245 tests (lib 192 + bin 4 + integration 49)
 
-Status: M0-M4 complete + 二期开工（`ApproveMode::Bus`、SA 判定含证据核对、bus 停车补投与自动重连、journal 快照/截断与在线投影、多任务 task 命名空间、openai-responses wire、worker 池、预算按 token 结算的价格表、journal 轮转的默认策略、按类型核对的证据与 stage 要求表、审批请求的 at-least-once 投递与按 req 幂等、验证 FAIL 回跳写者、bash `output_path` 交出可核对的 test_log）——这批改动 2026-11-04 走完真端点联跑（`pipeline complete`；那两轮联跑抓出并修掉三个「测试全绿但跑不起来」的缺陷，见 docs/design.md §9.32 / §9.33）。fmt / clippy `-D warnings` / test 三闸门全绿（人工执行：本仓库不挂 CI）。上面那行数字由 `tests/discipline.rs` 与源码树对照校验：改完代码不更新它，闸门就红。
+Status: M0-M4 complete + 二期开工（`ApproveMode::Bus`、SA 判定含证据核对、bus 停车补投与自动重连、journal 快照/截断与在线投影、多任务 task 命名空间、openai-responses wire、worker 池、预算按 token 结算的价格表、journal 轮转的默认策略、按类型核对的证据与 stage 要求表、审批请求的 at-least-once 投递与按 req 幂等、验证 FAIL 回跳写者、bash `output_path` 交出可核对的 test_log）——这批改动 2026-11-04 走完真端点联跑（`pipeline complete`；那两轮联跑抓出并修掉三个「测试全绿但跑不起来」的缺陷，见 docs/design.md §9.32 / §9.33）。2026-11-05 又跑五次联跑：第二次四关一次过，抓出报账的两处「说不清」——没有费率的运行把 token 印成 `0 / 0`、同一颗审批请求的两张矛盾回执先到先得（§9.42，两处都已修）；第三次带一份测试费率表（`--prices`），§9.27 的两段式结算与 §9.36 的「读数不可信」分支第一次同时在真端点落地；第四次换成**真实费率**（官方页当天读数 + USD/CNY 换算 + `context_window`/`max_out` 收成官方 1M/384K 与 1M/128K，写进用户层 `providers.toml`，见 §9.43），报账只剩一个名义来源：`0.0732 usd, of which 0.0667 nominal (under-reported 0.0667)`——`no rate` 归零；第五次故意只给 RD 填价，把「没有结算」那条分支走回现场，用量列在没有 `budget_settled` 的情况下仍然印出 `tokens in 0 / out 8503`（§9.42② 的实证，见 smoke-report §30）。fmt / clippy `-D warnings` / test 三闸门全绿（人工执行：本仓库不挂 CI）。上面那行数字由 `tests/discipline.rs` 与源码树对照校验：改完代码不更新它，闸门就红。
 
 ## Quick start
 
@@ -70,6 +70,10 @@ cargo build && ./harness/run-demo.sh      # hub + RD + QA + demo-sa 四进程
 `priced` 标记与金额一起落 journal，所以事后能复现「这笔钱当时按什么算」——这是不变式 5
 （journal 是真相）对钱的延伸。把 `cost` 写成 `{input = 0.0, output = 0.0}` 不算「免费」，
 等同没填：按 0 记账的停损等于没有停损。
+收尾那行的 token 两列来自**读数本身**（`UsageReported` 参与折叠，只填用量、不动 stage 投影），
+不来自结算（§9.42）：没有费率 => 没有结算 => 过去照样把一次烧掉两万多 token 的运行印成
+`tokens in 0 / out 0`。结算是钱的来源，读数是用量的来源，两者分开才不会让「没算成账单」
+看起来像「没花东西」。
 
 SA 的判定只读盘，且分三层：通路（有答案、未 abort、worker 侧 stop 非 error）→
 语义（文字结论里的 `PASS`/`DONE`）→ **证据**（工件 `evidence` 数组点名的绝对路径必须
@@ -158,6 +162,12 @@ Ask——审批不能放宽角色的写范围。`test_log` 的汇总表认 cargo
 记成 `allow`；现在到点即撤摊、工件写 `expired / applied:false`。**没生效的批准不许记成生效**，
 因为 journal 与工件会互相印证一个假结论。仍不做的事：迟到批复不会在下一次同样调用上重新
 兑现（那等于把一次 allow 变成长期通行证，要放宽只能改授权表）；跨回合挂起的审批槽位仍在 §10。
+
+同一颗 `req` 的**两张矛盾回执**按事实强弱合并，不按先到先得（§9.42）：at-least-once 让 SA 去重时
+把批复重投一次，第一份唤醒了工具（工件记 `applied:true`），第二份只换回 `applied:false (no open
+request)`。台账存 `req -> applied`，`true` 覆盖 `false` 并**补一条更正记录**（journal 不抹旧行），
+`false` 永远不能把生效过的降级——同一句纪律的两面。矛盾的第二张仍然不落，但要把矛盾印出来：
+它是「批复被投了两次」唯一的现场线索。重启播种走同一个合并函数，所以账上读回来的是最强那条。
 
 `api` 三值：`anthropic-messages` / `openai-completions` / `openai-responses`。第三条是 §10 二期补上的 wire（`/v1/responses` + `response.*` 事件族），只有 fixture 级验证，**尚未真端点实测**（见 design.md §9.24）。`--base-url` 直连模式仍固定用 anthropic wire。
 

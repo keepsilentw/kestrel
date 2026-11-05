@@ -7,7 +7,7 @@
 
 ## 1. 自动化测试基线（cargo test）
 
-**Metrics** — src 51 files / 16848 lines · tests 9 files / 3383 lines · 243 tests (lib 190 + bin 4 + integration 49)
+**Metrics** — src 51 files / 17043 lines · tests 9 files / 3383 lines · 245 tests (lib 192 + bin 4 + integration 49)
 **Integration** — core_loop 5 / discipline 2 / m1_tools 9 / m2_session 6 / m4_bus 15 / m5_pool 6 / sandbox_e2e 4 / wire_anthropic 2
 
 | 组 | 覆盖 |
@@ -741,3 +741,97 @@ Error: [sa] iteration cap reached for Dev — 1 of those iterations were rework 
 **新露出的一层**（design §10）：`issues` 还是 `Vec<String>`，所以新加一类 issue 忘了判归因会**静默落在
 `Artifact`**。要根治得让 issue 自己带归因变体（`JudgmentIssue::Artifact | Turn`），把「忘了标」变成
 编译不过去的事。
+
+## 27. 2026-11-05 第十二轮联跑：四关一次过，报账上两处「说不清」被抓出来
+
+一个全新的 worktree（不复用上一次的产物，免得 RD 去评自己昨天写的那份），其余全走默认：
+`--evidence-spec roles/sa.evidence.json`、`--approvals`、`--nominal-usd 0.5`、`--max-usd 6.0`、轮转走默认策略。
+
+| 检查 | 实测 |
+|---|---|
+| 阶段 | dev / review / test / build **各 iter1 一次过** → `pipeline complete`（本轮没有 FAIL，所以 §9.40/§9.41 的归因与回跳都没被触发） |
+| 结论 | 四关各打印 `test log … exit 0, ran 28, 28 passed / 0 failed`；收尾四行 `test conclusion … green` |
+| 形状警告 | 四份工件的 `evidence_warnings` **全空**（§9.39 的写侧切分这轮没被触发，因为 RD 给的是裸路径） |
+| 审批 | 2 请求 / 2 deny：`ls -l … && tail -5 …` 这种复合命令在 tokenizer 里判不出来 → Ask → SA 只认显式 allow → deny（fail-closed 正确）；RD 改用自己的读工具继续，回合没被挂住 |
+| 报账 | `ledger total: 2.0000 usd, of which 2.0000 nominal (no rate 2.0000)`——两端都没填价，`priced` 全 false |
+| journal | 30 条（`budget_spent` 4 / `usage_reported` 4 / `result_committed` 4，`attribution` 全是 `artifact`），远低于默认上限，轮转未触发 |
+
+**抓出来的第一件事**：收尾那行印的是 `tokens in 0 / out 0`，而同一份 journal 里躺着
+`input 5646 / output 16894`。根因在钱的形状吞掉了用量——没有费率 => `settle()` 返回 `None` =>
+根本不落 `BudgetSettled`（§9.36 那条分支刻意如此），而 token 恰好只在结算配对成功时才累加。
+名义记账本身没错，错在「没结算」把用量一起抹了（design §9.42①②）。
+
+**抓出来的第二件事**：同一颗 `req` 的两张**互相矛盾**的回执。journal 落下
+`approval_acked{req:0581d66b…, applied:false}`，而 RD 的工件对同一颗 req 记 `applied:true`。
+顺序是：deny #1 唤醒了工具（工件 true + 回执 true）→ 那颗 at-least-once 的重发被 SA 去重后
+**重投**了同一份 deny → 第二份没有等待者，只换回 `applied:false (no open request)` → 而 `note_ack`
+先到先得，于是 `false` 落盘、`true` 被当重复丢弃，哪张赢取决于帧到达顺序（design §9.42③④）。
+这一条正好撞在 §9.31 立的那句「journal 与工件会互相印证」上——它们这次互相打脸。
+
+## 28. 2026-11-05 第十三轮联跑（测试费率表）：两段式结算第一次在真端点落地
+
+两处修复的源码已就位，这轮用 `KESTREL_DEMO_PRICES` 指了一份**测试费率表**（价钱是刻意编的整数：
+验的是形状，不是价钱；仓库外文件，`providers.toml` 本身没动）。
+
+| 检查 | 实测 |
+|---|---|
+| 阶段 | dev / review / test / build 各 iter1 pass → `pipeline complete`（`ran 22, 22 passed / 0 failed`） |
+| 结算（第一次现场跑通） | `dev iter1: settled 0.0066 usd for 5265 in / 4633 out tokens`——§9.27 的预留→结算两段式，journal 里 `budget_settled` 带着 `priced:true` 与那份读数 |
+| 读数不可信那条 | QA 三关走进 §9.36 的另一支：`harness-qa reported 0 input tokens with 5168 out — … books the reservation 0.1161 usd as NOMINAL instead of a bill that would read too cheap` |
+| 报账 | `ledger harness-qa: 0.3484 usd ; tokens in 0 / out 8508`、`ledger harness-rd: 0.0066 usd ; tokens in 5265 / out 4633`、`ledger total: 0.3550 usd, of which 0.3484 nominal (under-reported 0.3484)`——**混合来源第一次同场**，且 §9.37 那句「下一步该做什么」直接可读：该修读数/换端点，不是该补价 |
+| 形状警告又现场复现 | `dev iter1: note: worker-side shape warning: evidence claim …/unittest.log（测试日志，落盘） was read as path …/unittest.log`，判定照样 pass（§9.39 写侧切分 + 警告跟着 verdict 落账） |
+| 审批 | 1 请求 / 1 deny / 1 回执成对（`applied:true`），本轮没有出现矛盾回执 |
+
+**这两轮的修复各自没有被现场证明**，要说清：§9.42②（用量来自读数）在本轮走不到——两端都有价，
+每条派发都产生了结算；上一轮虽然是 bug 现场，跑的仍是修复前的代码。§9.42④（回执按强弱合并）
+本轮只有一颗请求，没有第二张矛盾回执。两者都由单测钉住：`a_nominal_run_reports_the_tokens_it_read`、
+`a_contradicting_receipt_upgrades_without_downgrading`（升级 / 不降级 / 重启读回最强那条，三个方向都断）。
+
+**闸门**：`cargo fmt --check` / `cargo clippy --all-targets -- -D warnings` / `cargo test` 实跑全绿，
+245 tests（lib 192 + bin 4 + integration 49）。净新增 2 项，`src` 16848→17043 行；`**Metrics**` 又被
+拦红一次并回写三处文档（§9.19 那条闸门照常做事）。两条环境说明：总线测试要真 UDS `bind`、
+`key_sources_resolve` 要写 `/tmp`，在严格沙箱里都会以 `EPERM` 失败，须在沙箱外执行这轮 `cargo test`。
+
+## 29. 2026-11-05 第十四轮联跑（真实费率）：`no rate` 这一格从报账里消失
+
+§28 用的是刻意编的整数费率（只验形状）。这一轮把它换成**官方页当天读到的真实单价**，写进用户层
+`~/.kestrel/providers.toml`（费率跟 provider 住、不跟仓库住；来源、抓取日期、USD/CNY 换算与「取峰时价」
+的理由都记在文件注释与 design §9.43）。走默认价格表路径（不传 `--prices`），全新 worktree。
+
+| 检查 | 实测 |
+|---|---|
+| 阶段 | dev / review / test / build 各 iter1 pass → `pipeline complete`（`ran 19, 19 passed / 0 failed`） |
+| 真账单 | `dev iter1: settled 0.0065 usd for 5218 in / 4086 out tokens`——按 Flash 峰时价复算 0.30×5218 + 1.20×4086（每百万）= 0.0064686，与印出来的数一致；预留 0.0581 先落盘、结算换掉它，`budget_spent` 与 `budget_settled` 各 4 条成对 |
+| 开工那行 | 上一轮启动时印 `budget stays NOMINAL for harness-rd,harness-qa`，本轮**没有这一行**：两个被派发的 peer 都查得到价 |
+| 网关少报 | QA 三关全走进 §9.36 的第二条分支：`harness-qa reported 0 input tokens with 6464 out — … books the reservation 0.0222 usd as NOMINAL instead of a bill that would read too cheap` |
+| 报账 | `ledger harness-rd: 0.0065 usd ; tokens in 5218 / out 4086`、`ledger harness-qa: 0.0667 usd ; tokens in 0 / out 10628`、`ledger total: 0.0732 usd, of which 0.0667 nominal (under-reported 0.0667)` |
+| 名义值的来源 | 分类账只剩 `under-reported`——**`no rate` 归零**。QA 那 0.0667 = 3 × 0.0222 预留额，即每一关按最坏情况落账，而不是按少掉整个输入侧的读数落账 |
+| 审批闭环 | 2 请求 / 2 deny / 2 回执 `applied:true`，journal 与 RD 工件对同一颗 req 取值一致；本轮没出现矛盾回执，§9.42④ 的升级路径仍只有单测覆盖 |
+
+**这一轮证明不了什么**：§9.42②（用量来自读数）需要一次「某个 peer 没有价、因而不产生结算」的运行，
+而真实费率恰好把那条分支变成了默认配置下的不可达路径。要现场证明它，得用一份只给 RD 填价的表跑一轮
+（design §9.42⑥ 末尾已记下这件事）。
+
+**闸门**：本轮无源码变更，`**Metrics**` 两行不变（245 tests / src 17043 行），`discipline` 复跑通过。
+
+## 30. 2026-11-05 第十五轮联跑（只给 RD 填价）：§9.42② 的现场证明
+
+§29 之后，「某个 peer 没有价、因而不产生结算」在默认配置下已经不可达。这一轮把表换成
+`prices-rd-only.toml`（RD 用真实峰时价 + 官方 1M/384K，QA 的 `cost` 整块删掉），专门走那条分支。
+
+| 检查 | 实测 |
+|---|---|
+| 阶段 | dev / review / test / build 各 iter1 pass → `pipeline complete`（`ran 25, 25 passed / 0 failed`） |
+| 开工警告 | `budget stays NOMINAL for harness-qa`（只列 QA 一个 peer——RD 有价） |
+| 有价那一侧 | `dev iter1: settled 0.0071 usd for 4704 in / 4733 out tokens`（0.30×4704 + 1.20×4733 每百万 = 0.00709） |
+| 没价那一侧 | QA 三关全部 `harness-qa has no rate — the reservation stays as the bill (nominal)` |
+| journal | `budget_spent` 4 条（rd 1 + qa 3）、`budget_settled` **只有 1 条**（rd）——QA 三次派发根本没有结算记录 |
+| **这一轮要看的** | `ledger harness-qa: 1.5000 usd (nominal backend: no rate) ; tokens in 0 / out 8503`。三条 `usage_reported`（4532 + 1885 + 2086 = 8503）在没有结算的情况下**照样进了用量列**；修复前这里是 `tokens in 0 / out 0`（§27 那一次的现场） |
+| 报账 | `ledger total: 1.5071 usd, of which 1.5000 nominal (no rate 1.5000)` |
+| 预留形状 | RD 的预留按官方 1M/384K 是 0.7608，结算 0.0071 换掉它；QA 无价 => 每次 0.5 名义 |
+
+**仍未在现场出现过的一件事**：§9.42④（同一颗 req 的矛盾回执按强弱合并）。这一轮只有 1 颗审批请求、
+1 张回执，没有第二份批复可投。那条路径要的是「审批窗口里恰好卡上一次重发」的时序，配表达不到，
+所以它的证明仍然只有 `a_contradicting_receipt_upgrades_without_downgrading` 这一条单测。
+
+**闸门**：本轮无源码变更，`**Metrics**` 两行不变（245 tests / src 17043 行）。
