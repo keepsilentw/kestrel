@@ -4,8 +4,12 @@ peer_id = "harness-sa"
 bus_socket = "~/.kestrel/harness/bus.sock"
 
 [llm]
-provider = "qwen-anthropic"      # 旗舰：编排/拆解/收敛判定（providers.toml 引用）
-model = "qwen3.8-max"
+provider = "mimo-anthropic"      # 编排/拆解/收敛判定（providers.toml 引用）
+model = "mimo-v2.6-flash"
+
+# 后端从百炼 Token Plan 换成小米 MiMo（2026-11-05）：前者是订阅制、查不到每 token
+# 标价，anthropic 表面又踩中 §9.7 的 usage 少报。SA 在 demo 里不被派发，所以它
+# 没有 cost 也只影响「开工时能不能报出这个 peer 的价」那一行提示。
 
 [system]
 prompt_file = "../systems/sa.md"   # 相对 role 文件所在目录（harness/roles/）
