@@ -135,25 +135,35 @@ struct DemoSaCmd {
     #[arg(long, default_value = "artifacts")]
     artifacts_dir: PathBuf,
 
-    /// Budget ceiling for the whole pipeline.
+    /// Budget ceiling for the whole pipeline, in the run's money unit.
     ///
     /// With a price table (`--roles-dir` together with a `cost` block for that
-    /// model in providers.toml) this is a real USD bill: the stop-loss blocks a
+    /// model in providers.toml) this is a real bill: the stop-loss blocks a
     /// dispatch whose WORST-CASE cost (whole context window plus a full max_out
     /// answer) would cross it, then settles the actual tokens. Without one the
-    /// ledger books `--nominal-usd` per dispatch, which is a fixture unit and not
+    /// ledger books `--nominal-cost` per dispatch, which is a fixture unit and not
     /// a bill — the SA prints that fact at startup rather than letting it pass as
     /// one. Either way it has to cover the retry policy, not just the happy path:
     /// 4 stages times 3 iterations times 0.5 is 6.0 (a fail 回环 is real now — an
     /// empty answer or a FAIL verdict re-dispatches instead of passing).
-    #[arg(long, default_value_t = 6.0)]
-    max_usd: f64,
+    /// The unit is whatever the price table declares per provider (`currency`);
+    /// with no table in play it is `--currency` (design §9.44). The old
+    /// `--max-usd` spelling still parses.
+    #[arg(long = "max-cost", alias = "max-usd", default_value_t = 6.0)]
+    max_cost: f64,
 
     /// Nominal per-dispatch charge, used only when a peer has no rate to settle
     /// against. Kept explicit as a flag because it is the difference between
     /// "the ceiling is a bill" and "the ceiling is a dispatch counter".
-    #[arg(long, default_value_t = 0.5)]
-    nominal_usd: f64,
+    #[arg(long = "nominal-cost", alias = "nominal-usd", default_value_t = 0.5)]
+    nominal_cost: f64,
+
+    /// The currency `--max-cost` / `--nominal-cost` are written in, used only
+    /// when the price table declares none. A priced table always wins, and a
+    /// table that mixes currencies in one run is refused at startup: a ledger
+    /// sums one unit, not two.
+    #[arg(long, default_value = "usd")]
+    currency: String,
 
     /// Directory of role TOMLs. The ledger reads `[llm]` from them to learn which
     /// peer runs on which provider/model, then prices that model from
@@ -161,7 +171,8 @@ struct DemoSaCmd {
     #[arg(long)]
     roles_dir: Option<PathBuf>,
 
-    /// Rate table (USD per million tokens). Defaults to the user layer file
+    /// Rate table (price per million tokens, in each provider's own `currency`).
+    /// Defaults to the user layer file
     /// `~/.kestrel/providers.toml`, read only if it exists.
     #[arg(long)]
     prices: Option<PathBuf>,
@@ -280,11 +291,12 @@ async fn main() -> anyhow::Result<()> {
                 task: d.task,
                 journal: d.journal,
                 artifacts: d.artifacts_dir,
-                per_dispatch_usd: d.nominal_usd,
-                max_usd: d.max_usd,
+                per_dispatch_cost: d.nominal_cost,
+                max_cost: d.max_cost,
+                currency: d.currency,
                 max_iterations: 3,
                 // 与 max_iterations 同为编译期默认值（demo 的两个上限都不是钱的上限，
-                // 钱由 --max-usd 管）：回跳额度见 design §9.32④。
+                // 钱由 --max-cost 管）：回跳额度见 design §9.32④。
                 max_reworks: 2,
                 bell_timeout: Duration::from_secs(d.bell_timeout_secs),
                 worktree: d.worktree,

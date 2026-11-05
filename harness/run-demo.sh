@@ -15,7 +15,11 @@
 #   KESTREL_DEMO_ROTATE_AFTER 活文件超过这么多条记录就折成检查点并归档旧前缀
 #     （不设 = 走 SA 的默认策略 512 条；显式设 0 = 关闭这一条）
 #   KESTREL_DEMO_ROTATE_BYTES 活文件超过这么多字节也折（不设 = 默认 1 MiB；0 = 关闭）
-#   KESTREL_DEMO_TASK / KESTREL_DEMO_BELL_TIMEOUT / KESTREL_DEMO_MAX_USD
+#   KESTREL_DEMO_TASK / KESTREL_DEMO_BELL_TIMEOUT / KESTREL_DEMO_MAX_COST
+#                             停损上限，单位是这次运行的钱的币种（见 --currency，
+#                             价格表声明了币种时以表为准，design §9.44）
+#   KESTREL_DEMO_CURRENCY     名义记账的币种（默认 cny；两个被派发的 peer 都有
+#                             价时它只是备用声明）
 #   KESTREL_DEMO_PRICES       费率表（默认用 ~/.kestrel/providers.toml）。仓库外的
 #                             实验文件，用来验证「按 token 结算」这条路径——单价跟着
 #                             provider 住，不把费率数字钉进 demo。
@@ -43,7 +47,8 @@ if [ ! -x "$BIN" ]; then
 fi
 
 # journal 是 write-ahead 真相源，只追加不截断（design §5 不变式 5），因此上一轮的
-# 花费会被重放：预算 0.5×4 阶段 = 2.0 = max_usd，直接再跑会立刻停损。默认清空重来；
+# 花费会被重放：预算 名义 4×4 阶段 = 16 个币种单位，直接再跑就可能撞 --max-cost 停损。
+# 默认清空重来；
 # 崩溃恢复演练需要跨进程续读，用 KESTREL_DEMO_KEEP_JOURNAL=1 保留。
 if [ "${KESTREL_DEMO_KEEP_JOURNAL:-0}" != "1" ]; then
   rm -f "$HERE/journal.jsonl"
@@ -87,8 +92,10 @@ sleep 1
 #     --worktree 把 RD 的写入目录广播进每颗门铃的 ref，QA 才是在验同一棵树；
 #     fail 回环是真的（空结果/FAIL 结论都会回派），所以预算给到 8 次派发。
 #     --roles-dir 让账本知道每个 peer 跑在哪个 provider/model 上：providers.toml
-#     里那个 model 写了 cost，停损就是按 token 结算的账单；没写就退回 --nominal-usd
-#     的名义记账（SA 开工时把这件事印出来，不含糊过去）。
+#     里那个 model 写了 cost，停损就是按 token 结算的账单；没写就退回 --nominal-cost
+#     的名义记账（SA 开工时把这件事印出来，不含糊过去）。钱的单位不写在 flag 名里
+#     （§9.44）：`--max-cost 40 --nominal-cost 4` 是 40/4 个「本次币种」，币种由
+#     价格表声明的 `currency` 决定，报账那一行会把它印出来。
 #     --evidence-spec 是「每个 stage 必须拿出哪类证据」的表（`roles/sa.evidence.json`）。
 #     缺省那份只要求 `file`，也就是类型化之前的语义；把某一格改成 `test_log` / `diff` /
 #     `screenshot` 之后，worker 光说「跑过了」不管用——那份文件必须真经得起按类型核对。
@@ -120,7 +127,8 @@ KESTREL_TEST_KILL_AFTER="${KESTREL_TEST_KILL_AFTER:-}" \
   --approvals "$HERE/roles/sa.approvals.json" \
   ${EVIDENCE_ARGS[@]+"${EVIDENCE_ARGS[@]}"} \
   --roles-dir "$HERE/roles" \
-  --nominal-usd "${KESTREL_DEMO_NOMINAL:-0.5}" \
+  --currency "${KESTREL_DEMO_CURRENCY:-cny}" \
+  --nominal-cost "${KESTREL_DEMO_NOMINAL:-4}" \
   ${PRICE_ARGS[@]+"${PRICE_ARGS[@]}"} \
   ${ROTATE_ARGS[@]+"${ROTATE_ARGS[@]}"} \
-  --bell-timeout-secs "${KESTREL_DEMO_BELL_TIMEOUT:-300}" --max-usd "${KESTREL_DEMO_MAX_USD:-6.0}"
+  --bell-timeout-secs "${KESTREL_DEMO_BELL_TIMEOUT:-300}" --max-cost "${KESTREL_DEMO_MAX_COST:-40}"

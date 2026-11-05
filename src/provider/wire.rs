@@ -26,11 +26,14 @@ pub enum WireId {
     OpenAiResponses,
 }
 
-/// Price per million tokens (USD), declared in the user layer
+/// Price per million tokens, declared in the user layer
 /// (`~/.kestrel/providers.toml`) — the one place money rates may be written
-/// down, exactly like keys. `cache_read` / `cache_write` are optional because
-/// not every gateway bills them separately; when absent, cached input is billed
-/// at the plain `input` rate (see `Usage::cost_usd`).
+/// down, exactly like keys. **The unit is not part of this type**: it comes from
+/// the provider's `currency` (`Registry::provider_currency`, default `usd`), so a
+/// vendor's own price list can be recorded as published — 元 stays 元, no FX
+/// arithmetic hides in the kernel (design §9.44). `cache_read` / `cache_write` are
+/// optional because not every gateway bills them separately; when absent, cached
+/// input is billed at the plain `input` rate (see `Usage::cost`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct CostPerMTok {
     pub input: f64,
@@ -189,7 +192,11 @@ impl Usage {
     /// Cache reads are usually cheaper than that (so this overstates a little)
     /// and cache writes a bit dearer (so this understates the write premium);
     /// declare `cache_read` / `cache_write` when the difference matters.
-    pub fn cost_usd(&self, price: &CostPerMTok) -> f64 {
+    ///
+    /// Unit-neutral by design: the number is in whatever currency the rate table
+    /// declares. A name that claims a currency the table does not have is how a
+    /// report line starts lying about money.
+    pub fn cost(&self, price: &CostPerMTok) -> f64 {
         const M: f64 = 1_000_000.0;
         let cache_read = price.cache_read.unwrap_or(price.input);
         let cache_write = price.cache_write.unwrap_or(price.input);
@@ -203,14 +210,14 @@ impl Usage {
     /// context window re-sent as input plus a full `max_out` of output. Used as
     /// a budget RESERVATION before the work is dispatched, so a pipeline that
     /// crashes mid-dispatch cannot re-burn the ceiling forever.
-    pub fn worst_case_usd(price: &CostPerMTok, context_window: u32, max_out: u32) -> f64 {
+    pub fn worst_case_cost(price: &CostPerMTok, context_window: u32, max_out: u32) -> f64 {
         let billed = Usage {
             input_tokens: context_window as u64,
             output_tokens: max_out as u64,
             cache_read_tokens: 0,
             cache_write_tokens: 0,
         };
-        billed.cost_usd(price)
+        billed.cost(price)
     }
 }
 
@@ -572,11 +579,7 @@ mod tests {
         };
         let flat = CostPerMTok::simple(2.0, 8.0);
         // 2 + 4 + 4 + 0.2 (reads and writes both at the input rate)
-        assert!(
-            (u.cost_usd(&flat) - 10.2).abs() < 1e-9,
-            "{}",
-            u.cost_usd(&flat)
-        );
+        assert!((u.cost(&flat) - 10.2).abs() < 1e-9, "{}", u.cost(&flat));
         let cached = CostPerMTok {
             input: 2.0,
             output: 8.0,
@@ -584,13 +587,13 @@ mod tests {
             cache_write: Some(2.5),
         };
         // 2 + 4 + 0.4 + 0.25
-        assert!((u.cost_usd(&cached) - 6.65).abs() < 1e-9);
+        assert!((u.cost(&cached) - 6.65).abs() < 1e-9);
     }
 
     #[test]
     fn reservation_is_the_context_window_plus_one_full_answer() {
         let price = CostPerMTok::simple(1.0, 4.0);
-        let worst = Usage::worst_case_usd(&price, 128_000, 8_192);
+        let worst = Usage::worst_case_cost(&price, 128_000, 8_192);
         assert!((worst - (0.128 + 0.032768)).abs() < 1e-9, "{worst}");
     }
 

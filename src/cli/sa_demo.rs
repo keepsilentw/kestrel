@@ -29,10 +29,14 @@ pub struct DemoSaArgs {
     pub task: String,
     pub journal: PathBuf,
     pub artifacts: PathBuf,
-    /// fixture 单次派发的名义记账金额：demo 没有价格表，`usd` 是按派发次数计的
-    /// 停损单位，不是账单。真实 token 用量另记 `usage_reported`（见下）。
-    pub per_dispatch_usd: f64,
-    pub max_usd: f64,
+    /// 单次派发的名义记账金额：没有价格表时它按派发次数计钱，是停损单位而不是账单。
+    /// 真实 token 用量另记 `usage_reported`（见下）。
+    pub per_dispatch_cost: f64,
+    pub max_cost: f64,
+    /// 名义记账用的币种。**只在价格表没人声明币种时才有意义**：有价可查时以表里
+    /// 声明的为准（`currency`，design §9.44），因为钱的单位要么有来源，要么当场
+    /// 说清，不能由字段名猜。
+    pub currency: String,
     pub max_iterations: u64,
     /// 一次 pipeline 允许把「验证没过」的活儿退回给写者几次。验证类 stage 的 FAIL
     /// 归因在被验证的产物上，而产物在写者手里（design §9.32④）——回跳要有额度，
@@ -86,6 +90,8 @@ pub struct BackendPrice {
     pub model: String,
     /// registry 声明的费率。`None` = 这张表没人填——**不等于免费**。
     pub cost: Option<CostPerMTok>,
+    /// 那张价目表写的什么币种（provider 级 `currency`，缺省读成 `usd`）。
+    pub currency: Option<String>,
     /// 预留上界的两个输入：整窗输入 + 满输出。
     pub context_window: u32,
     pub max_out: u32,
@@ -137,6 +143,9 @@ impl PriceLedger {
                     provider: llm.provider.clone(),
                     model: llm.model.clone(),
                     cost,
+                    currency: registry
+                        .and_then(|r| r.provider_currency(&llm.provider))
+                        .map(|c| c.to_lowercase()),
                     context_window: meta.as_ref().map(|m| m.context_window).unwrap_or(128_000),
                     max_out: meta.as_ref().map(|m| m.max_out).unwrap_or(16_384),
                 },
@@ -145,15 +154,51 @@ impl PriceLedger {
         Self { peers }
     }
 
-    /// 派发前的预留金额 `(usd, priced)`：有费率 => 该模型的最坏情况账单；
+    /// 这一次运行的钱是什么币种（design §9.44）。所有**有价** peer 必须同一种：
+    /// 账本是要加总的，一次运行里混两种币种的「总额」没有意义。混了 = 表写错了
+    /// => 启动即失败，而不是挑一个猜。全部没价 => 用 CLI 声明的 `fallback`。
+    pub fn unit(&self, fallback: &str) -> anyhow::Result<String> {
+        let mut by_currency: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (peer, price) in &self.peers {
+            if price.cost.is_some() {
+                let currency = price
+                    .currency
+                    .clone()
+                    .unwrap_or_else(|| "usd".to_string())
+                    .to_lowercase();
+                by_currency.entry(currency).or_default().push(peer.clone());
+            }
+        }
+        match by_currency.len() {
+            0 => Ok(fallback.to_lowercase()),
+            1 => Ok(by_currency
+                .keys()
+                .next()
+                .cloned()
+                .unwrap_or_else(|| fallback.to_lowercase())),
+            _ => {
+                let parts: Vec<String> = by_currency
+                    .iter()
+                    .map(|(currency, peers)| format!("{currency} for {}", peers.join(",")))
+                    .collect();
+                anyhow::bail!(
+                    "[sa] the price table mixes currencies in one run: {} — one ledger sums \
+                     one unit, so declare the same `currency` on every priced provider",
+                    parts.join(" / ")
+                );
+            }
+        }
+    }
+
+    /// 派发前的预留金额 `(cost, priced)`：有费率 => 该模型的最坏情况账单；
     /// 没有费率 => 名义值，并带着「这是名义值」的标记进账本。
-    pub fn reservation(&self, peer: &str, nominal_usd: f64) -> (f64, bool) {
+    pub fn reservation(&self, peer: &str, nominal_cost: f64) -> (f64, bool) {
         match self.peers.get(peer).and_then(|p| p.cost) {
             Some(cost) => (
-                Usage::worst_case_usd(&cost, self.context_window(peer), self.max_out(peer)),
+                Usage::worst_case_cost(&cost, self.context_window(peer), self.max_out(peer)),
                 true,
             ),
-            None => (nominal_usd, false),
+            None => (nominal_cost, false),
         }
     }
 
@@ -163,7 +208,7 @@ impl PriceLedger {
         self.peers
             .get(peer)
             .and_then(|p| p.cost)
-            .map(|cost| usage.cost_usd(&cost))
+            .map(|cost| usage.cost(&cost))
     }
 
     pub fn is_priced(&self, peer: &str) -> bool {
@@ -455,9 +500,12 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
     );
     // 价格表：role 目录说「谁跑在哪个 model 上」，registry 说「那个 model 多少钱」。
     // 两者任一缺席 => 退回名义记账，并在开工时就把这事说出来——不让人误以为
-    // `--max-usd` 是账单上限。
+    // `--max-cost` 是账单上限。
     let prices = load_prices(args.prices.as_deref());
     let ledger = PriceLedger::discover(args.roles_dir.as_deref(), prices.as_ref());
+    // 钱有一个币种，而且这个币种有来源（价格表声明 > `--currency`）。同一次运行里
+    // 混两种币种直接失败：账本是加总的，「0.1 美元 + 0.5 元」不是任何数（§9.44）。
+    let unit = ledger.unit(&args.currency)?;
     // 证据要求表：坏表硬失败（读不出来就当「没有要求」是 fail-open，验收标准会被
     // 静默放宽）。没给 = 只核存在性。
     let requirements = match &args.evidence_spec {
@@ -478,7 +526,7 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
         .collect();
     if !unpriced.is_empty() {
         println!(
-            "[sa] budget stays NOMINAL for {} (known peers: {}) — each dispatch books {} usd \
+            "[sa] budget stays NOMINAL for {} (known peers: {}) — each dispatch books {} {unit} \
              instead of a bill; declare [models.cost] in providers.toml and pass --roles-dir \
              to settle by token",
             unpriced.join(","),
@@ -487,7 +535,7 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
             } else {
                 ledger.known_peers().join(",")
             },
-            args.per_dispatch_usd
+            args.per_dispatch_cost
         );
     }
 
@@ -519,19 +567,19 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
             // （整窗输入 + 满输出），没有费率时才是名义值。只看「事后账单」的停损
             // 拦不住正在跑的派发，崩溃重来还能反复把上限烧穿。
             let state = journal.projection().state;
-            let total: f64 = state.spent_usd.values().sum();
-            let nominal: f64 = state.nominal_usd.values().sum();
-            let (reserve, priced) = ledger.reservation(target, args.per_dispatch_usd);
-            if total + reserve > args.max_usd {
+            let total: f64 = state.spent.values().sum();
+            let nominal: f64 = state.nominal.values().sum();
+            let (reserve, priced) = ledger.reservation(target, args.per_dispatch_cost);
+            if total + reserve > args.max_cost {
                 anyhow::bail!(
                     "[sa] budget stop-loss: spent {total:.4} (nominal {nominal:.4}) + next \
-                     reservation {reserve:.4}{} > max {:.4}",
+                     reservation {reserve:.4}{} > max {:.4} {unit}",
                     if priced {
                         " = priced upper bound"
                     } else {
                         " (nominal)"
                     },
-                    args.max_usd
+                    args.max_cost
                 );
             }
             if iter > args.max_iterations {
@@ -671,18 +719,18 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
                         // 让穷尽性检查看不见那个布尔，编译器会要求一条多余的兜底臂。
                         let untrustworthy = under_reports_input(&usage);
                         match (ledger.settle(target, &usage), untrustworthy) {
-                            (Some(usd), false) => {
+                            (Some(cost), false) => {
                                 journal.append(&JournalRecord::settled(
                                     args.task_id.clone(),
                                     target,
                                     stage,
                                     iter,
                                     usage,
-                                    usd,
+                                    cost,
                                     true,
                                 ))?;
                                 println!(
-                                    "[sa] {stage_name} iter{iter}: settled {usd:.4} usd for \
+                                    "[sa] {stage_name} iter{iter}: settled {cost:.4} {unit} for \
                                      {} in / {} out tokens",
                                     usage.input_tokens, usage.output_tokens
                                 );
@@ -700,7 +748,7 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
                                 println!(
                                     "[sa] {stage_name} iter{iter}: {target} reported 0 input \
                                      tokens with {} out — the gateway under-reports (§9.7), so \
-                                     this books the reservation {reserve:.4} usd as NOMINAL \
+                                     this books the reservation {reserve:.4} {unit} as NOMINAL \
                                      instead of a bill that would read too cheap",
                                     usage.output_tokens
                                 );
@@ -857,12 +905,12 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
             }
         }
     }
-    report_ledger(&journal, &ledger);
+    report_ledger(&journal, &ledger, &unit);
     println!("[sa] pipeline complete");
     Ok(())
 }
 
-/// 收尾报账：花了多少、其中多少仍是名义值、换出了多少 token。`--max-usd` 到底是
+/// 收尾报账：花了多少、其中多少仍是名义值、换出了多少 token。`--max-cost` 到底是
 /// 「账单上限」还是「名义上限」，由这行说清楚，不靠人记住这次有没有传 `--roles-dir`。
 /// 这份读数能不能按 token 算成账单。
 ///
@@ -901,7 +949,9 @@ fn attribute(issues: &[String]) -> Attribution {
     }
 }
 
-fn report_ledger(journal: &Journal, ledger: &PriceLedger) {
+/// `unit` 是这一次运行的钱的单位（`PriceLedger::unit`），报账当场把它印出来：
+/// 一个不带单位的金额数字，在两种币种面前就是误导（§9.44）。
+fn report_ledger(journal: &Journal, ledger: &PriceLedger, unit: &str) {
     let state = journal.projection().state;
     // 结论也是账的一部分（§9.35）：报账时说出「每一关最后一次提交读出来的测试结论」。
     // 读的是投影，不是重新去翻那几份工件——它和预算停损看的必须是同一份状态。
@@ -923,19 +973,19 @@ fn report_ledger(journal: &Journal, ledger: &PriceLedger) {
             );
         }
     }
-    if state.spent_usd.is_empty() {
+    if state.spent.is_empty() {
         println!("[sa] ledger: nothing booked");
         return;
     }
-    let nominal_total: f64 = state.nominal_usd.values().sum();
-    let total: f64 = state.spent_usd.values().sum();
+    let nominal_total: f64 = state.nominal.values().sum();
+    let total: f64 = state.spent.values().sum();
     // 「说不清的钱」要分得出为什么说不清：该补价，还是该修读数（§9.37）。
     let reasons: Vec<String> = state
         .nominal_by_reason
         .iter()
-        .map(|(reason, usd)| format!("{} {usd:.4}", reason.label()))
+        .map(|(reason, amount)| format!("{} {amount:.4}", reason.label()))
         .collect();
-    for (peer, usd) in &state.spent_usd {
+    for (peer, cost) in &state.spent {
         let tokens = state.tokens.get(peer).copied().unwrap_or_default();
         let unsettled = state
             .reserved
@@ -943,7 +993,7 @@ fn report_ledger(journal: &Journal, ledger: &PriceLedger) {
             .filter(|((_, p, _, _), _)| p == peer)
             .count();
         println!(
-            "[sa] ledger {peer}: {usd:.4} usd{}{} ; tokens in {} / out {}{}",
+            "[sa] ledger {peer}: {cost:.4} {unit}{}{} ; tokens in {} / out {}{}",
             if ledger.is_priced(peer) {
                 ""
             } else {
@@ -964,7 +1014,7 @@ fn report_ledger(journal: &Journal, ledger: &PriceLedger) {
         );
     }
     println!(
-        "[sa] ledger total: {total:.4} usd, of which {nominal_total:.4} nominal{}",
+        "[sa] ledger total: {total:.4} {unit}, of which {nominal_total:.4} nominal{}",
         if reasons.is_empty() {
             String::new()
         } else {
@@ -1558,8 +1608,9 @@ mod tests {
             task: "demo: 实现一个 LRU cache".into(),
             journal: PathBuf::from("/tmp/journal.jsonl"),
             artifacts: PathBuf::from("/tmp/artifacts"),
-            per_dispatch_usd: 0.5,
-            max_usd: 6.0,
+            per_dispatch_cost: 0.5,
+            max_cost: 6.0,
+            currency: "usd".into(),
             max_iterations: 3,
             max_reworks: 2,
             bell_timeout: Duration::from_secs(300),
@@ -1751,6 +1802,81 @@ mod tests {
         let nothing = PriceLedger::discover(None, None);
         assert_eq!(nothing.reservation("harness-rd", 0.25), (0.25, false));
         assert!(nothing.known_peers().is_empty());
+    }
+
+    /// 钱的单位有一个**来源**，而不是写在字段名里（design §9.44）：
+    /// ① 价格表声明的币种赢过 CLI 的 fallback；② 全无价时才用 fallback；
+    /// ③ 同一次运行里混两种币种 => 启动即失败——账本是加总的，混币种的「总额」
+    /// 不是任何数，挑一个猜也不是。
+    #[test]
+    fn the_money_unit_comes_from_the_table_and_never_gues() {
+        let dir = std::env::temp_dir().join(format!("kestrel-unit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let roles = dir.join("roles");
+        std::fs::create_dir_all(&roles).unwrap();
+        std::fs::write(
+            roles.join("rd.toml"),
+            "role = \"rd\"\npeer_id = \"harness-rd\"\n\n[llm]\nprovider = \"cn\"\nmodel = \"m\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            roles.join("qa.toml"),
+            "role = \"qa\"\npeer_id = \"harness-qa\"\n\n[llm]\nprovider = \"us\"\nmodel = \"m\"\n",
+        )
+        .unwrap();
+        let priced = |currency: Option<&str>| {
+            let currency = currency
+                .map(|c| format!("currency = \"{c}\"\n"))
+                .unwrap_or_default();
+            format!(
+                "[providers.cn]\nbase_url = \"https://cn.invalid\"\napi = \"anthropic-messages\"\nkey = \"k\"\n{currency}\n\
+                 [[providers.cn.models]]\nid = \"m\"\n\n[providers.cn.models.cost]\ninput = 0.8\noutput = 2.8\n\n\
+                 [providers.us]\nbase_url = \"https://us.invalid\"\napi = \"anthropic-messages\"\nkey = \"k\"\n{currency}\n\
+                 [[providers.us.models]]\nid = \"m\"\n\n[providers.us.models.cost]\ninput = 0.3\noutput = 1.2\n"
+            )
+        };
+        let registry = |text: String| {
+            let path = dir.join(format!("providers-{}.toml", std::process::id()));
+            std::fs::write(&path, text).unwrap();
+            Registry::load(&path).unwrap()
+        };
+
+        // ① 表说了算：两个 peer 都声明 cny，fallback 写 usd 也没用
+        let reg = registry(priced(Some("cny")));
+        let ledger = PriceLedger::discover(Some(&roles), Some(&reg));
+        assert_eq!(ledger.unit("usd").unwrap(), "cny", "币种跟着价目表走");
+
+        // ② 全无价 => 用 CLI 声明的币种（名义记账也得说得出单位）
+        let no_rates = PriceLedger::discover(Some(&roles), None);
+        assert_eq!(no_rates.unit("cny").unwrap(), "cny");
+        assert_eq!(no_rates.unit("USD").unwrap(), "usd", "大小写归一");
+
+        // ③ 混币种 => 失败，并且失败里要点名是谁们
+        let mixed = registry(
+            "[providers.cn]\nbase_url = \"https://cn.invalid\"\napi = \"anthropic-messages\"\nkey = \"k\"\ncurrency = \"cny\"\n\n\
+             [[providers.cn.models]]\nid = \"m\"\n\n[providers.cn.models.cost]\ninput = 0.8\noutput = 2.8\n\n\
+             [providers.us]\nbase_url = \"https://us.invalid\"\napi = \"anthropic-messages\"\nkey = \"k\"\ncurrency = \"usd\"\n\n\
+             [[providers.us.models]]\nid = \"m\"\n\n[providers.us.models.cost]\ninput = 0.3\noutput = 1.2\n"
+                .to_string(),
+        );
+        let ledger = PriceLedger::discover(Some(&roles), Some(&mixed));
+        let err = ledger.unit("usd").expect_err("一次运行不能同时记两种钱");
+        let text = err.to_string();
+        assert!(text.contains("cny") && text.contains("usd"), "{text}");
+        assert!(
+            text.contains("harness-rd") && text.contains("harness-qa"),
+            "失败要点名到 peer: {text}"
+        );
+
+        // 有价但没声明币种 => 读成 usd（历史默认，不是猜出来的第三种）
+        let legacy = registry(priced(None));
+        let ledger = PriceLedger::discover(Some(&roles), Some(&legacy));
+        assert_eq!(
+            ledger.unit("cny").unwrap(),
+            "usd",
+            "缺省 = usd，与旧行为一致"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 投递是 at-least-once，所以审批者必须按 `req` 去重：重发不该再判一次，也不该

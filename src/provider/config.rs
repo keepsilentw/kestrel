@@ -24,6 +24,13 @@ pub struct ProviderDef {
     pub base_url: String,
     pub api: WireId,
     pub key: String,
+    /// The currency the `cost` tables of this provider are written in. Declared
+    /// per provider because that is the unit the **vendor** publishes: a Chinese
+    /// price list stays 元, a USD one stays $, and no FX arithmetic is hidden in
+    /// the kernel (design §9.44). Absent => `usd`, the unit the ledger has always
+    /// printed. A run whose priced peers disagree is refused, not averaged.
+    #[serde(default)]
+    pub currency: Option<String>,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
     #[serde(default)]
@@ -96,6 +103,12 @@ impl Registry {
             .find(|m| m.id == model_id)
             .and_then(|m| m.cost)?;
         cost.is_declared().then_some(cost)
+    }
+
+    /// The currency a provider's rates are written in (`None` = not declared,
+    /// which callers read as `usd`). Compared case-insensitively by the ledger.
+    pub fn provider_currency(&self, provider_id: &str) -> Option<&str> {
+        self.providers.get(provider_id)?.currency.as_deref()
     }
 
     pub fn headers(&self, provider_id: &str) -> Vec<(String, String)> {

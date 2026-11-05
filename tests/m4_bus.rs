@@ -256,7 +256,7 @@ async fn rotation_does_not_hide_an_in_flight_bell() {
         }
     }
     let before = reconcile(&journal.replay());
-    let spent_before = before.state.spent_usd.get("harness-rd").copied().unwrap();
+    let spent_before = before.state.spent.get("harness-rd").copied().unwrap();
     assert_eq!(before.in_flight.len(), 1);
 
     // --- rotate so only the newest few records stay live
@@ -273,7 +273,7 @@ async fn rotation_does_not_hide_an_in_flight_bell() {
     assert_eq!(live.state, whole.state, "预算与阶段投影不因截断而失真");
     assert_eq!(live.in_flight, whole.in_flight);
     assert_eq!(
-        live.state.spent_usd.get("harness-rd").copied().unwrap(),
+        live.state.spent.get("harness-rd").copied().unwrap(),
         spent_before,
         "no double counting after a checkpoint"
     );
@@ -467,7 +467,7 @@ async fn budget_stop_loss_trips() {
         total += turn;
     }
     let state = reconcile(&journal.replay()).state;
-    let spent = state.spent_usd.get("harness-rd").copied().unwrap_or(0.0);
+    let spent = state.spent.get("harness-rd").copied().unwrap_or(0.0);
     assert!(
         (spent - 1.7).abs() < 1e-9,
         "third dispatch blocked at {spent}"

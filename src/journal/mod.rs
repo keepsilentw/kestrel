@@ -397,13 +397,13 @@ mod tests {
         let path = std::env::temp_dir().join(format!("kestrel-j3-{}.jsonl", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let j = Journal::create(&path).unwrap();
-        for usd in [0.5, 0.75] {
+        for cost in [0.5, 0.75] {
             j.append(&JournalRecord::reserved(
                 "demo",
                 "harness-rd",
                 Stage::Dev,
                 1,
-                usd,
+                cost,
                 false,
             ))
             .unwrap();
@@ -412,7 +412,7 @@ mod tests {
         let reconciled = records::reconcile(&records);
         let spent = reconciled
             .state
-            .spent_usd
+            .spent
             .get("harness-rd")
             .copied()
             .unwrap_or(0.0);
@@ -510,12 +510,7 @@ mod tests {
             vec![4],
             "the unsettled bell of the newest iteration is still in flight"
         );
-        let spent = all
-            .state
-            .spent_usd
-            .get("harness-rd")
-            .copied()
-            .unwrap_or(0.0);
+        let spent = all.state.spent.get("harness-rd").copied().unwrap_or(0.0);
         assert!((spent - 2.0).abs() < 1e-9, "{spent}");
 
         // the held handle follows the renamed file: appending must still work
@@ -681,12 +676,7 @@ mod tests {
         assert!(staged_leftovers(&dir).is_empty());
         // replay_all must not double-count the budget: 4 dispatches x 0.5
         let all = reconcile(&journal.replay_all());
-        let spent = all
-            .state
-            .spent_usd
-            .get("harness-rd")
-            .copied()
-            .unwrap_or(0.0);
+        let spent = all.state.spent.get("harness-rd").copied().unwrap_or(0.0);
         assert!((spent - 2.0).abs() < 1e-9, "{spent}");
         assert_eq!(all.in_flight.len(), 1);
         std::fs::remove_dir_all(&dir).ok();
@@ -709,7 +699,7 @@ mod tests {
         let checkpoint = Checkpoint {
             stage: Some(Stage::Test),
             iteration: 3,
-            spent_usd: [("harness-qa".to_string(), 1.5)].into_iter().collect(),
+            spent: [("harness-qa".to_string(), 1.5)].into_iter().collect(),
             in_flight: vec![records::InFlightBell {
                 task: "demo".into(),
                 to: "harness-qa".into(),
@@ -816,7 +806,7 @@ mod tests {
             "unsettled bell survives reopen"
         );
         assert_eq!(
-            projection.state.spent_usd.get("harness-rd").copied(),
+            projection.state.spent.get("harness-rd").copied(),
             Some(0.5),
             "the stop-loss still sees yesterday's spend"
         );

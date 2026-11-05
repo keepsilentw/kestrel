@@ -144,7 +144,10 @@ pub enum JournalRecord {
         stage: Option<Stage>,
         #[serde(default)]
         iteration: u64,
-        usd: f64,
+        /// 金额。字段名是**单位中立**的：单位由价格表声明（`currency`，见 §9.44），
+        /// 不写进 key 里。`alias = "usd"` 让 2026-11-05 之前落盘的 journal 行照旧可读。
+        #[serde(rename = "cost", alias = "usd")]
+        cost: f64,
         /// true = 金额来自价格表（`providers.toml` 的 cost）；false = 这个
         /// fixture 的名义值。账本必须能把两者分开说清楚，否则「按名义值停损」
         /// 会被读成「按账单停损」。
@@ -152,7 +155,7 @@ pub enum JournalRecord {
         priced: bool,
     },
     /// 结算：把上面那笔预留换成实际 token 的账单。没有这条记录，账本就只能永远
-    /// 按派发次数计钱——design §10 划出的边界「usd 才能真正按 token 结算」说的
+    /// 按派发次数计钱——design §10 划出的边界「钱才能真正按 token 结算」说的
     /// 就是它。结算只替换同坐标的预留；找不到预留的结算是重复投递或漏预留，
     /// 一律不记账（钱只计一次，宁可少计一次重复的）。
     BudgetSettled {
@@ -164,7 +167,8 @@ pub enum JournalRecord {
         #[serde(default)]
         iteration: u64,
         usage: crate::provider::wire::Usage,
-        usd: f64,
+        #[serde(rename = "cost", alias = "usd")]
+        cost: f64,
         #[serde(default)]
         priced: bool,
         /// 当 `priced = false`：这笔钱为什么算不成账单。老记录读出来是 `None`
@@ -229,7 +233,7 @@ impl JournalRecord {
         peer: &str,
         stage: Stage,
         iteration: u64,
-        usd: f64,
+        cost: f64,
         priced: bool,
     ) -> Self {
         JournalRecord::BudgetSpent {
@@ -237,7 +241,7 @@ impl JournalRecord {
             peer: peer.to_string(),
             stage: Some(stage),
             iteration,
-            usd,
+            cost,
             priced,
         }
     }
@@ -249,7 +253,7 @@ impl JournalRecord {
         stage: Stage,
         iteration: u64,
         usage: crate::provider::wire::Usage,
-        usd: f64,
+        cost: f64,
         priced: bool,
     ) -> Self {
         JournalRecord::BudgetSettled {
@@ -258,7 +262,7 @@ impl JournalRecord {
             stage: Some(stage),
             iteration,
             usage,
-            usd,
+            cost,
             priced,
             nominal_reason: None,
         }
@@ -272,7 +276,7 @@ impl JournalRecord {
         stage: Stage,
         iteration: u64,
         usage: crate::provider::wire::Usage,
-        usd: f64,
+        cost: f64,
         reason: NominalReason,
     ) -> Self {
         JournalRecord::BudgetSettled {
@@ -281,7 +285,7 @@ impl JournalRecord {
             stage: Some(stage),
             iteration,
             usage,
-            usd,
+            cost,
             priced: false,
             nominal_reason: Some(reason),
         }
@@ -315,16 +319,18 @@ impl NominalReason {
 pub struct StateSnapshot {
     pub stage: Option<Stage>,
     pub iteration: u64,
-    pub spent_usd: BTreeMap<String, f64>,
+    /// 每个 peer 花掉的钱。**单位中立命名**：单位由价格表声明（§9.44），
+    /// 一个把币种写进字段名的结构，迟早会在另一种币种上报错数。
+    pub spent: BTreeMap<String, f64>,
     /// 那笔花费里有多少仍是名义值（没有价格表可结算的预留）。停损报账时必须
     /// 说得出这个差值，否则「按名义停损」会被读成「按账单停损」。
-    pub nominal_usd: BTreeMap<String, f64>,
+    pub nominal: BTreeMap<String, f64>,
     /// 已结算派发的 token 合计：钱是算出来的，这里留下算的那份输入。
     pub tokens: BTreeMap<String, crate::provider::wire::Usage>,
     /// 还没结算的预留（dispatch 坐标 -> 金额/是否按价）。轮转把它抄进检查点，
     /// 结算才配对得上——丢了它就等于同一笔派发计两次钱。
     pub reserved: BTreeMap<BudgetKey, Booking>,
-    /// 名义钱按来源分类（总额仍在 `nominal_usd` 里）。看账的人要能分得出
+    /// 名义钱按来源分类（总额仍在 `nominal` 里）。看账的人要能分得出
     /// 「该补价」与「该修读数」是哪些钱（§9.37）。
     pub nominal_by_reason: BTreeMap<NominalReason, f64>,
     /// 每个 (task, stage) **最后一次提交**读出的测试结论（§9.35）。这是状态不是
@@ -378,9 +384,13 @@ pub struct InFlightBell {
 pub struct Checkpoint {
     pub stage: Option<Stage>,
     pub iteration: u64,
-    pub spent_usd: BTreeMap<String, f64>,
+    // 单位中立的新名 + 老名 alias：检查点是落盘的，2026-11-05 之前的归档段
+    // 必须还能读回来，否则「截断后结论不变」那条不变式会因为改名而失效。
+    #[serde(rename = "spent", alias = "spent_usd")]
+    pub spent: BTreeMap<String, f64>,
     pub in_flight: Vec<InFlightBell>,
-    pub nominal_usd: BTreeMap<String, f64>,
+    #[serde(rename = "nominal", alias = "nominal_usd")]
+    pub nominal: BTreeMap<String, f64>,
     pub tokens: BTreeMap<String, crate::provider::wire::Usage>,
     pub reserved: Vec<ReservationEntry>,
     /// 名义钱的来源分类也必须跨检查点活着，否则截断之后「说不清」就只剩一个总数了。
@@ -397,9 +407,9 @@ impl Checkpoint {
         Self {
             stage: report.state.stage,
             iteration: report.state.iteration,
-            spent_usd: report.state.spent_usd.clone(),
+            spent: report.state.spent.clone(),
             in_flight: report.in_flight.clone(),
-            nominal_usd: report.state.nominal_usd.clone(),
+            nominal: report.state.nominal.clone(),
             tokens: report.state.tokens.clone(),
             // BTreeMap 的迭代顺序是确定的，所以同一份账本捕获出的检查点字节一致
             // ——「在线投影 == 全量重放」那条断言依赖这一点。
@@ -528,18 +538,18 @@ impl Folder {
                 peer,
                 stage,
                 iteration,
-                usd,
+                cost,
                 priced,
             } => {
-                *self.spent.entry(peer.clone()).or_insert(0.0) += usd;
+                *self.spent.entry(peer.clone()).or_insert(0.0) += cost;
                 if !priced {
-                    *self.nominal.entry(peer.clone()).or_insert(0.0) += usd;
+                    *self.nominal.entry(peer.clone()).or_insert(0.0) += cost;
                     // 预留在记下来时就是名义的，只可能是「价格表里查不到这个 peer 的
                     // model」——按构造如此（§9.27），所以这里不需要额外字段。
-                    self.shift_nominal(NominalReason::NoRate, *usd);
+                    self.shift_nominal(NominalReason::NoRate, *cost);
                 }
                 self.reserved
-                    .insert(budget_key(task, peer, *stage, *iteration), (*usd, *priced));
+                    .insert(budget_key(task, peer, *stage, *iteration), (*cost, *priced));
             }
             // 结算换掉同坐标的预留：钱只计一次，多出来的部分退回去。找不到预留
             // 的结算（重复投递、或该 stage 早已结了账）不记账——宁可漏计一次重复
@@ -550,7 +560,7 @@ impl Folder {
                 peer,
                 stage,
                 iteration,
-                usd,
+                cost,
                 priced,
                 nominal_reason,
                 // `usage` 留在这条记录里是审计（结算对着哪份读数算的钱），但折叠不读它：
@@ -558,21 +568,21 @@ impl Folder {
                 usage: _,
             } => {
                 let key = budget_key(task, peer, *stage, *iteration);
-                if let Some((prior_usd, prior_priced)) = self.reserved.remove(&key) {
-                    *self.spent.entry(peer.clone()).or_insert(0.0) += usd - prior_usd;
+                if let Some((prior_cost, prior_priced)) = self.reserved.remove(&key) {
+                    *self.spent.entry(peer.clone()).or_insert(0.0) += cost - prior_cost;
                     if !prior_priced {
                         let slot = self.nominal.entry(peer.clone()).or_insert(0.0);
-                        *slot -= prior_usd;
+                        *slot -= prior_cost;
                         if slot.abs() < 1e-12 {
                             *slot = 0.0;
                         }
                         // 之前那笔名义钱来自预留（BudgetSpent），来源只能是「没有价」。
-                        self.shift_nominal(NominalReason::NoRate, -prior_usd);
+                        self.shift_nominal(NominalReason::NoRate, -prior_cost);
                     }
                     if !priced {
-                        *self.nominal.entry(peer.clone()).or_insert(0.0) += usd;
+                        *self.nominal.entry(peer.clone()).or_insert(0.0) += cost;
                         // 老记录没有这个字段：按「没有价」处理，而不是按 0 或猜别的。
-                        self.shift_nominal(nominal_reason.unwrap_or(NominalReason::NoRate), *usd);
+                        self.shift_nominal(nominal_reason.unwrap_or(NominalReason::NoRate), *cost);
                     }
                 }
             }
@@ -599,11 +609,11 @@ impl Folder {
                         .push((b.task.clone(), b.to.clone(), b.bell.clone()));
                 }
                 self.spent.clear();
-                self.spent.extend(checkpoint.spent_usd.clone());
+                self.spent.extend(checkpoint.spent.clone());
                 // 结算配对必须跟着检查点走：归档掉的前缀里那些还没结算的预留，
                 // 若不在这里恢复，之后到达的结算会当成「无预留」而再记一次钱。
                 self.nominal.clear();
-                self.nominal.extend(checkpoint.nominal_usd.clone());
+                self.nominal.extend(checkpoint.nominal.clone());
                 self.tokens.clear();
                 self.tokens.extend(checkpoint.tokens.clone());
                 self.reserved.clear();
@@ -637,8 +647,8 @@ impl Folder {
             state: StateSnapshot {
                 stage: self.settled.last_stage,
                 iteration: self.settled.max_iteration,
-                spent_usd: self.spent.clone(),
-                nominal_usd: self.nominal.clone(),
+                spent: self.spent.clone(),
+                nominal: self.nominal.clone(),
                 nominal_by_reason: self.nominal_by_reason.clone(),
                 tokens: self.tokens.clone(),
                 reserved: self.reserved.clone(),
@@ -792,7 +802,7 @@ mod tests {
             "an approval decision is not a bell receipt"
         );
         assert_eq!(rep.state.stage, Some(Stage::Dev));
-        assert!(rep.state.spent_usd.is_empty());
+        assert!(rep.state.spent.is_empty());
     }
 
     /// A checkpoint resets the settled-receipt keys too. Without that, a bell
@@ -898,11 +908,11 @@ mod tests {
         ];
         let rep = reconcile(&records);
         assert!(
-            (rep.state.spent_usd["rd"] - 0.12).abs() < 1e-9,
+            (rep.state.spent["rd"] - 0.12).abs() < 1e-9,
             "{:?}",
-            rep.state.spent_usd
+            rep.state.spent
         );
-        assert!(rep.state.nominal_usd.is_empty(), "按价结算的不是名义值");
+        assert!(rep.state.nominal.is_empty(), "按价结算的不是名义值");
         assert_eq!(
             rep.state.tokens["rd"],
             usage(100, 20),
@@ -920,8 +930,8 @@ mod tests {
             JournalRecord::settled("t", "rd", Stage::Dev, 1, usage(10, 5), 0.12, true),
         ];
         let rep = reconcile(&records);
-        assert!((rep.state.spent_usd["rd"] - 0.12).abs() < 1e-9);
-        assert_eq!(rep.state.nominal_usd.get("rd").copied().unwrap_or(0.0), 0.0);
+        assert!((rep.state.spent["rd"] - 0.12).abs() < 1e-9);
+        assert_eq!(rep.state.nominal.get("rd").copied().unwrap_or(0.0), 0.0);
     }
 
     /// 说不清价就是说不清价，不是「这次免费」：名义预留既计进 spent 也计进
@@ -937,8 +947,8 @@ mod tests {
             false,
         )];
         let rep = reconcile(&records);
-        assert!((rep.state.spent_usd["rd"] - 0.5).abs() < 1e-9);
-        assert!((rep.state.nominal_usd["rd"] - 0.5).abs() < 1e-9);
+        assert!((rep.state.spent["rd"] - 0.5).abs() < 1e-9);
+        assert!((rep.state.nominal["rd"] - 0.5).abs() < 1e-9);
     }
 
     /// 找不到预留的结算不记账：重复投递、或该 stage 早已结了账，都不该把一笔
@@ -950,7 +960,7 @@ mod tests {
             JournalRecord::settled("t", "rd", Stage::Dev, 1, usage(50, 50), 0.3, true),
         ];
         let rep = reconcile(&records);
-        assert_eq!(rep.state.spent_usd.get("rd").copied().unwrap_or(0.0), 0.0);
+        assert_eq!(rep.state.spent.get("rd").copied().unwrap_or(0.0), 0.0);
         assert!(
             rep.state.tokens.is_empty(),
             "结算不再是用量的来源：被丢弃的结算既不记钱也不记 token"
@@ -977,9 +987,9 @@ mod tests {
             "读数进账，与有没有费率无关"
         );
         assert!(
-            (rep.state.nominal_usd["rd"] - 0.5).abs() < 1e-9,
+            (rep.state.nominal["rd"] - 0.5).abs() < 1e-9,
             "钱仍按名义计一次: {:?}",
-            rep.state.nominal_usd
+            rep.state.nominal
         );
 
         // 一份读数配两次结算（重复投递）也只能算一次用量
@@ -1010,9 +1020,9 @@ mod tests {
         ];
         let rep = reconcile(&records);
         assert!(
-            (rep.state.spent_usd["rd"] - 0.5).abs() < 1e-9,
+            (rep.state.spent["rd"] - 0.5).abs() < 1e-9,
             "配不上对的结算被忽略，iter1 的预留原样留在账上: {:?}",
-            rep.state.spent_usd
+            rep.state.spent
         );
         assert_eq!(rep.state.reserved.len(), 1, "iter1 还欠着一次结算");
     }
@@ -1037,7 +1047,7 @@ mod tests {
         ];
         let rep = reconcile(&records);
         assert!(rep.state.reserved.is_empty(), "配对键随 stage 结算收掉");
-        assert!((rep.state.spent_usd["rd"] - 0.5).abs() < 1e-9);
+        assert!((rep.state.spent["rd"] - 0.5).abs() < 1e-9);
         // 另一个 task 的同名 stage 不受影响
         let other = vec![
             JournalRecord::reserved("t2", "rd", Stage::Dev, 1, 0.5, false),
@@ -1064,9 +1074,9 @@ mod tests {
         let checkpoint = Checkpoint {
             stage: Some(Stage::Dev),
             iteration: 1,
-            spent_usd: [("rd".to_string(), 0.5)].into_iter().collect(),
+            spent: [("rd".to_string(), 0.5)].into_iter().collect(),
             in_flight: vec![],
-            nominal_usd: Default::default(),
+            nominal: Default::default(),
             tokens: Default::default(),
             reserved: vec![(key, (0.5, true))],
             tests: Default::default(),
@@ -1085,11 +1095,65 @@ mod tests {
         ];
         let rep = reconcile(&records);
         assert!(
-            (rep.state.spent_usd["rd"] - 0.12).abs() < 1e-9,
+            (rep.state.spent["rd"] - 0.12).abs() < 1e-9,
             "{:?}",
-            rep.state.spent_usd
+            rep.state.spent
         );
         assert_eq!(rep.state.tokens["rd"], usage(30, 12));
+    }
+
+    /// 把金额字段从 `usd` 改成单位中立的 `cost`（§9.44）**不许让旧账失忆**：
+    /// journal 是真相源，昨天的 `usd` 行读不回金额，停损/截断/审计就都从既有花费上
+    /// 重新开始数——那正是「同一笔派发计两次钱」的入口。alias 由这一条钉住。
+    #[test]
+    fn old_usd_keyed_lines_still_replay() {
+        let line = r#"{"type":"budget_spent","task":"demo","peer":"rd","stage":"dev","iteration":1,"usd":0.5,"priced":false}"#;
+        let back: JournalRecord = serde_json::from_str(line).expect("旧 key 仍可读");
+        match &back {
+            JournalRecord::BudgetSpent { cost, priced, .. } => {
+                assert!((*cost - 0.5).abs() < 1e-9, "{cost}");
+                assert!(!priced, "老行没有 priced 之外的信息，也不该编出");
+            }
+            other => panic!("wrong record: {other:?}"),
+        }
+        // 折叠也认得它：钱与名义那一份都落进来
+        let rep = reconcile(&[back]);
+        assert!(
+            (rep.state.spent["rd"] - 0.5).abs() < 1e-9,
+            "{:?}",
+            rep.state.spent
+        );
+        assert!((rep.state.nominal["rd"] - 0.5).abs() < 1e-9);
+
+        // 旧检查点里的 `spent_usd` / `nominal_usd` 同样读得回来
+        let ckpt = r#"{"type":"snapshot","covers":2,"checkpoint":{"stage":"dev","iteration":1,"spent_usd":{"rd":0.5},"in_flight":[],"nominal_usd":{"rd":0.5},"tokens":{},"reserved":[]}}"#;
+        let back: JournalRecord = serde_json::from_str(ckpt).expect("老检查点仍能解析");
+        let rep = reconcile(&[back]);
+        assert!(
+            (rep.state.spent["rd"] - 0.5).abs() < 1e-9,
+            "检查点带过来的钱不因改名而蒸发: {:?}",
+            rep.state.spent
+        );
+        assert!(
+            (rep.state.nominal["rd"] - 0.5).abs() < 1e-9,
+            "名义那一份也要跟着活下来: {:?}",
+            rep.state.nominal
+        );
+
+        // 新行写出去的是单位中立的名字（alias 只进不出，不会把两种拼法都留在盘上）
+        let fresh = serde_json::to_string(&JournalRecord::reserved(
+            "demo",
+            "rd",
+            Stage::Dev,
+            1,
+            0.5,
+            false,
+        ))
+        .unwrap();
+        assert!(
+            fresh.contains("\"cost\":0.5") && !fresh.contains("\"usd\""),
+            "{fresh}"
+        );
     }
 
     /// 带**未结算预留**的检查点必须能序列化往返：先预留、轮转、后结算是真实序列，
@@ -1101,13 +1165,13 @@ mod tests {
         let checkpoint = Checkpoint {
             stage: Some(Stage::Dev),
             iteration: 1,
-            spent_usd: [("rd".to_string(), 0.5)].into_iter().collect(),
+            spent: [("rd".to_string(), 0.5)].into_iter().collect(),
             in_flight: vec![InFlightBell {
                 task: "t".into(),
                 to: "rd".into(),
                 bell: bell("rd", Stage::Dev, 1),
             }],
-            nominal_usd: Default::default(),
+            nominal: Default::default(),
             tokens: [("rd".to_string(), usage(8, 8))].into_iter().collect(),
             reserved: vec![(key, (0.5, true))],
             tests: Default::default(),
@@ -1139,9 +1203,9 @@ mod tests {
             JournalRecord::settled("t", "rd", Stage::Dev, 1, usage(4, 4), 0.12, true),
         ]);
         assert!(
-            (rep.state.spent_usd["rd"] - 0.12).abs() < 1e-9,
+            (rep.state.spent["rd"] - 0.12).abs() < 1e-9,
             "检查点带过来的 0.5 预留被结算换成 0.12，而不是加在旁边: {:?}",
-            rep.state.spent_usd
+            rep.state.spent
         );
     }
 
@@ -1221,14 +1285,14 @@ mod tests {
         ];
         let rep = reconcile(&records);
         assert!(
-            (rep.state.spent_usd["qa"] - 0.160_768).abs() < 1e-9,
+            (rep.state.spent["qa"] - 0.160_768).abs() < 1e-9,
             "按名义多计，不是按少报的读数少计: {:?}",
-            rep.state.spent_usd
+            rep.state.spent
         );
         assert!(
-            (rep.state.nominal_usd["qa"] - 0.160_768).abs() < 1e-9,
+            (rep.state.nominal["qa"] - 0.160_768).abs() < 1e-9,
             "名义那一份要跟着涨，报账才说不清这钱是「算不出来」的: {:?}",
-            rep.state.nominal_usd
+            rep.state.nominal
         );
         assert!(
             rep.state.reserved.is_empty(),
@@ -1278,7 +1342,7 @@ mod tests {
             "{:?}",
             rep.state.nominal_by_reason
         );
-        let by_peer: f64 = rep.state.nominal_usd.values().sum();
+        let by_peer: f64 = rep.state.nominal.values().sum();
         let by_reason: f64 = rep.state.nominal_by_reason.values().sum();
         assert!(
             (by_peer - by_reason).abs() < 1e-12,
