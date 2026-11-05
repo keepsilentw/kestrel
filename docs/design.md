@@ -12,11 +12,14 @@
 > 归因随后提成判定自带的字段，不再让路由读措辞（§9.41）。
 > 2026-11-05：报账的两处「说不清」——没有费率的运行不再报出 `tokens 0 / 0`，同一颗 req 的矛盾回执
 > 按事实强弱合并而不是先到先得（§9.42）；同日一份测试费率表让 §9.27 的两段式结算第一次在真端点落地，
-> 随后换成**真实费率**（用户层 `providers.toml`，来源/换算/取峰价的理由见 §9.43），名义值只剩一个来源：网关少报读数。
+> 随后换成**真实费率**（用户层 `providers.toml`，取峰时价的理由见 §9.43），名义值只剩一个来源：网关少报读数；
+> 最后一步把钱的单位从「写在名字里的 usd」改成「价目表声明的 currency」，两份价目表按厂商原文记（§9.44），
+> 并把 SA 后端从百炼 Token Plan 换成小米 MiMo——`-p` 单发两轮实测通过、官方 元 价也查到并记进配置（§9.44⑥⑧），
+> 只有星型联跑仍不派发 SA 这一点没变。
 > 质量闸门保持人工执行（本仓库不挂 CI，见 §9.19⑥）。
 > 二期十一项已于 2026-11-04 在真端点联跑中走完（`pipeline complete`，四阶段全 pass，
 > 审批请求/判定/回执各 5 条成对）；那一次联跑抓出并修掉两个「测试全绿但跑不起来」的缺陷，见 §9.32。
-> **Metrics** — src 51 files / 17043 lines · tests 9 files / 3383 lines · 245 tests (lib 192 + bin 4 + integration 49)
+> **Metrics** — src 51 files / 17251 lines · tests 9 files / 3383 lines · 247 tests (lib 194 + bin 4 + integration 49)
 > **Integration** — core_loop 5 / discipline 2 / m1_tools 9 / m2_session 6 / m4_bus 15 / m5_pool 6 / sandbox_e2e 4 / wire_anthropic 2
 > 规模已过 plan 预算（10-13k）的上沿：多出来的部分几乎都花在「取消安全」与「对账」这两条纪律上。
 > 上面两行数字由 `tests/discipline.rs::metrics_lines_match_the_tree` 对照源码树重算校验——
@@ -107,7 +110,7 @@ flowchart TD
 | user | `~/.kestrel/providers.toml` | 唯一归属地（key 三态：字面量 / `$ENV` / `!cmd`） |
 | env | 仅被显式 `$VAR` 引用 | 无隐式 ANTHROPIC_* 回退 |
 
-每角色一个 TOML = 「一角色一后端」：SA→qwen3.8-max、RD→deepseek-v4-flash、QA→glm-5.3-flash（示例见 `harness/roles/`）。对照 CC 方案（harness-v3 §6.2 的 settings 优先级对抗 + 钉全集仪式）此处 provider 归属在类型层唯一，无需仪式。
+每角色一个 TOML = 「一角色一后端」：SA→mimo-v2.6-flash、RD→deepseek-v4-flash、QA→glm-5.3-flash（示例见 `harness/roles/`）。对照 CC 方案（harness-v3 §6.2 的 settings 优先级对抗 + 钉全集仪式）此处 provider 归属在类型层唯一，无需仪式。SA 这一格 2026-11-05 从百炼 Token Plan 换成小米 MiMo，理由与「仍未实测」的边界见 §9.44⑤⑥。
 
 工具审批走同一条优先级链：`--approve all|none|bus`（runtime）> role 的 `[permissions].approve` > `none`（拒绝，fail-closed）。此前 `serve` 硬编码 HeadlessDeny，worker 永远走不到「沙箱拒绝 → 审批 → 脱沙箱重试」这条回路；现在 role 可以声明三态（demo 里 RD = `bus` 且 `approver = "harness-sa"`，QA 保持缺省拒绝）。runtime 只覆盖**模式**，不覆盖 role 声明的 `approve_timeout_secs`（`with_role_deadline`）——一个 CLI flag 不该顺手把审批等待改成无限。
 
@@ -328,7 +331,7 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
     ⑤ 同日用一份**测试费率表**（`--prices`，费率是刻意编的整数：验的是形状，不是价钱）跑了第三次联跑，§9.27 的两段式第一次在真端点落地——`dev iter1: settled 0.0066 usd for 5265 in / 4633 out tokens`；QA 那三关走进 §9.36 的另一条分支（有价但读数不可信 => `books the reservation 0.1161 usd as NOMINAL`）。收尾第一次报出混合来源：`ledger total: 0.3550 usd, of which 0.3484 nominal (under-reported 0.3484)`。
     ⑥ 边界要说清（写这条时②与④还**只有单测钉住**）：第二次联跑全是 no-rate，那正是 ② 的 bug 现场，但跑的仍是修复前的代码；第三次两端都有价，走不到「没有结算」那条路；④ 也一样，第三次只有一颗审批请求，没出现矛盾回执。实跑当时真正证明的是 ⑤ 的两条结算分支，以及 §9.39 的写侧警告又现场复现一次（`note: worker-side shape warning: … was read as path …`，dev 照样 pass）。**这条边界后来补上了**：把「没填价」这一格用真实费率填掉之后（§9.43），「没有结算」在默认配置下成了不可达路径，于是专门跑了一轮只给 RD 填价的表（§9.43⑦）——QA 三次派发 `has no rate — the reservation stays as the bill (nominal)`、journal 里 `budget_settled` 一条都没有，而收尾仍印出 `harness-qa: 1.5000 usd (nominal backend: no rate) ; tokens in 0 / out 8503`。② 自此有了现场证据。④ 的矛盾回执路径**仍只有单测覆盖**：这两天四轮的批复都没有被投第二次，那件东西要的是「审批窗口里恰好卡上一次重发」的时序，不是配一次表就能撞出来的。
 
-43. **真实费率落进用户层：报账的下一步只剩「该修读数」（2026-11-05）**：
+43. **真实费率落进用户层：报账的下一步只剩「该修读数」（2026-11-05；当天最后一次改动把换算整段拿掉，见 §9.44）**：
     ① 单价住在 `~/.kestrel/providers.toml`（§6 那条「唯一归属地」：费率跟 provider 住，不跟仓库住）。填的是官方页当天读到的数字，不做估算：DeepSeek `https://api-docs.deepseek.com/quick_start/pricing` —— Flash 档 USD/1M tokens：输入 0.15（off-peak）/0.30（peak）、缓存命中 0.003/0.006、输出 0.60/1.20，并注明 `deepseek-v4-flash` 是**已退役的旧名、仍接受、按 Flash 计价**（实际由 V4.1-Flash 服务）；BigModel `https://docs.bigmodel.cn/cn/guide/start/pricing` —— GLM-5.3-Flash CNY/1M tokens：输入 0.8、输出 2.8、缓存命中 0.23，缓存存储「限时免费」。
     ② **只填价不够，币种也得对上一条**：账本记 usd（`--max-usd`、`ledger total … usd`），智谱那张表是人民币。换算取 USD/CNY = 6.67（ECB 参考价 `https://api.frankfurter.dev/v1/latest?base=USD&symbols=CNY` = 6.6723 / 2026-11-04，与 `https://open.er-api.com/v6/latest/USD` = 6.6854 / 2026-11-05 相互印证），每个数字**向上取整**（0.8→0.12、2.8→0.42、0.23→0.035），账单因此永远不会读起来比厂商报价便宜。汇率与抓取日期写进配置注释：一张不记得来源的价目表和一张没填的表一样不可审计。
     ③ 峰谷价对上单值表，选**保守的一侧**：kestrel 每个方向只有一个数，declared 的是**峰时价**（输入 0.30 / 输出 1.20）。谷时价低一半，但那会让停损在峰时**少算**——与 §9.27「宁可按最坏情况多计」同一句。峰时段（UTC 01-04、06-10，工作日，中国法定节假日除外）与谷时价都留在注释里，读得到，不藏。
@@ -336,6 +339,18 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
     ⑤ 换掉测试费率表再跑一轮（真实费率，四关 iter1 全过）：`dev iter1: settled 0.0065 usd for 5218 in / 4086 out tokens`——0.30×5218 + 1.20×4086 每百万 = 0.0064686，与印出来的 0.0065 对得上；预留 0.0581（默认 128K 窗 + 16K 输出的最坏情况）。QA 三关全部走进 §9.36 的第二条分支（`books the reservation 0.0222 usd as NOMINAL instead of a bill that would read too cheap`）。收尾 `ledger total: 0.0732 usd, of which 0.0667 nominal (under-reported 0.0667)`——**`no rate` 这一格消失了**，`nominal_by_reason` 只剩 `under-reported`。这正是 §9.37 要那句话指到的下一步：活儿剩下「修读数来源」（BigModel 的 anthropic 端点不回 input usage），不再是「再补一张价目表」。
     ⑥ 仍然没填的：`qwen-anthropic` / `bailian-qwen` 三个 model 的 `cost` 保持缺席并在注释里写明原因——百炼那条是 **Token Plan（订阅制）**，没查到每 token 标价，写 0 会被读成「免费」。
     ⑦ `context_window` / `max_out` 同日按官方值收成实数（它们不是费率，但同样是「单价跟着 provider 住」那一层的声明）：DeepSeek Flash 1M 上下文 / 384K 输出（定价页同页给出），GLM-5.3-Flash 1M / 128K（模型概览页 `https://docs.bigmodel.cn/cn/guide/start/model-overview`）。这件事会**抬高预留**而不改账单：RD 一次派发的最坏情况从 0.0581（默认 128K/16K）涨到 0.7608 usd（1M×0.30 + 384K×1.20 每百万），QA 从 0.0222 涨到 0.1738；结算仍按实际读数，所以第十四轮的 0.0065 与第十五轮的 0.0071 这类数字不受影响。停损的语义因此变严——四次满额派发约 1.28 usd，仍在 `--max-usd 6.0` 之内，但过去那个默认窗口是在**低估**最坏情况。
+
+44. **钱的单位改成「声明出来的」，两份价目表按厂商原文记；SA 后端换成小米 MiMo（2026-11-05）**：
+    ① 起因是一次很具体的不舒服：§9.43 把智谱的 0.8/2.8/0.23 元换算成 0.12/0.42/0.035 美元，还得在注释里写下汇率、来源与日期。**汇率是一个会过期又没人复核的数字**，而它买到的只是「让账本那个叫 `usd` 的字段别说谎」。直接记人民币才是把来源拿掉的做法——前提是单位不再写在名字里。
+    ② 单位此前确实写在名字里：flag 叫 `--max-usd`/`--nominal-usd`、journal 的金额字段是 `usd`、报账那行印 `usd`、`Usage::cost_usd`。数字换成元而名字继续声称美元，就是报账在说谎，也是 §9.42 反对的那类「两份真相各说一套」。于是收成一句：**金额字段单位中立，单位由价目表声明**。provider 级 `currency`（缺省 `usd`）→ `PriceLedger::unit()` → 报账与停损那行当场印出来；字段改名覆盖 `cost`（journal）、`spent`/`nominal`（投影与检查点）、`--max-cost`/`--nominal-cost`、`Usage::cost`/`worst_case_cost`。
+    ③ 改名**不许让旧账失忆**：journal 是真相源，昨天的 `usd` 行读不回金额，停损与截断就会从既有花费上重新开始数——那正是 §9.14/§9.34 反复踩过的那类坑。所以旧拼法留两条退路：CLI `alias`（`--max-usd`/`--nominal-usd` 照旧解析）与 serde `alias`（旧记录行、旧检查点里的 `spent_usd`/`nominal_usd` 照旧读回来），并由 `old_usd_keyed_lines_still_replay` 同时断「老行读得回来」与「新行只写新名」（alias 只进不出，不会把两种拼法都留在盘上）。
+    ④ **同一次运行混两种币种 = 启动失败**，不是挑一个猜：账本要加总，「2 元 + 0.3 美元」不是任何数；失败信息点名到 peer。这条沿用 §9.29 对坏证据表的同一句话——把「读不懂」当成「没要求」才是危险的那个默认值。完全没有价目表时单位来自 `--currency`（默认 `usd`），名义记账也带着单位印出来：「4 个什么」不该靠人记。
+    ⑤ SA 后端从百炼 Token Plan 换成小米 MiMo（`mimo-anthropic` / `mimo-v2.6-flash`，`providers.toml` 里凭据仍按 `!sqlite3` 引用 cc-switch 那一行，唯一归属地不变）。换的理由不是性能：订阅制的 Token Plan **没有每 token 标价**可填，而它的 anthropic 表面正是 §9.7/§9.10 里 usage 少报、只认 `/apps/anthropic` 那两个形态问题的来源。
+    ⑥ MiMo 的价后来**是查到了**（同日稍后）：`https://mimo.mi.com/pricing` 是服务端渲染的正文，curl 读得到（对照失败的那几个：`platform.mimo.xiaomi.com` 与 `www.xiaomimimo.com` 不解析，`mimo.xiaomi.com/pricing`、`api.xiaomimimo.com/pricing`、`platform.xiaomimimo.com/pricing` 要么 404 要么只有 JS 壳）。MiMo-V2.6-Flash 元/1M tokens：输入（缓存未命中）**1**、缓存命中 **0.02**、输出 **2**，厂商只给一个数、没有峰谷档，所以这里没有「取保守上界」可做的事。`cache_write` 仍留空（页面没写写入费）。顺带同页一条要紧的运维事实：**MiMo-V2.5 / V2.5-Pro 已于 2026-10-21 下线，旧名不再解析**——这也是 model id 必须留在 V2.6 上的理由。cc-switch 里存的是 `mimo-v2.6-flash[1M]`，`[1M]` 是 Claude Code 的上下文提示后缀，不属于 model id，所以声明裸名。
+    ⑦ `context_window` / `max_out` 对 MiMo **仍留默认值**，理由与「查不到价」不同：模型规格页（`mimo.mi.com/docs/quick-start/summary/model`、`/docs/price/pay-as-you-go`）是客户端渲染，curl 拿到的只有 13KB 的壳、正文 84 字符。未验证就不写——写一个猜来的窗口等于给停损喂假的最坏情况。
+    ⑧ 端点本身**已经实测过两次**（`-p` 单发，2026-11-05）：纯文本流 `turn_complete usage in=17 / out=23`；带 bash 工具回合 `tool_begin{command:"echo kestrel-mimo-tool-ok"} → tool_end（沙箱内执行）→ turn_complete in=534 / out=68`，`stop=stop` 且**input usage 照报**（与 BigModel 那条 §9.7 的少报端点不同，这一台不会掉进 §9.36 的「读数不可信」分支）。仍要说清没覆盖的部分：demo 的星型联跑**不派发 SA**，所以 MiMo 没有走过门铃/工件/证据那条路，`harness/roles/sa.toml` 只是把后端指向了它。现场记录见 smoke-report §32。
+
+    ⑧ 单位这件事是**跑过的**，不是改完名就宣布完成：第六轮联跑（真实费率、直接记元）走完四关，`dev iter1: settled 0.0401 cny for 3458 in / 4143 out tokens`（2×3458 + 8×4143 每百万 = 0.04006 元，与印出的数一致），收尾 `ledger total: 3.5153 cny, of which 3.4752 nominal (under-reported 3.4752)`——3.4752 = 3 × 1.1584，即 QA 三次都按峰时最坏情况的预留落名义账。现场记录见 smoke-report §31。
 
 ## 10 二期清单
 

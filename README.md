@@ -2,9 +2,9 @@
 
 为星型多 Agent harness 写的 Rust harness kernel：引擎 + wire 层 + 工具/权限/沙箱 + 会话 + 总线/journal + CLI/配置。设计文档（中文）见本仓库 `docs/design.md`。
 
-**Metrics** — src 51 files / 17043 lines · tests 9 files / 3383 lines · 245 tests (lib 192 + bin 4 + integration 49)
+**Metrics** — src 51 files / 17251 lines · tests 9 files / 3383 lines · 247 tests (lib 194 + bin 4 + integration 49)
 
-Status: M0-M4 complete + 二期开工（`ApproveMode::Bus`、SA 判定含证据核对、bus 停车补投与自动重连、journal 快照/截断与在线投影、多任务 task 命名空间、openai-responses wire、worker 池、预算按 token 结算的价格表、journal 轮转的默认策略、按类型核对的证据与 stage 要求表、审批请求的 at-least-once 投递与按 req 幂等、验证 FAIL 回跳写者、bash `output_path` 交出可核对的 test_log）——这批改动 2026-11-04 走完真端点联跑（`pipeline complete`；那两轮联跑抓出并修掉三个「测试全绿但跑不起来」的缺陷，见 docs/design.md §9.32 / §9.33）。2026-11-05 又跑五次联跑：第二次四关一次过，抓出报账的两处「说不清」——没有费率的运行把 token 印成 `0 / 0`、同一颗审批请求的两张矛盾回执先到先得（§9.42，两处都已修）；第三次带一份测试费率表（`--prices`），§9.27 的两段式结算与 §9.36 的「读数不可信」分支第一次同时在真端点落地；第四次换成**真实费率**（官方页当天读数 + USD/CNY 换算 + `context_window`/`max_out` 收成官方 1M/384K 与 1M/128K，写进用户层 `providers.toml`，见 §9.43），报账只剩一个名义来源：`0.0732 usd, of which 0.0667 nominal (under-reported 0.0667)`——`no rate` 归零；第五次故意只给 RD 填价，把「没有结算」那条分支走回现场，用量列在没有 `budget_settled` 的情况下仍然印出 `tokens in 0 / out 8503`（§9.42② 的实证，见 smoke-report §30）。fmt / clippy `-D warnings` / test 三闸门全绿（人工执行：本仓库不挂 CI）。上面那行数字由 `tests/discipline.rs` 与源码树对照校验：改完代码不更新它，闸门就红。
+Status: M0-M4 complete + 二期开工（`ApproveMode::Bus`、SA 判定含证据核对、bus 停车补投与自动重连、journal 快照/截断与在线投影、多任务 task 命名空间、openai-responses wire、worker 池、预算按 token 结算的价格表、journal 轮转的默认策略、按类型核对的证据与 stage 要求表、审批请求的 at-least-once 投递与按 req 幂等、验证 FAIL 回跳写者、bash `output_path` 交出可核对的 test_log）——这批改动 2026-11-04 走完真端点联跑（`pipeline complete`；那两轮联跑抓出并修掉三个「测试全绿但跑不起来」的缺陷，见 docs/design.md §9.32 / §9.33）。2026-11-05 又跑六次联跑：第二次四关一次过，抓出报账的两处「说不清」——没有费率的运行把 token 印成 `0 / 0`、同一颗审批请求的两张矛盾回执先到先得（§9.42，两处都已修）；第三次带一份测试费率表（`--prices`），§9.27 的两段式结算与 §9.36 的「读数不可信」分支第一次同时在真端点落地；第四次换成**真实费率**（官方页当天读数 + USD/CNY 换算 + `context_window`/`max_out` 收成官方 1M/384K 与 1M/128K，写进用户层 `providers.toml`，见 §9.43），报账只剩一个名义来源：`0.0732 usd, of which 0.0667 nominal (under-reported 0.0667)`——`no rate` 归零；第五次故意只给 RD 填价，把「没有结算」那条分支走回现场，用量列在没有 `budget_settled` 的情况下仍然印出 `tokens in 0 / out 8503`（§9.42② 的实证，见 smoke-report §30）；第六次把第四次那套换算整段拿掉——**直接记厂商原文的人民币**，钱的单位由 provider 的 `currency` 声明而不是写在 flag 与字段名里（§9.44；SA 后端同日从百炼 Token Plan 换成小米 MiMo，`-p` 单发两轮实测通过、官方 元 价也查到并记进配置，见 §9.44⑥⑧ 与 smoke-report §32），`ledger total: 3.5153 cny, of which 3.4752 nominal (under-reported 3.4752)`。fmt / clippy `-D warnings` / test 三闸门全绿（人工执行：本仓库不挂 CI）。上面那行数字由 `tests/discipline.rs` 与源码树对照校验：改完代码不更新它，闸门就红。
 
 ## Quick start
 
@@ -46,25 +46,33 @@ cargo build && ./harness/run-demo.sh      # hub + RD + QA + demo-sa 四进程
 ```
 
 可调项（env 或 `demo-sa` flag）：`--bell-timeout-secs`（等回铃，默认 300）、
-`--max-usd`（停损上限，默认 6.0）、`--roles-dir`/`--prices`（预算价格表，见下）、
+`--max-cost`（停损上限，默认 40 个本次币种）、`--currency`（名义记账的币种，默认 `usd`；
+demo 传 `cny`）、`--roles-dir`/`--prices`（预算价格表，见下）、
 `--evidence-spec`（每个 stage 要哪类证据，见下）、
 `--worktree`（RD 的写入目录，广播进每颗门铃的 `ref`，QA 据此取证；`KESTREL_WORKTREE`
 同时喂给 role 的 `write_roots`）、`--approvals`（SA 的审批授权表，见下）。
 
 ### 预算：账单还是名义值
 
-`--max-usd` 管的是钱，但钱从哪来要说得出口。账本查两张表：`--roles-dir` 里的 role
+`--max-cost` 管的是钱，但钱从哪来要说得出口。账本查两张表：`--roles-dir` 里的 role
 文件给出「哪个 peer 跑在哪个 provider/model 上」，`providers.toml` 的
 `[[providers.<id>.models]] cost` 给出「那个 model 每百万 token 多少钱」。**两端都有**
 => 派发前先按该模型的最坏情况（整窗输入 + 满 `max_out` 输出）预留额度做停损，结果铃
-回来后按实际 token 结算换掉预留；**任何一端缺席** => 每次派发记 `--nominal-usd`
-（默认 0.5）的名义值，SA 开工即印出哪些 peer 没有价，绝不把「没人填价」记成「这次免费」。
+回来后按实际 token 结算换掉预留；**任何一端缺席** => 每次派发记 `--nominal-cost`
+（默认 4）的名义值，SA 开工即印出哪些 peer 没有价，绝不把「没人填价」记成「这次免费」。
 **有价但读数不可信**（端点报了 output 却不报 input，BigModel 就是这个形状）=> 结算照做（预留得配对
 掉），但按**名义**落账并当场打印理由：一张少掉整个输入侧的「账单」比名义值更危险，因为它看起来是
 算出来的。那个字符估算只用来决定「要不要压上下文」，绝不当钱的来源（§9.36）。
 
 收尾那一行把「说不清的钱」按来源分开报（§9.37）：
-`ledger total: 0.1167 usd, of which 0.0960 nominal (under-reported 0.0960)`。
+`ledger total: 0.8000 cny, of which 0.7000 nominal (under-reported 0.7000)`。
+
+**钱的单位是声明出来的，不是写在名字里的**（design §9.44）：`providers.toml` 每个
+provider 可以写 `currency = "cny"`，账本读它并当场印出来——所以一份中文价目表可以
+原样落进配置里，不必先换算成美元（换算一次就多一个会过期的数字，和一个没人复核的
+汇率）。同一次运行里**混两种币种直接启动失败**：账本是要加总的，「2 元 + 0.3 美元」
+不是一个数。没有价目表时单位来自 `--currency`（默认 `usd`）。journal 里的金额字段
+因此叫 `cost` 而不是 `usd`（旧行 `usd` 仍可读，`old_usd_keyed_lines_still_replay` 钉住）。
 `no rate` 是**该补价**，`under-reported` 是**该修读数或换端点**——两种「不省钱」的下一步完全不同，
 不该挤在同一个数字里。
 `priced` 标记与金额一起落 journal，所以事后能复现「这笔钱当时按什么算」——这是不变式 5

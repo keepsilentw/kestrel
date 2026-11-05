@@ -7,7 +7,7 @@
 
 ## 1. 自动化测试基线（cargo test）
 
-**Metrics** — src 51 files / 17043 lines · tests 9 files / 3383 lines · 245 tests (lib 192 + bin 4 + integration 49)
+**Metrics** — src 51 files / 17251 lines · tests 9 files / 3383 lines · 247 tests (lib 194 + bin 4 + integration 49)
 **Integration** — core_loop 5 / discipline 2 / m1_tools 9 / m2_session 6 / m4_bus 15 / m5_pool 6 / sandbox_e2e 4 / wire_anthropic 2
 
 | 组 | 覆盖 |
@@ -835,3 +835,53 @@ Error: [sa] iteration cap reached for Dev — 1 of those iterations were rework 
 所以它的证明仍然只有 `a_contradicting_receipt_upgrades_without_downgrading` 这一条单测。
 
 **闸门**：本轮无源码变更，`**Metrics**` 两行不变（245 tests / src 17043 行）。
+
+## 31. 2026-11-05 第十六轮联跑（直接记人民币）：钱的单位端到端换成 `cny`
+
+§9.44 把换算整段拿掉：两份价目表按厂商原文写（DeepSeek 元、智谱 元），provider 声明
+`currency = "cny"`，账本读它并当场印它。demo 的默认值也换成同币种（`--nominal-cost 4`、
+`--max-cost 40`、`--currency cny`）。走默认价格表（用户层 `providers.toml`），全新 worktree。
+
+| 检查 | 实测 |
+|---|---|
+| 阶段 | dev / review / test / build 各 iter1 pass → `pipeline complete`（`ran 16, 16 passed / 0 failed`） |
+| 真账单 | `dev iter1: settled 0.0401 cny for 3458 in / 4143 out tokens`——按峰时元价复算 2×3458 + 8×4143（每百万）= 0.04006 元，与印出的数一致，且**没有任何一步经过汇率** |
+| 预留形状 | RD 一次派发预留 5.072 元（1M×2 + 384K×8），QA 预留 1.1584 元（1M×0.8 + 128K×2.8）——官方 1M/384K 与 1M/128K 的窗口在这里第一次参与停损 |
+| 网关少报 | QA 三关全部 `books the reservation 1.1584 cny as NOMINAL instead of a bill that would read too cheap` |
+| 报账 | `ledger harness-rd: 0.0401 cny ; tokens in 3458 / out 4143`、`ledger harness-qa: 3.4752 cny ; tokens in 0 / out 9642`、`ledger total: 3.5153 cny, of which 3.4752 nominal (under-reported 3.4752)`（3.4752 = 3 × 1.1584） |
+| 开工那行 | 没有 `budget stays NOMINAL`——两个被派发的 peer 都有价，且价目表的币种被 `--currency` 之外的路径（表声明）覆盖，正是 §9.44② 要的优先级 |
+| 审批 | 1 请求 / 1 deny / 1 回执成对（`applied:true`），本轮无矛盾回执 |
+
+**没被这一轮证明的**：MiMo（SA 后端）**仍未实测**——demo 不派发 SA，`providers.toml` 里那条只被
+`harness/roles/sa.toml` 引用；它的 `cost` 也仍留空（官方标价查不到，§9.44⑥），所以那格是「名义 +
+未验证」两件事叠在一起。第一次实测要么 `-p` 单发，要么等 SA 变成真协调者。
+
+**闸门**：`cargo fmt --check` / `cargo clippy --all-targets -- -D warnings` / `cargo test` 实跑全绿，
+247 tests（lib 194 + bin 4 + integration 49）。本轮源码变更是单位改名与两个新测试
+（`the_money_unit_comes_from_the_table_and_never_gues`、`old_usd_keyed_lines_still_replay`），
+`src` 17043→17251 行；`**Metrics**` 又被拦红一次并回写三处文档。
+
+## 32. 2026-11-05 MiMo（小米）实测两轮 + 官方 元 价目表
+
+§31 留下的那一格（SA 后端换了 MiMo 但没跑过）在本节补上。两次都是 `-p` 单发，不经过总线与 journal。
+
+| 场景 | 结果 | 关键证据 |
+|---|---|---|
+| 纯对话流式 | **通过** | `thinking_delta` 流 → `text_delta` → `message_done("kestrel-mimo-ok")` → `turn_complete(stop=stop)`，`usage in=17 / out=23` |
+| bash 工具回合 | **通过** | `tool_begin{call_id, name:"bash", args:{command:"echo kestrel-mimo-tool-ok"}}` → Seatbelt 沙箱内执行 → `tool_end(is_error:false, output "kestrel-mimo-tool-ok\n")` → 模型回灌后报告原文 → `turn_complete in=534 / out=68` |
+| usage 形状 | **两端都报** | 与 §9.7/§2.1 的 BigModel（`message_start` 不回 input）不同，MiMo 的 input/output 都有——所以它不会掉进 §9.36 的「读数不可信 => 按名义落账」分支 |
+| 端点 | `https://api.xiaomimimo.com/anthropic`，`api = "anthropic-messages"`，model `mimo-v2.6-flash`；凭据仍按 `!sqlite3` 引用 cc-switch 的「小米」条目（唯一归属地不变） |
+
+**定价（已查到并记进 `providers.toml`）**：`https://mimo.mi.com/pricing` 是服务端渲染正文，curl 读得到
+——MiMo-V2.6-Flash 元/1M tokens：输入（缓存未命中）**1**、缓存命中 **0.02**、输出 **2**，峰谷不分档。
+同页另一条运维事实：**MiMo-V2.5 / V2.5-Pro 已于 2026-10-21 下线，旧名不再解析**（所以 model id 必须留在 V2.6）。
+失败过的入口一并记下，避免下次重走：`platform.mimo.xiaomi.com`、`www.xiaomimimo.com` 不解析；
+`mimo.xiaomi.com/pricing`、`api.xiaomimimo.com/pricing` 404；`platform.xiaomimimo.com/pricing` 与
+`mimo.mi.com/docs/price/pay-as-you-go` 只有 JS 壳（正文 84 字符），因此 MiMo 的
+`context_window` / `max_out` **仍不声明**（§9.44⑦）。
+
+**仍未覆盖**：MiMo 没有走过星型联跑那条路（门铃 / 工件 / 证据核对 / journal 账本）——demo 不派发 SA，
+`harness/roles/sa.toml` 只是把后端指向它。这一格要等 SA 变成真协调者才谈得上。
+
+**闸门**：本轮只改用户层配置与文档，无源码变更；`cargo fmt --check` / `cargo clippy --all-targets -- -D warnings` /
+`cargo test` 复跑全绿，247 tests（lib 194 + bin 4 + integration 49），`**Metrics**` 两行不变。
