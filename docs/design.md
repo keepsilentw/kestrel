@@ -359,7 +359,8 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
     ③ 收尾一行第一次没有任何名义：`ledger total: 0.1806 cny, of which 0.0000 nominal`，而且后面那对括号（`no rate` / `under-reported` 的分类账）整段消失——§9.37 设计的「说不清的钱要说清为什么」，在一条全清白的账上就该什么都不说。整条 pipeline 报出来的钱从 3.5153 元降到 0.1806 元：不是价格变了，是**终于按实际读数算而不是按最坏情况猜**。
     ④ 但那一行一开始印的是 `of which -0.0000 nominal`。查出来不是账算错：`f64` 的 `Iterator::sum` 用 `-0.0` 做单位元（有符号零要守 IEEE 的符号规则），所以**对空集合求和得到 `-0.0`**，`format!("{:.4}", -0.0)` 就是 `-0.0000`。「一分名义钱都没花」被渲染成「倒欠了钱」——报账那一行的全部意义是让人读得懂，这种读感不能交给标准库决定。修法是 `money()`：绝对值小于显示精度一半（4 位小数 => 5e-5）按零渲染，**真负数照原样印**（那是折叠出了 bug，藏起来比露出来危险）。回归测试 `a_zero_ledger_line_does_not_read_as_a_debt`。
     ⑤ 顺带一个形状修正：`chat_url` 原来只会把 base_url 当产品根补 `/v1/chat/completions`，而智谱这条表面的版本号**已经在根上**（`/api/paas/v4`），照旧拼就成了 `/v4/v1/chat/completions`，实测 404。现在认三种形状：写全的路径原样用、末段是 `v<数字>` 的补 `/chat/completions`、其余补 `/v1/chat/completions`（`chat_url_accepts_a_versioned_root_and_a_full_path` 钉住三种，含 `v1beta` 这种不是版本段的反例）。这不是加猜测：base_url 本来就住在 provider 那一层，调用方写了哪个端点就按哪个走。
-    ⑥ 仍未覆盖：`stream_include_usage = true` 这颗 compat 位是照 §9.7 对百炼的实测加的，BigModel 这条**没做过「不加会怎样」的反证**——值得拿一条不带它的 provider 再跑一轮，确认它不是靠猜留下的。QA 的多模态取证（`input_image`）这一轮也没被任何 stage 用到：demo 交出的证据全是文本文件，「能看图」这件事到目前为止只有 §2 那轮 smoke 验过端点能吃图，没验过流程。
+    ⑥ `stream_include_usage` 这颗 compat 位**当天就做了反证，结论是拿掉**：同一请求带它跑一次 `in=18 / out=273`，去掉它再跑一次 `in=18 / out=4`（两次都是真端点，2026-11-05）。BigModel 这条 OpenAI 兼容表面**不要求** `stream_options.include_usage` 就回 input usage；那颗 flag 是百炼的形态问题（§9.7），不是 OpenAI 兼容族的要求。留着它的理由只剩「另一个网关需要过」，那就是把猜测当成配置，所以删。删掉之后又复测一次：`in=19 / out=75`，照报。
+    ⑦ 仍未覆盖的一件事留在这里：QA 的 `input_image` 能力这几轮联跑**没有任何 stage 用到**——demo 交出的证据全是文本文件。「端点能吃图」只在 §2 那轮 smoke 用 1×1 PNG 验过请求层面，「验证者靠截图反驳 worker 的声明」这条流程从没跑通过，因为 `screenshot` 这一档证据类型要求 worker 真的产出图，而 demo 的沙箱里没有任何画图的手段。这是流程缺口，不是 wire 缺口。
 
 ## 10 二期清单
 

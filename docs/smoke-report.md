@@ -918,3 +918,24 @@ Error: [sa] iteration cap reached for Dev — 1 of those iterations were rework 
 **闸门**：`cargo fmt --check` / `cargo clippy --all-targets -- -D warnings` / `cargo test` 全绿，
 249 tests（lib 196 + bin 4 + integration 49）。净新增 2 项（`chat_url_accepts_a_versioned_root_and_a_full_path`、
 `a_zero_ledger_line_does_not_read_as_a_debt`），`src` 17251→17338 行；`**Metrics**` 又被拦红一次并回写三处。
+
+## 34. 2026-11-05 A/B 反证：BigModel 不需要 `stream_include_usage`
+
+§9.45⑥ 留的那个问题（那颗 compat 位是必需，还是从百炼抄来的猜测）用两次 `-p` 单发回答，同一颗
+`glm-5.3-flash`、同一条 `/api/paas/v4` 表面，只在请求体里加不加 `stream_options.include_usage`：
+
+| 配置 | 实测 usage |
+|---|---|
+| 带 `stream_include_usage = true` | `turn_complete in=18 / out=273` |
+| **去掉这颗 flag** | `turn_complete in=18 / out=4`（输出长度是推理采样差异，与计费形状无关） |
+| 删掉之后正式复测 | `message_done("flagless-ok")` → `turn_complete in=19 / out=75` |
+
+结论：**input usage 两边都报**，这颗 flag 对 BigModel 不是必需的。它属于百炼的形态问题（§9.7：那边不设
+`include_usage` 就整块 usage 都不回，而且把 usage 块发在 `finish_reason` 之后），不是 OpenAI 兼容族的通则。
+于是 `providers.toml` 里 `[providers.zhipu-openai.models.compat]` 整块删除，注释换成上面这组数字——
+**一颗没人验证过为什么存在的开关，比没有开关更危险**：它会跟着配置被复制到下一个端点上去。
+
+**顺带把范围说清**：这轮反证用的是 `-p` 单发，不经总线与 journal；QA 在联跑里走的仍是这条无 flag 配置，
+第七轮的报账数字（`of which 0.0000 nominal`）本来就是带 flag 跑出来的，两者 usage 形状相同，账单形状不变。
+
+**闸门**：无源码变更（只改用户层配置与文档），`**Metrics**` 两行不变（249 tests / src 17338 行）。
