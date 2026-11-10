@@ -7,7 +7,7 @@
 
 ## 1. 自动化测试基线（cargo test）
 
-**Metrics** — src 51 files / 19097 lines · tests 9 files / 3704 lines · 267 tests (lib 209 + bin 5 + integration 53)
+**Metrics** — src 51 files / 19338 lines · tests 9 files / 3704 lines · 269 tests (lib 211 + bin 5 + integration 53)
 **Integration** — core_loop 5 / discipline 2 / m1_tools 11 / m2_session 6 / m4_bus 15 / m5_pool 8 / sandbox_e2e 4 / wire_anthropic 2
 
 | 组 | 覆盖 |
@@ -1143,3 +1143,32 @@ task 发信的人，而 mpsc 先把已排队的门铃送达才返回 `None`，�
    `1 coverage gap(s)`，退出码 1。
 
 **未跑**：三期真端点 demo 仍未实测（需要 provider 凭据）。
+
+## 46. 2026-11-10 三期第十二格：记录层的深度校验 `--verify`
+
+`status()` 只看 metadata，所以「段名叫 seg0-10」与「文件里真有 10 条」在它眼里是同一件事。
+`Journal::verify()` 读记录，把三个源放在一张桌子上：段名的区间、`replay_path` 真数出来的条数、
+活文件检查点的 `covers` 与链尾。任一对不上就进 `problems`；入口是 `journal-status --verify`，
+默认那一路仍然只 stat 文件（读记录不该是「看一眼库存」的代价）。
+
+三类它能抓到而 §45 抓不到的：段被截断或写入崩在中途；检查点自己数错了；链有段而活文件丢了
+`Snapshot` 行——最后一类重放会把已归档的前缀再读一遍，而 metadata 看到的是一条不缺的完整链。
+
+`verification` 是 `Option`：`None` 是「没跑」，不是「跑过且干净」。`--check` 的句子因此显式写
+`record-level verify not run`，不给假的清白。
+
+**CLI 实跑**（`target/debug/kestrel`，`~/tmp` 里用空段文件做托）：同一份盘上
+`--check` 不带 `--verify` 时报 `coverage chain: complete`、退出码 0；带上 `--verify` 后报出
+3 条问题（两段各少 4 / 5 条，外加活文件没有检查点），退出码 1，`--json` 里带出 `verification` 块。
+
+**两条新测试** `verify_counts_what_a_segment_file_actually_holds`、
+`verify_makes_the_checkpoint_and_the_chain_agree`，各做过变异验证：去掉条数比对只打红第一条，
+去掉检查点比对只打红第二条（第一次尝试的变异是空操作，测试照绿——那说明变异没生效，重做了）。
+
+**边界**：`verify()` 只数条数与两处区间，不做语义重放，也不问段里的记录是否仍属于它宣称的那个
+task；手写出来的空段会被报成「比名字少」，这是刻意的。压缩与保留策略仍不在范围内（design §10）。
+
+**闸门**：`cargo fmt --check` 通过；`cargo clippy --all-targets -- -D warnings` 通过；
+`cargo test` 沙箱外全绿 269 tests（lib 211 + bin 5 + integration 53）；沙箱内仍是那 9 个
+`m4_bus` 的 UDS `bind` EPERM（§1 的环境限制，与本格无关）。`**Metrics**` 行被拦红一次
+（src 19097→19338）并回写三处文档。**未跑**：三期真端点 demo。

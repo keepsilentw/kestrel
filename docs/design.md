@@ -20,13 +20,14 @@
 > 质量闸门保持人工执行（本仓库不挂 CI，见 §9.19⑥）。
 > 二期十一项已于 2026-11-04 在真端点联跑中走完（`pipeline complete`，四阶段全 pass，
 > 审批请求/判定/回执各 5 条成对）；那一次联跑抓出并修掉两个「测试全绿但跑不起来」的缺陷，见 §9.32。
-> 2026-11-10：三期开工（§9.46–§9.55）——worker 的两级工具并发上限、内存软上限（drain）与
+> 2026-11-10：三期开工（§9.46–§9.57）——worker 的两级工具并发上限、内存软上限（drain）与
 > journal 归档段的离线移动 / 热窗口 / 预览 / 库存 / 健康检查、审批链审计、常驻 worker 状态
 > 文件，外加名义成本细到 `peer × 原因`（§9.49）、判定 issue 自带归因（§9.50），以及把这些
-> 护栏接到 `harness/run-demo.sh` 的入口上（§9.54）、空闲 task 退休与会话树重开（§9.55）。
+> 护栏接到 `harness/run-demo.sh` 的入口上（§9.54）、空闲 task 退休与会话树重开（§9.55）、
+> 归档链的断口与重复段的隔离出口（§9.56）、记录层的深度校验 `--verify`（§9.57）；
 > 代码部分都过了 fmt / clippy / test；
 > **真端点联跑未重跑**，demo 的接法只到语法与 flag 解析这一层。
-> **Metrics** — src 51 files / 19097 lines · tests 9 files / 3704 lines · 267 tests (lib 209 + bin 5 + integration 53)
+> **Metrics** — src 51 files / 19338 lines · tests 9 files / 3704 lines · 269 tests (lib 211 + bin 5 + integration 53)
 > **Integration** — core_loop 5 / discipline 2 / m1_tools 11 / m2_session 6 / m4_bus 15 / m5_pool 8 / sandbox_e2e 4 / wire_anthropic 2
 > 规模已过 plan 预算（10-13k）的上沿：多出来的部分几乎都花在「取消安全」与「对账」这两条纪律上。
 > 上面两行数字由 `tests/discipline.rs::metrics_lines_match_the_tree` 对照源码树重算校验——
@@ -521,6 +522,28 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
    ⑨ `--check` 的拒绝语原先在 `--json` 与人读两条分支各写一遍，本轮只改了前一遍，人读那条
        于是把「断口」漏在了消息里，与它自己要拒绝的结论矛盾。收成 `unhealthy_report()` 一处
        （重复的句子是这类漏改的制造机）。
+
+57. **三期第十二格：记录层的深度校验（2026-11-10）**：
+    ① §9.56⑤ 划下的边界在这一格补掉：`status()` 只看 metadata，所以「段的名字说 0-10」与
+       「文件里真有 10 条」是两件事。新增 `Journal::verify()`——它读记录，因此**必须**是
+       opt-in（`journal-status --verify`），默认那一路仍然只 stat 文件。
+    ② 三个源必须说同一句话：段名的区间（`to - from`）、`replay_path` 真能读出的条数、
+       活文件检查点的 `covers` 与链尾 `chain_end`。任一对不上就进 `problems`。
+    ③ 能抓到的三类：段被截断 / 写入崩在中途（`replay_path` 会在坏行前停下，于是条数少给）；
+       检查点自己数错了；链有段而活文件丢了 `Snapshot` 行——最后这类最阴，重放会把已归档的
+       前缀**再读一遍**，而 metadata 检查看到的是一段不缺的完整链。
+    ④ `verification` 是 `Option`：`None` 表示「没跑」，绝不表示「跑过且干净」；`is_healthy()`
+       只在 `Some` 时才把 `problems` 算进去。`--check` 的句子因此显式带上
+       `record-level verify not run`，不给读者一个假的清白。
+    ⑤ 边界：`verify()` 只数记录条数与两处区间，不做语义重放（不比对 `reconcile` 的状态），
+       也不检查段内容是否仍属于它宣称的那个 task；空文件（0 条）会被报成「比名字少」，
+       这是刻意的——手写出来的假段本来就不该被当成账本。压缩与保留策略仍不在范围内（§10）。
+    ⑥ 两条新测试 `verify_counts_what_a_segment_file_actually_holds`、
+       `verify_makes_the_checkpoint_and_the_chain_agree` 各做过变异验证（去掉条数比对 /
+       去掉检查点比对，各自打红对应那条）。
+    ⑦ CLI 实跑（`target/debug/kestrel`，空段文件做托）：不带 `--verify` 时
+       `coverage chain: complete` 且退出码 0，带上之后报出 3 条问题、退出码 1——这一对
+       正好说明为什么这一格值得单独存在，也说明 §9.56 的链检查只覆盖了它能覆盖的那一半。
 
 ## 10 二期清单
 

@@ -66,16 +66,27 @@ pub struct JournalStatus {
     /// audit ledger — replay still succeeds, it just silently reads less.
     pub coverage_gaps: Vec<CoverageGap>,
     pub segments: Vec<SegmentStatus>,
+    /// The record-level check, present only when the caller asked for it
+    /// (`--verify`). `None` means "not run", never "passed".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verification: Option<Verification>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approvals: Option<ApprovalStatus>,
 }
 
 impl JournalStatus {
     /// Operational health. Every item here is inspectable without deleting
-    /// anything: a duplicated range, a hole in the coverage chain, or a staged
-    /// `.new` left behind by an interrupted rotation.
+    /// anything: a duplicated range, a hole in the coverage chain, a staged
+    /// `.new` left behind by an interrupted rotation, or — when the caller ran
+    /// the record-level check — a chain that disagrees with its own files.
     pub fn is_healthy(&self) -> bool {
-        self.duplicate_segments == 0 && self.staged_files == 0 && self.coverage_gaps.is_empty()
+        self.duplicate_segments == 0
+            && self.staged_files == 0
+            && self.coverage_gaps.is_empty()
+            && self
+                .verification
+                .as_ref()
+                .is_none_or(Verification::is_consistent)
     }
 }
 
@@ -85,6 +96,40 @@ pub struct CoverageGap {
     pub expected_from: u64,
     /// First record the next surviving segment actually starts at.
     pub found_from: u64,
+}
+
+/// One segment as `--verify` found it: what its name promises versus how many
+/// records `replay_path` can actually read out of it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SegmentVerify {
+    pub from: u64,
+    pub to: u64,
+    /// `to - from`: the promise encoded in the file name.
+    pub promised: u64,
+    /// Records read from the file. A truncated or torn file reads short.
+    pub records: u64,
+    /// Which copy was counted — a range can live in both places (§9.47③).
+    pub path: PathBuf,
+}
+
+/// Record-level agreement between the chain, the segment files and the live
+/// checkpoint. Opt-in, because — unlike `status()` — this parses every record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Verification {
+    /// Where the authoritative chain ends (records before it are archived).
+    pub chain_end: u64,
+    /// What the live file's checkpoint claims is archived. `None` when the live
+    /// file carries no `Snapshot` line at all.
+    pub checkpoint_covers: Option<u64>,
+    pub segments: Vec<SegmentVerify>,
+    /// Every way the three sources of truth disagreed. Empty means verified.
+    pub problems: Vec<String>,
+}
+
+impl Verification {
+    pub fn is_consistent(&self) -> bool {
+        self.problems.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -261,7 +306,61 @@ impl Journal {
             total_segment_bytes: segments.iter().map(|segment| segment.bytes).sum(),
             staged_files: staged_files(journal_dir(&self.path).as_deref()),
             segments,
+            verification: None,
             approvals: None,
+        }
+    }
+
+    /// The record-level check behind `journal-status --verify`: it parses the
+    /// segments `replay_all` would read and the live file, then makes the three
+    /// sources of truth say the same thing. `status()` stays metadata-only, so
+    /// this is deliberately a separate, opt-in pass.
+    ///
+    /// Three failures it can see that no metadata check can:
+    /// ① a segment shorter than its name promises (truncated, or a torn tail
+    ///    `replay_path` had to stop at);
+    /// ② a checkpoint that claims more or less was archived than the chain holds;
+    /// ③ a chain with segments but a live file that lost its `Snapshot` line —
+    ///    replay would then read the archived prefix twice.
+    pub fn verify(&self) -> Verification {
+        let mut segments = Vec::new();
+        let mut problems = Vec::new();
+        let mut chain_end = 0u64;
+        for (from, to, path) in self.authoritative_segments() {
+            let promised = to.saturating_sub(from);
+            let records = replay_path(&path).len() as u64;
+            if records != promised {
+                problems.push(format!(
+                    "segment seg{from}-{to} holds {records} record(s), its name promises {promised}"
+                ));
+            }
+            chain_end = chain_end.max(to);
+            segments.push(SegmentVerify {
+                from,
+                to,
+                promised,
+                records,
+                path,
+            });
+        }
+        let checkpoint_covers = self.replay().iter().find_map(|record| match record {
+            JournalRecord::Snapshot { covers, .. } => Some(*covers),
+            _ => None,
+        });
+        match checkpoint_covers {
+            Some(covers) if covers != chain_end => problems.push(format!(
+                "the live checkpoint says {covers} record(s) are archived, the chain ends at {chain_end}"
+            )),
+            None if chain_end > 0 => problems.push(format!(
+                "the chain covers {chain_end} record(s) but the live file holds no checkpoint"
+            )),
+            _ => {}
+        }
+        Verification {
+            chain_end,
+            checkpoint_covers,
+            segments,
+            problems,
         }
     }
 
@@ -1237,6 +1336,96 @@ mod tests {
         assert_eq!(broken.coverage_gaps[0].expected_from, 0);
         assert_eq!(broken.coverage_gaps[0].found_from, to - 1);
         assert!(!broken.is_healthy(), "a hole is not a healthy journal");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 名字里的区间是承诺，文件里的条数是事实。对不上只有两种可能：段被截断，或写入
+    /// 崩在中途——而 `status()` 只看 metadata，永远看不见这件事。
+    #[test]
+    fn verify_counts_what_a_segment_file_actually_holds() {
+        let dir = scratch("verify-count");
+        let path = dir.join("journal.jsonl");
+        let journal = Journal::create(&path).unwrap();
+        seed(&journal, 4);
+        journal.rotate(5).unwrap().expect("rotation");
+
+        let clean = journal.verify();
+        assert!(clean.is_consistent(), "{:?}", clean.problems);
+        assert_eq!(
+            clean.checkpoint_covers,
+            Some(clean.chain_end),
+            "a fresh rotation leaves the checkpoint and the chain agreeing"
+        );
+        let segment = &clean.segments[0];
+        assert_eq!(segment.records, segment.promised, "{segment:?}");
+
+        // 只留下第一条记录，文件名照旧宣称整段
+        let text = std::fs::read_to_string(&segment.path).unwrap();
+        let first = text.lines().next().unwrap().to_string();
+        std::fs::write(&segment.path, format!("{first}\n")).unwrap();
+
+        let truncated = journal.verify();
+        assert!(!truncated.is_consistent(), "{truncated:?}");
+        assert_eq!(
+            truncated.chain_end, clean.chain_end,
+            "the chain is named, not counted"
+        );
+        assert_eq!(truncated.segments[0].records, 1);
+        assert_eq!(truncated.segments[0].promised, segment.promised);
+        assert!(
+            journal.status().is_healthy(),
+            "metadata-only status cannot see a truncated file — which is exactly why --verify exists"
+        );
+        let mut deep = journal.status();
+        deep.verification = Some(truncated);
+        assert!(!deep.is_healthy(), "--check with --verify must refuse");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 检查点说「前面 N 条已归档」，链说「我覆盖到 M」。N != M 意味着 `replay_all`
+    /// 会把某段读重或漏读；活文件丢了 `Snapshot` 行是同一件事的极端形式。
+    #[test]
+    fn verify_makes_the_checkpoint_and_the_chain_agree() {
+        let dir = scratch("verify-covers");
+        let path = dir.join("journal.jsonl");
+        let journal = Journal::create(&path).unwrap();
+        seed(&journal, 4);
+        journal.rotate(5).unwrap().expect("rotation");
+        let covers = journal
+            .verify()
+            .checkpoint_covers
+            .expect("a rotated live file starts with a checkpoint");
+        let lines: Vec<String> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+
+        // ① 检查点自己数错了
+        let mut bumped: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        bumped["covers"] = (covers + 1).into();
+        let mut rewritten = vec![bumped.to_string()];
+        rewritten.extend_from_slice(&lines[1..]);
+        std::fs::write(&path, rewritten.join("\n") + "\n").unwrap();
+        let off = journal.verify();
+        assert_eq!(off.checkpoint_covers, Some(covers + 1));
+        assert_eq!(off.problems.len(), 1, "{:?}", off.problems);
+        assert!(
+            off.problems[0].contains("checkpoint"),
+            "{}",
+            off.problems[0]
+        );
+
+        // ② 活文件连检查点行都没有了
+        std::fs::write(&path, lines[1..].join("\n") + "\n").unwrap();
+        let missing = journal.verify();
+        assert_eq!(missing.checkpoint_covers, None);
+        assert!(
+            missing.problems.iter().any(|p| p.contains("no checkpoint")),
+            "{:?}",
+            missing.problems
+        );
+        assert!(!missing.is_consistent());
         std::fs::remove_dir_all(&dir).ok();
     }
 

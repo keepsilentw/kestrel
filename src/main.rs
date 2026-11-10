@@ -317,6 +317,12 @@ struct JournalStatusCmd {
     #[arg(long)]
     check: bool,
 
+    /// Parse the records: compare each segment's real record count with the
+    /// range in its name, and the live checkpoint's `covers` with the end of the
+    /// chain. Slower than the metadata-only default, so it is opt-in.
+    #[arg(long)]
+    verify: bool,
+
     /// Replay approval audit records and include pending, decided, receipted and
     /// orphaned request counts.
     #[arg(long)]
@@ -391,6 +397,9 @@ async fn main() -> anyhow::Result<()> {
             if s.approvals {
                 status.approvals = Some(journal.approval_status());
             }
+            if s.verify {
+                status.verification = Some(journal.verify());
+            }
             if s.json {
                 println!("{}", serde_json::to_string_pretty(&status)?);
                 if s.check && !status.is_healthy() {
@@ -424,6 +433,20 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             println!("staged residue: {} file(s)", status.staged_files);
+            if let Some(verification) = &status.verification {
+                if verification.problems.is_empty() {
+                    println!(
+                        "verify: {} segment(s) hold what their names promise, checkpoint covers \
+                         {} record(s)",
+                        verification.segments.len(),
+                        verification.chain_end
+                    );
+                } else {
+                    for problem in &verification.problems {
+                        println!("verify: {problem}");
+                    }
+                }
+            }
             if let Some(approvals) = &status.approvals {
                 println!(
                     "approvals: {} request(s), {} decision(s), {} receipt(s), {} pending, {} unacked, {} applied, {} stale, {} orphan decision(s), {} orphan receipt(s)",
@@ -565,9 +588,15 @@ async fn main() -> anyhow::Result<()> {
 /// `is_healthy()` on one branch only and `--check` went on refusing while
 /// blaming duplicates and residue — a message that contradicted its own verdict.
 fn unhealthy_report(status: &JournalStatus) -> String {
+    let verified = match &status.verification {
+        Some(verification) => format!("{} verify problem(s)", verification.problems.len()),
+        // `--check` without `--verify` really has not looked at the records;
+        // saying so beats implying a clean bill of health.
+        None => "record-level verify not run".to_string(),
+    };
     format!(
         "journal status is unhealthy: {} duplicate range(s), {} coverage gap(s), {} staged \
-         residue file(s)",
+         residue file(s); {verified}",
         status.duplicate_segments,
         status.coverage_gaps.len(),
         status.staged_files
@@ -707,12 +736,35 @@ mod tests {
                 found_from: 5,
             }],
             segments: vec![],
+            verification: None,
             approvals: None,
         };
         assert!(!status.is_healthy(), "a hole in the chain is not healthy");
         let text = unhealthy_report(&status);
         assert!(text.contains("1 coverage gap(s)"), "{text}");
         assert!(text.contains("0 duplicate range(s)"), "{text}");
+        assert!(
+            text.contains("verify not run"),
+            "an un-run record check must not read as a passed one: {text}"
+        );
+
+        let verified = JournalStatus {
+            verification: Some(kestrel::journal::Verification {
+                chain_end: 9,
+                checkpoint_covers: Some(10),
+                segments: vec![],
+                problems: vec!["the live checkpoint says 10, the chain ends at 9".into()],
+            }),
+            ..status.clone()
+        };
+        assert!(
+            !verified.is_healthy(),
+            "a verified disagreement is still unhealthy"
+        );
+        assert!(
+            unhealthy_report(&verified).contains("1 verify problem(s)"),
+            "{verified:?}"
+        );
     }
 
     #[test]
