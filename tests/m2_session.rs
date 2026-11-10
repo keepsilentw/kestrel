@@ -51,6 +51,8 @@ fn spawn(
         system: String::new(),
         tools: vec![],
         max_rounds,
+        max_parallel_tools: kestrel::tools::DEFAULT_MAX_PARALLEL_TOOLS,
+        worker_tool_slots: None,
         cwd: PathBuf::from("/ws"),
         role: "rd".into(),
         idgen: Arc::new(SeqGen::new()),

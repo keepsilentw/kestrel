@@ -15,6 +15,7 @@ pub use records::{
     Checkpoint, Folder, JournalRecord, ReconcileReport, StateSnapshot, ThinBell, Verdict,
 };
 
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -154,10 +155,9 @@ impl Journal {
     }
 
     /// Archived segments, oldest range first: `<stem>.seg<from>-<to>.jsonl`.
-    /// The name comes from the record RANGE it covers, so retrying a rotation
-    /// that crashed before the rename overwrites the same file instead of
-    /// archiving the same prefix twice — which would double-count the budget in
-    /// `replay_all`.
+    /// Both the live directory and `<stem>.segments/` are scanned. When a crash
+    /// leaves the same range in both places, the live copy wins: it is the one a
+    /// retried rotation most recently fsynced.
     fn segments(&self) -> Vec<PathBuf> {
         let Some(dir) = self.path.parent() else {
             return vec![];
@@ -166,28 +166,84 @@ impl Journal {
             return vec![];
         };
         let prefix = format!("{stem}.seg");
-        let mut found: Vec<(u64, u64, PathBuf)> = Vec::new();
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return vec![];
-        };
-        for entry in entries.map_while(Result::ok) {
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            let Some(rest) = name.strip_prefix(&prefix) else {
-                continue;
-            };
-            let Some(range) = rest.strip_suffix(".jsonl") else {
-                continue;
-            };
-            let Some((from, to)) = range.split_once('-') else {
-                continue;
-            };
-            if let (Ok(a), Ok(b)) = (from.parse::<u64>(), to.parse::<u64>()) {
-                found.push((a, b, entry.path()));
+        let mut found = BTreeMap::new();
+        for (from, to, path) in segment_files(dir, &prefix) {
+            found.insert((from, to), path);
+        }
+        if let Some(archive) = self.segment_archive_dir() {
+            for (from, to, path) in segment_files(&archive, &prefix) {
+                found.entry((from, to)).or_insert(path);
             }
         }
-        found.sort();
-        found.into_iter().map(|(_, _, p)| p).collect()
+        found.into_values().collect()
+    }
+
+    /// Where `archive_segments` parks sealed files. The directory is derived
+    /// from the journal name, so `replay_all` finds it after a restart without
+    /// another configuration source.
+    pub fn segment_archive_dir(&self) -> Option<PathBuf> {
+        let dir = self.path.parent()?;
+        let stem = self.path.file_stem()?.to_str()?;
+        Some(dir.join(format!("{stem}.segments")))
+    }
+
+    /// Move sealed segments out of the journal directory without deleting them.
+    /// `replay_all` reads both locations, so moving a segment changes no
+    /// projection. Re-running is idempotent; a destination collision is refused
+    /// before any file moves.
+    pub fn archive_segments(&self) -> anyhow::Result<usize> {
+        let _file = self.file.lock().unwrap();
+        let Some(dir) = self.path.parent() else {
+            anyhow::bail!("journal path has no parent directory");
+        };
+        let Some(stem) = self.path.file_stem().and_then(|s| s.to_str()) else {
+            anyhow::bail!("journal path has no usable file stem");
+        };
+        let prefix = format!("{stem}.seg");
+        let segments = segment_files(dir, &prefix);
+        if segments.is_empty() {
+            return Ok(0);
+        }
+        let archive = self
+            .segment_archive_dir()
+            .context("journal path has no archive directory")?;
+        std::fs::create_dir_all(&archive)
+            .with_context(|| format!("create segment archive {}", archive.display()))?;
+        for (_, _, source) in &segments {
+            let destination = archive.join(
+                source
+                    .file_name()
+                    .context("journal segment has no file name")?,
+            );
+            if destination.exists() {
+                anyhow::bail!(
+                    "refusing to overwrite archived segment {} while moving {}",
+                    destination.display(),
+                    source.display()
+                );
+            }
+        }
+        for (_, _, source) in &segments {
+            let destination = archive.join(
+                source
+                    .file_name()
+                    .context("journal segment has no file name")?,
+            );
+            std::fs::rename(source, &destination).with_context(|| {
+                format!(
+                    "move segment {} into {}",
+                    source.display(),
+                    archive.display()
+                )
+            })?;
+        }
+        if let Ok(d) = File::open(dir) {
+            let _ = d.sync_all();
+        }
+        if let Ok(d) = File::open(&archive) {
+            let _ = d.sync_all();
+        }
+        Ok(segments.len())
     }
 
     /// Fold everything older than the newest `keep` records into a checkpoint
@@ -291,6 +347,31 @@ fn replay_path(path: &Path) -> Vec<JournalRecord> {
         }
     }
     out
+}
+
+fn segment_files(dir: &Path, prefix: &str) -> Vec<(u64, u64, PathBuf)> {
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return found;
+    };
+    for entry in entries.map_while(Result::ok) {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(rest) = name.strip_prefix(prefix) else {
+            continue;
+        };
+        let Some(range) = rest.strip_suffix(".jsonl") else {
+            continue;
+        };
+        let Some((from, to)) = range.split_once('-') else {
+            continue;
+        };
+        if let (Ok(from), Ok(to)) = (from.parse::<u64>(), to.parse::<u64>()) {
+            found.push((from, to, entry.path()));
+        }
+    }
+    found.sort();
+    found
 }
 
 fn write_records(path: &Path, records: &[JournalRecord]) -> anyhow::Result<()> {
@@ -523,6 +604,64 @@ mod tests {
             .unwrap();
         assert_eq!(journal.len(), 7, "checkpoint + 5 kept + the receipt");
         assert!(reconcile(&journal.replay()).in_flight.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Sealed segments may leave the journal directory, but not the truth:
+    /// `replay_all` reads the archive directory too, and a later rotation can
+    /// coexist with the already-archived older range.
+    #[test]
+    fn sealed_segments_move_to_an_archive_without_changing_history() {
+        let dir = scratch("offline-archive");
+        let path = dir.join("journal.jsonl");
+        let journal = Journal::create(&path).unwrap();
+        seed(&journal, 4);
+        let before = reconcile(&journal.replay());
+
+        let rotated = journal.rotate(5).unwrap().expect("rotation");
+        assert_eq!(journal.archive_segments().unwrap(), 1);
+        let archive = journal.segment_archive_dir().unwrap();
+        let archived = archive.join(rotated.archived_to.file_name().unwrap());
+        assert!(
+            !rotated.archived_to.exists(),
+            "the sealed file left the root"
+        );
+        assert!(
+            archived.exists(),
+            "the sealed file moved rather than vanished"
+        );
+        assert_eq!(replay_path(&archived).len(), 10);
+        assert_eq!(
+            journal.archive_segments().unwrap(),
+            0,
+            "archiving an empty root is idempotent"
+        );
+
+        let after_move = reconcile(&journal.replay_all());
+        assert_eq!(after_move.state, before.state);
+        assert_eq!(after_move.in_flight, before.in_flight);
+
+        for iteration in 5..=8 {
+            journal
+                .append(&JournalRecord::StageWritten {
+                    task: "demo".into(),
+                    stage: Stage::Dev,
+                    iteration,
+                })
+                .unwrap();
+        }
+        let before_second = reconcile(&journal.replay());
+        journal.rotate(0).unwrap().expect("second rotation");
+        assert_eq!(
+            journal.segments().len(),
+            2,
+            "replay sees one archived and one newly sealed range"
+        );
+        assert_eq!(
+            reconcile(&journal.replay_all()).state,
+            before_second.state,
+            "moving files changes location, not state"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

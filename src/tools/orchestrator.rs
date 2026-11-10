@@ -161,6 +161,20 @@ type StageResult = Result<StagedCall, ToolOutcome>;
 
 type IndexedOutcome<'a> = Pin<Box<dyn Future<Output = (usize, ToolOutcome)> + Send + 'a>>;
 
+async fn acquire_slot(
+    slots: Option<Arc<tokio::sync::Semaphore>>,
+    token: &CancellationToken,
+) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, ()> {
+    let Some(slots) = slots else {
+        return Ok(None);
+    };
+    tokio::select! {
+        biased;
+        _ = token.cancelled() => Err(()),
+        permit = slots.acquire_owned() => permit.map(Some).map_err(|_| ()),
+    }
+}
+
 /// Execute one prepared call with the sandbox-denial escalation loop.
 async fn run_one(
     staged: StagedCall,
@@ -275,6 +289,36 @@ pub async fn dispatch_batch(
     approvals: &ApprovalBoard,
     idgen: &Arc<dyn IdGen>,
 ) -> Vec<(ToolCall, ToolOutcome)> {
+    dispatch_batch_with_limit(
+        registry,
+        calls,
+        ctx,
+        token,
+        emit,
+        approvals,
+        idgen,
+        super::DEFAULT_MAX_PARALLEL_TOOLS,
+        None,
+    )
+    .await
+}
+
+/// Same batch semantics with a hard ceiling on concurrently executing tools.
+/// `0` means no ceiling; positive values gate only the execute phase. Serial
+/// preparation (including approvals) is unchanged, and results remain in source
+/// order regardless of which tool finishes first.
+#[allow(clippy::too_many_arguments)]
+pub async fn dispatch_batch_with_limit(
+    registry: &ToolRegistry,
+    calls: &[ToolCall],
+    ctx: &ToolCtx,
+    token: &CancellationToken,
+    emit: &EmitFn,
+    approvals: &ApprovalBoard,
+    idgen: &Arc<dyn IdGen>,
+    max_parallel_tools: usize,
+    worker_tool_slots: Option<Arc<tokio::sync::Semaphore>>,
+) -> Vec<(ToolCall, ToolOutcome)> {
     // --- serial prepare phase (any NeedsApproval short-circuits to an outcome).
     let mut stage: Vec<StageResult> = Vec::new();
     for call in calls {
@@ -288,6 +332,8 @@ pub async fn dispatch_batch(
 
     // --- concurrent execute phase.
     let lock = Arc::new(tokio::sync::RwLock::new(()));
+    let slots =
+        (max_parallel_tools > 0).then(|| Arc::new(tokio::sync::Semaphore::new(max_parallel_tools)));
     let mut futs: Vec<IndexedOutcome<'_>> = Vec::new();
     for (i, call) in calls.iter().enumerate() {
         let stage_i = std::mem::replace(&mut stage[i], Err(ToolOutcome::error("consumed")));
@@ -301,8 +347,30 @@ pub async fn dispatch_batch(
                 let emit = Arc::clone(emit);
                 let idgen = Arc::clone(idgen);
                 let lock = Arc::clone(&lock);
+                let slots = slots.clone();
+                let worker_tool_slots = worker_tool_slots.clone();
                 let call2 = call.clone();
                 futs.push(Box::pin(async move {
+                    let _worker_slot = match acquire_slot(worker_tool_slots, &token).await {
+                        Ok(slot) => slot,
+                        Err(()) => {
+                            return (
+                                i,
+                                ToolOutcome::error(
+                                    "aborted before a worker tool slot was available",
+                                ),
+                            );
+                        }
+                    };
+                    let _task_slot = match acquire_slot(slots, &token).await {
+                        Ok(slot) => slot,
+                        Err(()) => {
+                            return (
+                                i,
+                                ToolOutcome::error("aborted before a task tool slot was available"),
+                            );
+                        }
+                    };
                     // Either keeps the two guard types unifiable; both drop-only.
                     let _guard = if sequential {
                         futures::future::Either::Left(lock.write().await)

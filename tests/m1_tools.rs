@@ -4,14 +4,15 @@
 mod common;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use common::{EngineSpec, SleepTool};
 use kestrel::core::events::{EventMsg, MessageItem};
 use kestrel::permissions::{Decision, PolicyTable, PrefixRule, Segment};
 use kestrel::provider::faux::FauxWire;
-use kestrel::tools::dispatch_batch;
 use kestrel::tools::{ToolCall, ToolCtx, ToolRegistry};
+use kestrel::tools::{dispatch_batch, dispatch_batch_with_limit};
 
 fn ctx_for(cwd: std::path::PathBuf, approve: kestrel::tools::ApproveMode) -> ToolCtx {
     ToolCtx {
@@ -80,6 +81,193 @@ async fn parallel_tools_overlap_in_time() {
     assert_eq!(results[0].0.call_id, "c1");
     assert_eq!(results[1].0.call_id, "c2");
     assert!(!results[0].1.is_error);
+}
+
+#[derive(Default)]
+struct RunningTools {
+    current: AtomicUsize,
+    max: AtomicUsize,
+}
+
+struct RunningGuard(Arc<RunningTools>);
+
+impl Drop for RunningGuard {
+    fn drop(&mut self) {
+        self.0.current.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+struct CountingSleepTool {
+    running: Arc<RunningTools>,
+    ms: u64,
+}
+
+#[async_trait::async_trait]
+impl kestrel::tools::Tool for CountingSleepTool {
+    fn name(&self) -> &str {
+        "counted-sleep"
+    }
+
+    fn schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object"})
+    }
+
+    fn mode(&self) -> kestrel::tools::ExecMode {
+        kestrel::tools::ExecMode::Parallel
+    }
+
+    async fn prepare(
+        &self,
+        _call: &ToolCall,
+        _ctx: &ToolCtx,
+    ) -> Result<kestrel::tools::Prepared, kestrel::tools::Reject> {
+        Ok(kestrel::tools::Prepared(serde_json::json!({})))
+    }
+
+    async fn execute(
+        &self,
+        _prep: kestrel::tools::Prepared,
+        _ctx: &ToolCtx,
+        cancel: tokio_util::sync::CancellationToken,
+        _update: tokio::sync::mpsc::UnboundedSender<kestrel::tools::ToolUpdate>,
+    ) -> Result<kestrel::tools::ToolOutcome, kestrel::tools::ToolError> {
+        let now = self.running.current.fetch_add(1, Ordering::SeqCst) + 1;
+        self.running.max.fetch_max(now, Ordering::SeqCst);
+        let _guard = RunningGuard(Arc::clone(&self.running));
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(kestrel::tools::ToolError::Cancelled),
+            _ = tokio::time::sleep(Duration::from_millis(self.ms)) => {
+                Ok(kestrel::tools::ToolOutcome::text("slept"))
+            }
+        }
+    }
+}
+
+/// A task-level ceiling gates the execute phase without changing source order.
+#[tokio::test]
+async fn tool_execution_ceiling_bounds_one_task() {
+    let running = Arc::new(RunningTools::default());
+    let registry = ToolRegistry::new(vec![Arc::new(CountingSleepTool {
+        running: Arc::clone(&running),
+        ms: 60,
+    })]);
+    let calls: Vec<ToolCall> = (0..4)
+        .map(|i| tool_call(&format!("c{i}"), "counted-sleep", serde_json::json!({})))
+        .collect();
+    let ctx = ctx_for(
+        std::env::temp_dir(),
+        kestrel::tools::ApproveMode::HeadlessDeny,
+    );
+    let results = dispatch_batch_with_limit(
+        &registry,
+        &calls,
+        &ctx,
+        &tokio_util::sync::CancellationToken::new(),
+        &(Arc::new(|_m: EventMsg| {}) as kestrel::tools::orchestrator::EmitFn),
+        &kestrel::core::approvals::ApprovalBoard::default(),
+        &(Arc::new(kestrel::core::id::SeqGen::new()) as Arc<dyn kestrel::core::id::IdGen>),
+        2,
+        None,
+    )
+    .await;
+
+    assert_eq!(
+        running.max.load(Ordering::SeqCst),
+        2,
+        "the ceiling must engage"
+    );
+    assert_eq!(
+        running.current.load(Ordering::SeqCst),
+        0,
+        "permits are returned after execution"
+    );
+    let order: Vec<&str> = results
+        .iter()
+        .map(|(call, _)| call.call_id.as_str())
+        .collect();
+    assert_eq!(order, ["c0", "c1", "c2", "c3"], "results keep source order");
+}
+
+/// The worker-wide semaphore is shared by separate task batches; each task may
+/// still spend its own ceiling, but together they cannot exceed the worker cap.
+#[tokio::test]
+async fn worker_tool_ceiling_bounds_multiple_tasks() {
+    let running = Arc::new(RunningTools::default());
+    let registry = Arc::new(ToolRegistry::new(vec![Arc::new(CountingSleepTool {
+        running: Arc::clone(&running),
+        ms: 60,
+    })]));
+    let calls1: Vec<ToolCall> = (0..4)
+        .map(|i| tool_call(&format!("a{i}"), "counted-sleep", serde_json::json!({})))
+        .collect();
+    let calls2: Vec<ToolCall> = (0..4)
+        .map(|i| tool_call(&format!("b{i}"), "counted-sleep", serde_json::json!({})))
+        .collect();
+    let ctx1 = ctx_for(
+        std::env::temp_dir(),
+        kestrel::tools::ApproveMode::HeadlessDeny,
+    );
+    let ctx2 = ctx1.clone();
+    let emit1: kestrel::tools::orchestrator::EmitFn = Arc::new(|_m| {});
+    let emit2: kestrel::tools::orchestrator::EmitFn = Arc::new(|_m| {});
+    let approvals1 = kestrel::core::approvals::ApprovalBoard::default();
+    let approvals2 = kestrel::core::approvals::ApprovalBoard::default();
+    let idgen1: Arc<dyn kestrel::core::id::IdGen> = Arc::new(kestrel::core::id::SeqGen::new());
+    let idgen2: Arc<dyn kestrel::core::id::IdGen> = Arc::new(kestrel::core::id::SeqGen::new());
+    let token1 = tokio_util::sync::CancellationToken::new();
+    let token2 = tokio_util::sync::CancellationToken::new();
+    let worker_slots = Arc::new(tokio::sync::Semaphore::new(2));
+
+    let (results1, results2) = tokio::join!(
+        dispatch_batch_with_limit(
+            &registry,
+            &calls1,
+            &ctx1,
+            &token1,
+            &emit1,
+            &approvals1,
+            &idgen1,
+            4,
+            Some(Arc::clone(&worker_slots)),
+        ),
+        dispatch_batch_with_limit(
+            &registry,
+            &calls2,
+            &ctx2,
+            &token2,
+            &emit2,
+            &approvals2,
+            &idgen2,
+            4,
+            Some(Arc::clone(&worker_slots)),
+        ),
+    );
+
+    assert_eq!(
+        running.max.load(Ordering::SeqCst),
+        2,
+        "the worker-wide ceiling must bind across task batches"
+    );
+    assert_eq!(
+        running.current.load(Ordering::SeqCst),
+        0,
+        "both batches return every permit"
+    );
+    assert_eq!(
+        results1
+            .iter()
+            .map(|(call, _)| call.call_id.as_str())
+            .collect::<Vec<_>>(),
+        ["a0", "a1", "a2", "a3"]
+    );
+    assert_eq!(
+        results2
+            .iter()
+            .map(|(call, _)| call.call_id.as_str())
+            .collect::<Vec<_>>(),
+        ["b0", "b1", "b2", "b3"]
+    );
 }
 
 /// Acceptance 1b: a sequential tool excludes parallel ones -> wall >= ~350ms.

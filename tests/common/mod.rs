@@ -66,6 +66,8 @@ pub fn spawn_engine(
         system: "test system".into(),
         tools,
         max_rounds,
+        max_parallel_tools: kestrel::tools::DEFAULT_MAX_PARALLEL_TOOLS,
+        worker_tool_slots: None,
         cwd: std::env::temp_dir(),
         role: "test".into(),
         idgen: Arc::new(SeqGen::new()),

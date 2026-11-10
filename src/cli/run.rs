@@ -128,6 +128,8 @@ pub async fn run_once(args: RunArgs) -> anyhow::Result<i32> {
         system,
         tools,
         max_rounds: 8,
+        max_parallel_tools: crate::tools::DEFAULT_MAX_PARALLEL_TOOLS,
+        worker_tool_slots: None,
         cwd: std::env::current_dir()?,
         role: role_name,
         idgen: Arc::new(UuidGen),

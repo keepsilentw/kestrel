@@ -15,7 +15,7 @@ use super::cancel::next_or_cancel;
 use super::events::{Event, EventMsg, MessageItem};
 use super::id::ReqId;
 use crate::provider::wire::{StopReason, TurnContext, Usage, WireEvent};
-use crate::tools::{ToolCall, ToolOutcome, dispatch_batch, outcomes_to_history};
+use crate::tools::{ToolCall, ToolOutcome, dispatch_batch_with_limit, outcomes_to_history};
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum TurnEnd {
@@ -295,7 +295,7 @@ pub(crate) async fn run_turn(shared: &Arc<Shared>, token: &CancellationToken) ->
                     let _ = sh.events.send(Event::new(tr.clone(), msg));
                 })
             };
-            let results = dispatch_batch(
+            let results = dispatch_batch_with_limit(
                 &shared.tools,
                 &call_vec,
                 &tool_ctx,
@@ -303,6 +303,8 @@ pub(crate) async fn run_turn(shared: &Arc<Shared>, token: &CancellationToken) ->
                 &emit_tool,
                 &shared.approvals,
                 &shared.idgen,
+                shared.max_parallel_tools,
+                shared.worker_tool_slots.clone(),
             )
             .await;
             // One batch, one history commit: see outcomes_to_history.

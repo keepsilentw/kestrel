@@ -49,6 +49,11 @@ pub struct ServeArgs {
     /// How many tasks this worker will host engines for. Over the ceiling a
     /// bell is REFUSED with a visible error bell; 0 means no ceiling.
     pub max_tasks: usize,
+    /// How many tools one task may execute concurrently. 0 means no ceiling.
+    pub max_parallel_tools: usize,
+    /// How many tools all tasks in this worker may execute concurrently.
+    /// 0 means no worker-wide ceiling.
+    pub max_worker_tools: usize,
 }
 
 /// Resident worker: one long-lived process, one engine + session tree per task.
@@ -83,6 +88,8 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         .cloned()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let role_name = role.role.clone();
+    let worker_tool_slots = (args.max_worker_tools > 0)
+        .then(|| Arc::new(tokio::sync::Semaphore::new(args.max_worker_tools)));
     let cfg = Arc::new(PoolConfig {
         session: args.session.clone(),
         role: role_name.clone(),
@@ -105,6 +112,7 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         WireId::OpenAiResponses => Arc::new(OpenAiResponsesWire),
     };
     let engine_policy = Arc::clone(&engine_policy);
+    let worker_tool_slots = worker_tool_slots.clone();
     let factory: EngineFactory = Arc::new(move |task: &str| -> anyhow::Result<PooledEngine> {
         // One session tree per task: two pipelines must not share a history, a
         // read-before-edit ledger or a compaction checkpoint.
@@ -136,6 +144,8 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
                 Arc::new(Edit),
             ],
             max_rounds: 8,
+            max_parallel_tools: args.max_parallel_tools,
+            worker_tool_slots: worker_tool_slots.clone(),
             cwd: cwd.clone(),
             role: role_name.clone(),
             idgen: Arc::new(UuidGen),

@@ -7,8 +7,8 @@
 
 ## 1. 自动化测试基线（cargo test）
 
-**Metrics** — src 51 files / 17338 lines · tests 9 files / 3383 lines · 249 tests (lib 196 + bin 4 + integration 49)
-**Integration** — core_loop 5 / discipline 2 / m1_tools 9 / m2_session 6 / m4_bus 15 / m5_pool 6 / sandbox_e2e 4 / wire_anthropic 2
+**Metrics** — src 51 files / 17613 lines · tests 9 files / 3577 lines · 252 tests (lib 197 + bin 4 + integration 51)
+**Integration** — core_loop 5 / discipline 2 / m1_tools 11 / m2_session 6 / m4_bus 15 / m5_pool 6 / sandbox_e2e 4 / wire_anthropic 2
 
 | 组 | 覆盖 |
 |---|---|
@@ -939,3 +939,45 @@ Error: [sa] iteration cap reached for Dev — 1 of those iterations were rework 
 第七轮的报账数字（`of which 0.0000 nominal`）本来就是带 flag 跑出来的，两者 usage 形状相同，账单形状不变。
 
 **闸门**：无源码变更（只改用户层配置与文档），`**Metrics**` 两行不变（249 tests / src 17338 行）。
+
+## 35. 2026-11-10 三期开工：每 task 工具并发上限
+
+`serve` 新增 `--max-parallel-tools`（缺省 4，`0` = 无上限）。它只限制一个 task 的
+execute 阶段，不改变逐条 prepare、审批顺序、`RwLock` 的串行工具语义、源序回填或取消传播。
+`dispatch_batch` 采用同一个安全缺省值，生产 turn 走可配置的 `dispatch_batch_with_limit`。
+
+新增测试 `tool_execution_ceiling_bounds_one_task`：四个并行工具走上限 2，断言并发峰值为 2、
+所有 permit 最终归还、结果仍按源序返回。
+
+**验证边界**：本格落地时只执行了 `cargo fmt --check`；后续与归档实现一起通过了
+`cargo clippy --all-targets -- -D warnings` 和 `cargo test`（见 §36）。真实端点联跑尚未执行。
+内存 RSS 硬上限也没有随这一格完成。
+
+## 36. 2026-11-10 三期第二格：journal 归档段移动
+
+`kestrel journal-archive --journal journal.jsonl` 把根目录里的已封闭段移动到
+`journal.segments/`，不删除、不改写记录。`replay_all()` 同时扫描原目录和归档目录；
+同一区间两边都存在时原目录副本胜出。目标冲突会在任何文件移动前整体拒绝。
+
+新增测试 `sealed_segments_move_to_an_archive_without_changing_history` 覆盖：
+
+- 移动前后的 `reconcile(replay_all())` 状态和未结算铃完全一致；
+- 第二次执行返回 0，不把空目录当失败；
+- 归档旧段后继续轮转产生的新段与旧段共存，区间顺序仍正确。
+
+**闸门**：新增并发护栏与归档实现已通过 `cargo fmt --check`、
+`cargo clippy --all-targets -- -D warnings`、`cargo test`；完整真端点联跑仍未执行。
+归档只改变文件所在目录，不压缩字节，磁盘占用仍会增长。
+
+## 37. 2026-11-10 三期第三格：worker 级工具并发上限
+
+`serve` 新增 `--max-worker-tools`（缺省 8，`0` = 无上限）。该上限通过一个共享
+`Arc<Semaphore>` 约束同一 worker 内所有 task 的工具执行总数；每 task 的
+`--max-parallel-tools` 继续保留。获取顺序固定为 worker 槽 → task 槽，等待任一槽位都可被
+取消 token 打断。
+
+测试 `worker_tool_ceiling_bounds_multiple_tasks` 并行启动两个 task 批次，各自上限 4、
+共享上限 2。实测跨批次峰值为 2，全部 permit 归还，两个批次内部仍保持源序。
+
+**验证边界**：本格通过 fmt、clippy 与完整测试；真实端点联跑未执行。共享工具槽限制的是
+同时执行的工具数量，不是 RSS 上限。

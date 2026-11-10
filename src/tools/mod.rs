@@ -21,7 +21,14 @@ pub mod orchestrator;
 pub mod read;
 pub mod read_state;
 pub mod write;
-pub use orchestrator::dispatch_batch;
+pub use orchestrator::{dispatch_batch, dispatch_batch_with_limit};
+
+/// Default ceiling on tool executions running at the same time inside one
+/// task. `0` is the explicit "no ceiling" spelling, matching `--max-tasks`.
+pub const DEFAULT_MAX_PARALLEL_TOOLS: usize = 4;
+
+/// Default ceiling on tool executions across every task hosted by one worker.
+pub const DEFAULT_MAX_WORKER_TOOLS: usize = 8;
 
 /// One parsed tool call arriving from the model.
 #[derive(Clone, Debug)]

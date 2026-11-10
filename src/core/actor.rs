@@ -56,6 +56,9 @@ pub(crate) struct Shared {
     pub events: mpsc::UnboundedSender<Event>,
     pub idgen: Arc<dyn IdGen>,
     pub max_rounds: u32,
+    pub max_parallel_tools: usize,
+    /// Shared across every task engine in one worker.
+    pub worker_tool_slots: Option<Arc<tokio::sync::Semaphore>>,
     pub cwd: PathBuf,
     pub role: String,
     pub root: CancellationToken,
@@ -81,6 +84,11 @@ pub struct EngineConfig {
     pub tools: Vec<Arc<dyn crate::tools::Tool>>,
     /// Hard cap on sampling rounds per turn (codex uses 8).
     pub max_rounds: u32,
+    /// Hard cap on tool executions running concurrently inside one task.
+    /// `0` explicitly disables the ceiling.
+    pub max_parallel_tools: usize,
+    /// Hard cap shared by every task hosted by the same worker.
+    pub worker_tool_slots: Option<Arc<tokio::sync::Semaphore>>,
     pub cwd: PathBuf,
     pub role: String,
     pub idgen: Arc<dyn IdGen>,
@@ -126,6 +134,8 @@ impl AgentHandle {
             events: event_tx,
             idgen: config.idgen,
             max_rounds: config.max_rounds,
+            max_parallel_tools: config.max_parallel_tools,
+            worker_tool_slots: config.worker_tool_slots,
             cwd: config.cwd,
             role: config.role,
             root: root.clone(),

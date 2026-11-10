@@ -20,8 +20,8 @@
 > 质量闸门保持人工执行（本仓库不挂 CI，见 §9.19⑥）。
 > 二期十一项已于 2026-11-04 在真端点联跑中走完（`pipeline complete`，四阶段全 pass，
 > 审批请求/判定/回执各 5 条成对）；那一次联跑抓出并修掉两个「测试全绿但跑不起来」的缺陷，见 §9.32。
-> **Metrics** — src 51 files / 17338 lines · tests 9 files / 3383 lines · 249 tests (lib 196 + bin 4 + integration 49)
-> **Integration** — core_loop 5 / discipline 2 / m1_tools 9 / m2_session 6 / m4_bus 15 / m5_pool 6 / sandbox_e2e 4 / wire_anthropic 2
+> **Metrics** — src 51 files / 17613 lines · tests 9 files / 3577 lines · 252 tests (lib 197 + bin 4 + integration 51)
+> **Integration** — core_loop 5 / discipline 2 / m1_tools 11 / m2_session 6 / m4_bus 15 / m5_pool 6 / sandbox_e2e 4 / wire_anthropic 2
 > 规模已过 plan 预算（10-13k）的上沿：多出来的部分几乎都花在「取消安全」与「对账」这两条纪律上。
 > 上面两行数字由 `tests/discipline.rs::metrics_lines_match_the_tree` 对照源码树重算校验——
 > 这些计数此前在三处文档里手抄过三次、漂移过三次（§9.19），现在它是闸门不是仪式。
@@ -362,11 +362,32 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
     ⑥ `stream_include_usage` 这颗 compat 位**当天就做了反证，结论是拿掉**：同一请求带它跑一次 `in=18 / out=273`，去掉它再跑一次 `in=18 / out=4`（两次都是真端点，2026-11-05）。BigModel 这条 OpenAI 兼容表面**不要求** `stream_options.include_usage` 就回 input usage；那颗 flag 是百炼的形态问题（§9.7），不是 OpenAI 兼容族的要求。留着它的理由只剩「另一个网关需要过」，那就是把猜测当成配置，所以删。删掉之后又复测一次：`in=19 / out=75`，照报。
     ⑦ 仍未覆盖的一件事留在这里：QA 的 `input_image` 能力这几轮联跑**没有任何 stage 用到**——demo 交出的证据全是文本文件。「端点能吃图」只在 §2 那轮 smoke 用 1×1 PNG 验过请求层面，「验证者靠截图反驳 worker 的声明」这条流程从没跑通过，因为 `screenshot` 这一档证据类型要求 worker 真的产出图，而 demo 的沙箱里没有任何画图的手段。这是流程缺口，不是 wire 缺口。
 
+46. **三期开工：worker 池的并发执行护栏（2026-11-10）**：
+    ① 二期留下的边界不是「task 太多」——`--max-tasks` 已经会显式拒绝——而是**一个 task 内部**的并行工具批次没有上限。一次模型回合可以同时发起多个 bash/read/write/edit；task 数有界不等于副作用操作的并发数有界。
+    ② `EngineConfig.max_parallel_tools` 把上限交给每个 task 的引擎，CLI 在 `serve` 上暴露为 `--max-parallel-tools`，缺省 4；`0` 沿用 `--max-tasks` 的显式关闭语义，不把「没填」猜成无限。
+    ③ 约束只落在 execute 阶段：prepare 仍逐条执行，审批顺序不变；`RwLock` 的读写门仍然决定串行工具能否独占；结果仍按调用源序回填。并发槽用 fair semaphore，等待槽位期间响应取消 token，不会让已取消的回合继续排队。
+    ④ 测试 `tool_execution_ceiling_bounds_one_task` 用会记录峰值的工具发四个并行调用，断言峰值恰好为 2 且最终全部归还槽位、结果顺序仍为源序。`dispatch_batch` 采用同一个安全缺省值，需要显式不同的上限时走 `dispatch_batch_with_limit`。
+    ⑤ 这条**没有**回答「一个 task 最多占多少 RSS」。进程内存仍没有硬上限，真·多进程编排也仍属于 harness 上层；把并发工具数写成内存护栏会是另一张假账单。并发护栏与后续归档改动一起通过了 fmt / clippy / test；真端点联跑尚未执行。
+
+47. **三期第二格：journal 归档段治理（2026-11-10）**：
+    ① 默认轮转让活文件有界，但每次折叠都会在 journal 根目录留下一个只增不减的段文件。这里先解决**目录治理**：新增 `kestrel journal-archive --journal <path>`，把已封闭的 `<stem>.seg<from>-<to>.jsonl` 原子移动到由 journal 名推导出的 `<stem>.segments/`。段本来已经封闭且不可变，因此不需要重写内容。
+    ② 这不是删除，也不是「清理旧账」。`Journal::replay_all()` 同时扫描根目录和归档目录，按记录区间升序重放；移动前后折叠出的状态与未结算铃必须一致。若崩溃在多个 `rename` 中间，两个位置都仍可读，下一次运行会扫描到一起。
+    ③ 区间名仍是幂等键。根目录与归档目录出现同一区间时，根目录副本胜出——它是重试轮转刚刚 fsync 过的较新副本。归档命令在移动前先检查全部目标；任一目标已存在就整体拒绝，不做覆盖，也不留下只移动了一半的新冲突。
+    ④ 命令每次搬走当前根目录里全部已封闭段；重复执行返回移动 0 个。测试 `sealed_segments_move_to_an_archive_without_changing_history` 覆盖移动后历史等价、二次执行为空、归档旧段与后续新段共存三种情况。
+    ⑤ 边界：这只治理目录，不压缩字节，也不提供自动删除。长运行仍会持续占盘，下一步若是压缩或保留策略，必须另外定义可恢复性和审计窗口，不能借用「轮转不是删除」这条语义偷渡。
+
+48. **三期第三格：worker 级共享工具并发上限（2026-11-10）**：
+    ① 每 task 的 4 个工具槽只能约束一台引擎；`--max-tasks 4` 时全 worker 仍可能同时跑 16 个工具。新增 `--max-worker-tools`（缺省 8，`0` 显式关闭），由一个 `Arc<Semaphore>` 跨该 worker 的所有 task 引擎共享。
+    ② 执行一格工具要按固定顺序先拿 worker 槽、再拿 task 槽；所有路径同序获取，避免两个层级互相等待。等待任一槽位都响应取消 token，已取消的回合不会为了拿 permit 继续排队。
+    ③ 两个上限职责不同：task 槽保护单任务副作用密集度，worker 槽保护整个进程。两者都不改变 prepare/审批顺序、`RwLock` 串行工具语义或源序回填。
+    ④ 测试 `worker_tool_ceiling_bounds_multiple_tasks` 同时启动两个 task 批次，各自上限 4，共享上限 2；断言跨批次峰值恰好 2、全部 permit 归还、两批结果各自保持源序。
+    ⑤ 仍未回答 RSS 上限：工具并发数与内存占用不是同一个量，ARC 缓存、会话历史和模型响应仍可能让进程超出内存预算。该格只能防止“同时干太多活”，不能宣称“进程最多占多少内存”。
+
 ## 10 二期清单
 
 已落地（2026-10-28 起）：~~`ApproveMode::Bus`~~（授权表 + 超时 fail-closed + journal 审计，§9.20）、~~SA 判定升级到「工件 + 证据文件」~~（绝对路径存在性/非空核对，§9.20）、~~bus 重连重放~~（离线 session 停车补投 + 客户端自动重连；RPC 与「写入即死」的帧不重放，§9.21）、~~journal 快照/截断语义~~（检查点 + 归档段 + 崩溃安全轮转，§9.22）、~~多任务并行~~（task 命名空间三处同源 + 前缀寻址，§9.23）、~~openai-responses wire~~（第三条 v1 wire，金身 + fixture 验证，**真端点未实测**，§9.24）、~~journal 投影增量化与轮转触发~~（在线投影 = 全量重放 + 条数/字节双上限，§9.25）、~~一个引擎内真正并发地服务多个 task~~（改为「一 task 一引擎」的 worker 池，单活跃槽不动，§9.26）、~~`BudgetSpent` 的价格表~~（预留 → 结算两段式、按 token 换账单、无价退回名义值并报出来，§9.27；2026-11-03）、~~journal 轮转的**默认策略**~~（活文件 512 条 / 1 MiB 双上限、三态 CLI、生产与测试同一条 `rotate_at_boundary`，§9.28；2026-11-03）、~~证据的类型化~~（`file` / `test_log` / `diff` / `screenshot` 各自可在盘上反驳 + `--evidence-spec` 的 stage 要求，坏表硬失败，§9.29；2026-11-03）、~~审批批复的可靠投递~~（请求 at-least-once + 按 req 幂等 + 台账从 journal 播种，判定仍只一次，§9.30；2026-11-03）、~~批复到底有没有生效~~（回执 `approval_receipt` + `ApprovalAcked` 落账 + 到点撤摊，**没生效的批准不许记成生效**，§9.31；2026-11-03）。
 
-仍在清单上（审批已闭环到「有没有生效」这一层：请求 at-least-once、批复有回执、未回执的批复重启后补投一次。剩下的是**跨回合挂起的审批槽位**——「SA 下班、明早再批」需要未决请求的第二份真相与新的取消语义，见 §9.31⑤）：tree-sitter-bash 命令解析、execpolicy DSL（Starlark）、landlock/bwrap（Linux 沙箱）、TUI（行级 diff 形制，pi-tui 蓝本）、MCP 客户端、model-in-the-loop evals（含 openai-responses 的真端点实测，§9.24）、worker 池的资源护栏（`--max-tasks` 只挡 task 数，不挡每 task 的内存与并发 HTTP；真·多进程编排属于 harness 上层）、**归档段自身的治理**（默认策略落地后，长运行会攒出很多段；段按覆盖区间命名、永不自动清理，所以「段也该压缩或离线归档」是新的一格——不能靠默认轮转顺手做删除，那会撞上「这不是删除」那条语义边界）。
+仍在清单上（审批已闭环到「有没有生效」这一层：请求 at-least-once、批复有回执、未回执的批复重启后补投一次。剩下的是**跨回合挂起的审批槽位**——「SA 下班、明早再批」需要未决请求的第二份真相与新的取消语义，见 §9.31⑤）：tree-sitter-bash 命令解析、execpolicy DSL（Starlark）、landlock/bwrap（Linux 沙箱）、TUI（行级 diff 形制，pi-tui 蓝本）、MCP 客户端、model-in-the-loop evals（含 openai-responses 的真端点实测，§9.24）、worker 池资源护栏的剩余两层（task 与 worker 的工具并发数已分别由 `--max-parallel-tools` / `--max-worker-tools` 封顶，见 §9.46 / §9.48；每 task 的 RSS 硬上限与真·多进程编排仍留给 harness 上层）、归档段的**压缩与保留策略**（离线移动已由 `journal-archive` 落地，见 §9.47；磁盘占用仍只增不减，自动删除会撞上「这不是删除」的语义边界）。
 
 2026-11-04 联跑新添的两格同日落地（§9.33）：验证类 stage 的 FAIL 回跳给写者返工（带额度 `max_reworks`、带原因 `ref.rework`、每关 iter 跨回跳不清零），bash 用 `output_path` 参数交出可核对的 `test_log`（内核把 stdout/stderr 连 `exit: ExitStatus{...}` 一起写进那个文件）。下一格因此有了明确的落点：SA 只要去读那行 `exit:`，「形状」就能升级成「结论」——现在它还只证明「这份文件是测试汇总」。
 

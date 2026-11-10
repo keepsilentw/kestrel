@@ -7,6 +7,7 @@ use std::time::Duration;
 use clap::{ArgAction, Args, Parser, Subcommand};
 use kestrel::cli::run::{RunArgs, run_once};
 use kestrel::config::RoleConfig;
+use kestrel::journal::Journal;
 use kestrel::provider::config::{KeyResolver, Registry};
 use kestrel::provider::wire::{ModelMeta, WireId};
 
@@ -87,6 +88,8 @@ enum Command {
     DemoSa(DemoSaCmd),
     /// Bus hub: bind the UDS socket and route frames between peers.
     Hub(HubCmd),
+    /// Move sealed journal segments into `<journal-stem>.segments/`.
+    JournalArchive(JournalArchiveCmd),
 }
 
 #[derive(Args, Debug)]
@@ -112,6 +115,17 @@ struct ServeCmd {
     /// a visible error bell. 0 = no ceiling.
     #[arg(long, default_value_t = 4)]
     max_tasks: usize,
+
+    /// How many tools one task may execute concurrently. This bounds the
+    /// execute phase without changing source-order results or serial tools.
+    /// 0 = no ceiling.
+    #[arg(long, default_value_t = kestrel::tools::DEFAULT_MAX_PARALLEL_TOOLS)]
+    max_parallel_tools: usize,
+
+    /// How many tools all tasks in this worker may execute concurrently.
+    /// 0 = no worker-wide ceiling.
+    #[arg(long, default_value_t = kestrel::tools::DEFAULT_MAX_WORKER_TOOLS)]
+    max_worker_tools: usize,
 
     #[command(flatten)]
     backend: BackendArgs,
@@ -239,6 +253,14 @@ struct HubCmd {
     bus_socket: String,
 }
 
+#[derive(Args, Debug)]
+struct JournalArchiveCmd {
+    /// Journal whose already-sealed segments should be moved. No records are
+    /// deleted; `replay_all` continues to read the archive directory.
+    #[arg(long, default_value = "journal.jsonl")]
+    journal: PathBuf,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -255,6 +277,19 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Some(Command::Hub(h)) => {
             return kestrel::cli::hub::run_hub(shellexpand_home(&h.bus_socket)).await;
+        }
+        Some(Command::JournalArchive(a)) => {
+            let path = shellexpand_home(&a.journal.to_string_lossy());
+            let journal = Journal::open(&path)?;
+            let moved = journal.archive_segments()?;
+            match journal.segment_archive_dir() {
+                Some(dir) => println!(
+                    "journal archive: moved {moved} sealed segment(s) into {}",
+                    dir.display()
+                ),
+                None => println!("journal archive: moved {moved} sealed segment(s)"),
+            }
+            return Ok(());
         }
         Some(Command::Serve(s)) => {
             let role = RoleConfig::load(&s.role)?;
@@ -275,6 +310,8 @@ async fn main() -> anyhow::Result<()> {
                 api_key,
                 artifacts_dir: s.artifacts_dir,
                 max_tasks: s.max_tasks,
+                max_parallel_tools: s.max_parallel_tools,
+                max_worker_tools: s.max_worker_tools,
                 approve: approve.map(|mode| with_role_deadline(mode, Some(&role))),
             })
             .await;

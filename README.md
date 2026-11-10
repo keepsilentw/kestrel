@@ -2,9 +2,10 @@
 
 为星型多 Agent harness 写的 Rust harness kernel：引擎 + wire 层 + 工具/权限/沙箱 + 会话 + 总线/journal + CLI/配置。设计文档（中文）见本仓库 `docs/design.md`。
 
-**Metrics** — src 51 files / 17338 lines · tests 9 files / 3383 lines · 249 tests (lib 196 + bin 4 + integration 49)
+**Metrics** — src 51 files / 17613 lines · tests 9 files / 3577 lines · 252 tests (lib 197 + bin 4 + integration 51)
 
 Status: M0-M4 complete + 二期开工（`ApproveMode::Bus`、SA 判定含证据核对、bus 停车补投与自动重连、journal 快照/截断与在线投影、多任务 task 命名空间、openai-responses wire、worker 池、预算按 token 结算的价格表、journal 轮转的默认策略、按类型核对的证据与 stage 要求表、审批请求的 at-least-once 投递与按 req 幂等、验证 FAIL 回跳写者、bash `output_path` 交出可核对的 test_log）——这批改动 2026-11-04 走完真端点联跑（`pipeline complete`；那两轮联跑抓出并修掉三个「测试全绿但跑不起来」的缺陷，见 docs/design.md §9.32 / §9.33）。2026-11-05 又跑七次联跑：第二次四关一次过，抓出报账的两处「说不清」——没有费率的运行把 token 印成 `0 / 0`、同一颗审批请求的两张矛盾回执先到先得（§9.42，两处都已修）；第三次带一份测试费率表（`--prices`），§9.27 的两段式结算与 §9.36 的「读数不可信」分支第一次同时在真端点落地；第四次换成**真实费率**（官方页当天读数 + USD/CNY 换算 + `context_window`/`max_out` 收成官方 1M/384K 与 1M/128K，写进用户层 `providers.toml`，见 §9.43），报账只剩一个名义来源：`0.0732 usd, of which 0.0667 nominal (under-reported 0.0667)`——`no rate` 归零；第五次故意只给 RD 填价，把「没有结算」那条分支走回现场，用量列在没有 `budget_settled` 的情况下仍然印出 `tokens in 0 / out 8503`（§9.42② 的实证，见 smoke-report §30）；第六次把第四次那套换算整段拿掉——**直接记厂商原文的人民币**，钱的单位由 provider 的 `currency` 声明而不是写在 flag 与字段名里（§9.44；SA 后端同日从百炼 Token Plan 换成小米 MiMo，`-p` 单发两轮实测通过、官方 元 价也查到并记进配置，见 §9.44⑥⑧ 与 smoke-report §32），`ledger total: 3.5153 cny, of which 3.4752 nominal (under-reported 3.4752)`；第七次把 QA 换到 GLM 的 **OpenAI 兼容表面**，input usage 回来了，名义值第一次整段清零：`0.1806 cny, of which 0.0000 nominal`（§9.45、smoke-report §33；顺带修掉「空账印成 `-0.0000`」）。fmt / clippy `-D warnings` / test 三闸门全绿（人工执行：本仓库不挂 CI）。上面那行数字由 `tests/discipline.rs` 与源码树对照校验：改完代码不更新它，闸门就红。
+Status: M0-M4 complete + 二期主体落地。三期于 2026-11-10 开工：worker 池的并发执行护栏同时提供每 task 的 `--max-parallel-tools`（缺省 4）和 worker 全局的 `--max-worker-tools`（缺省 8），任一为 `0` 时显式关闭对应上限；两级限制都不改变源序回写、串行工具写锁和取消语义（design §9.46 / §9.48）。journal 的已封闭段可移入 `<journal>.segments/`，`replay_all()` 同时读取两处，移动而非删除历史（§9.47）。内存 RSS 硬上限和归档段压缩仍属未完成边界。二期已落地 `ApproveMode::Bus`、SA 判定含证据核对、bus 停车补投与自动重连、journal 快照/截断与在线投影、多任务 task 命名空间、openai-responses wire、worker 池、预算按 token 结算的价格表、journal 轮转的默认策略、按类型核对的证据与 stage 要求表、审批请求的 at-least-once 投递与按 req 幂等、验证 FAIL 回跳写者、bash `output_path` 交出可核对的 test_log。2026-11-05 最后一次真实联跑四关一次通过，QA 切到 GLM 的 OpenAI 兼容表面后报账为 `0.1806 cny, of which 0.0000 nominal`（§9.45、smoke-report §33）。2026-11-10 新增实现已通过 fmt / clippy / test 三道源码闸门，尚未做三期真端点联跑。上面那行数字由 `tests/discipline.rs` 与源码树对照校验。
 
 ## Quick start
 
@@ -206,8 +207,11 @@ socket」的帧**不重放**——重复铃由 SA 侧的 write-ahead 对账（jo
 t2:harness-rd --journal t2.jsonl` 告诉 SA 打哪一对 worker；task id 会盖进 journal
 记录、门铃、工件名与结果铃四处，命名契约由 `cli/task.rs` 一处算出，两端不会各拼一遍。
 `serve` 的并行单位是 task：`--max-tasks`（缺省 4）之内，每个 task 一台常驻引擎、一棵
-会话树，task 之间真并发。超过上限的门铃被**显式拒绝**（回一颗 error 铃），不排在看不
-见的队列里——静默排队在 SA 眼里就是「铃丢了」。单活跃槽没动：它是取消、steering 与
+会话树，task 之间真并发。每个 task 内部再用 `--max-parallel-tools`（缺省 4，`0` =
+无上限）限制同时执行的工具；整个 worker 再用 `--max-worker-tools`（缺省 8，`0` = 无上限）
+封顶所有 task 的工具执行总数。两级限制只收窄执行阶段，不改变串行 prepare、源序回写、
+串行工具写锁或取消语义。超过 task 上限的门铃被**显式拒绝**（回一颗 error 铃），不排在
+看不见的队列里——静默排队在 SA 眼里就是「铃丢了」。单活跃槽没动：它是取消、steering 与
 压缩时序的地基，并行靠加引擎而不是放宽槽位。
 
 ## Journal 截断
@@ -230,6 +234,16 @@ stderr）。检查点里带着**未结算的铃**与每个 peer 的花费（含�
 iteration / 每 peer 花费 / 未结算的铃）、`live_records()`、`file_bytes()` 都是 O(1)，
 所以预算停损不再每次派发重放整个文件。在线与重放由**同一个** `Folder` 折叠产生，
 测试逐条断言两者相等——否则「停损读缓存、巡检读重放」会分裂成两份真相。
+
+已封闭段可以手动移出 journal 根目录：
+
+```bash
+cargo run -- journal-archive --journal journal.jsonl
+```
+
+程序把 `<stem>.seg<from>-<to>.jsonl` 原子移动到 `<stem>.segments/`。这不是删除：
+`replay_all()` 会按区间同时读取根目录和归档目录；重复执行返回移动 0 个，目标同名文件
+存在时会在移动任何文件之前整体报错。归档只治理目录，不压缩存储，磁盘占用不会因此下降。
 
 ## Module map
 
