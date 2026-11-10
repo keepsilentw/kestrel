@@ -85,6 +85,12 @@ pub struct Router {
     tasks: HashSet<String>,
     req_owner: HashMap<String, String>,
     max_tasks: usize,
+    /// A resource ceiling was crossed: new tasks are refused out loud, while
+    /// tasks that already own an engine keep running. Refusing is the honest
+    /// half of a soft ceiling — killing the process would take the in-flight
+    /// turns with it, and `setrlimit`-style hard caps turn an overshoot into a
+    /// random allocation failure inside somebody's tool call.
+    draining: Option<String>,
 }
 
 impl Router {
@@ -95,12 +101,30 @@ impl Router {
             tasks: HashSet::new(),
             req_owner: HashMap::new(),
             max_tasks,
+            draining: None,
         }
+    }
+
+    /// Put the worker into drain mode with the reason the operator should see.
+    /// Idempotent: the first reason wins, so a repeated ceiling check does not
+    /// rewrite history while the warning has already been printed.
+    pub fn set_draining(&mut self, reason: impl Into<String>) {
+        self.draining.get_or_insert_with(|| reason.into());
+    }
+
+    pub fn draining(&self) -> Option<&str> {
+        self.draining.as_deref()
     }
 
     pub fn on_bell(&mut self, task: &str) -> Action {
         if self.tasks.contains(task) {
             return Action::Deliver(task.to_string());
+        }
+        if let Some(reason) = self.draining.clone() {
+            return Action::Reject {
+                task: task.to_string(),
+                reason,
+            };
         }
         if self.max_tasks > 0 && self.tasks.len() >= self.max_tasks {
             return Action::Reject {
@@ -181,6 +205,9 @@ pub struct PoolConfig {
     /// Optional machine-readable worker status, atomically replaced on each tick.
     pub status_file: Option<PathBuf>,
     pub status_interval: Duration,
+    /// Soft memory ceiling in bytes: once the process' PEAK resident size
+    /// reaches it the worker drains (refuses new tasks). 0 = no ceiling.
+    pub max_rss_bytes: u64,
 }
 
 /// An approval request that is still in flight: the frame itself (so a retry is
@@ -290,6 +317,28 @@ pub async fn run_pool(
                     continue;
                 }
                 let task = task_of(&frame.payload);
+                // The ceiling is read per bell, not on a timer: a bell is what
+                // costs a new engine, and `getrusage` is one syscall. Checking
+                // here (instead of only at the status tick) means the first
+                // overshoot refuses the bell that crossed it, not the next one.
+                if cfg.max_rss_bytes > 0 && router.draining().is_none() {
+                    match peak_rss_bytes() {
+                        Ok(peak) if peak >= cfg.max_rss_bytes => {
+                            let reason = format!(
+                                "worker is draining: peak RSS {peak} bytes reached the \
+                                 ceiling {} — new tasks are refused out loud, running ones \
+                                 finish",
+                                cfg.max_rss_bytes
+                            );
+                            tracing::warn!("pump: {reason}");
+                            router.set_draining(reason);
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            tracing::warn!("pump: peak RSS is unavailable: {error}")
+                        }
+                    }
+                }
                 match router.on_bell(&task) {
                     Action::Reject { task, reason } => {
                         tracing::warn!("pump: {reason}");
@@ -371,6 +420,9 @@ fn status_document(cfg: &PoolConfig, router: &Router) -> Value {
         "max_tasks": cfg.max_tasks,
         "max_parallel_tools": cfg.max_parallel_tools,
         "max_worker_tools": cfg.max_worker_tools,
+        "max_rss_bytes": cfg.max_rss_bytes,
+        "peak_rss_bytes": peak_rss_bytes().ok(),
+        "draining": router.draining(),
         "updated_unix_secs": SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -386,6 +438,22 @@ fn write_status_file(path: &std::path::Path, document: &Value) -> anyhow::Result
     let staged = path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
     std::fs::write(&staged, serde_json::to_vec(document)?)?;
     Ok(std::fs::rename(staged, path)?)
+}
+
+/// Peak resident size of this process, in bytes. `ru_maxrss` is the high water
+/// mark, which is what a stop-loss wants: an overshoot that already happened is
+/// not undone by the current reading being smaller. macOS reports bytes, Linux
+/// kilobytes — the unit is a property of the platform, not of the caller.
+fn peak_rss_bytes() -> anyhow::Result<u64> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+    anyhow::ensure!(rc == 0, "getrusage failed with {rc}");
+    let raw = (unsafe { usage.assume_init() }.ru_maxrss).max(0) as u64;
+    Ok(if cfg!(target_os = "linux") {
+        raw.saturating_mul(1024)
+    } else {
+        raw
+    })
 }
 
 /// One task's loop: bell -> turn -> artifact -> result bell, plus the approval
@@ -756,6 +824,41 @@ mod tests {
         assert_eq!(r.open_requests(), 0);
     }
 
+    /// A soft ceiling must not strand work that is already running: drain mode
+    /// refuses NEW tasks and keeps delivering the ones that own an engine.
+    #[test]
+    fn drain_mode_refuses_new_tasks_and_keeps_running_ones() {
+        let mut r = Router::new(4);
+        assert!(matches!(r.on_bell("running"), Action::Spawn(_)));
+        r.set_draining("peak RSS crossed the ceiling");
+        assert_eq!(r.draining(), Some("peak RSS crossed the ceiling"));
+        // the task that already has an engine is still served
+        assert_eq!(r.on_bell("running"), Action::Deliver("running".into()));
+        // a brand-new task is refused out loud, not queued behind the cap
+        match r.on_bell("fresh") {
+            Action::Reject { task, reason } => {
+                assert_eq!(task, "fresh");
+                assert!(reason.contains("peak RSS"), "{reason}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        // the first reason wins: a repeated check must not rewrite the refusal
+        r.set_draining("something else");
+        assert_eq!(r.draining(), Some("peak RSS crossed the ceiling"));
+    }
+
+    /// `ru_maxrss` is the only memory number both macOS and Linux agree on, and
+    /// the units differ — this pins that the conversion produced a sane size.
+    #[test]
+    fn peak_rss_reports_a_plausible_high_water_mark() {
+        let peak = peak_rss_bytes().expect("getrusage works in a test process");
+        assert!(peak > 0, "peak RSS must be non-zero: {peak}");
+        assert!(
+            peak < 1 << 40,
+            "a unit mix-up would land far outside any plausible range: {peak}"
+        );
+    }
+
     #[test]
     fn worker_status_document_is_atomic_and_reports_router_state() {
         let mut router = Router::new(4);
@@ -770,6 +873,7 @@ mod tests {
             max_tasks: 4,
             max_parallel_tools: 4,
             max_worker_tools: 8,
+            max_rss_bytes: 0,
             approval_retry: Duration::from_secs(1),
             status_file: None,
             status_interval: Duration::from_secs(5),

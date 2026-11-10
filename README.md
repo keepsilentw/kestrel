@@ -2,10 +2,9 @@
 
 为星型多 Agent harness 写的 Rust harness kernel：引擎 + wire 层 + 工具/权限/沙箱 + 会话 + 总线/journal + CLI/配置。设计文档（中文）见本仓库 `docs/design.md`。
 
-**Metrics** — src 51 files / 18462 lines · tests 9 files / 3581 lines · 257 tests (lib 202 + bin 4 + integration 51)
+**Metrics** — src 51 files / 18578 lines · tests 9 files / 3628 lines · 260 tests (lib 204 + bin 4 + integration 52)
 
-Status: M0-M4 complete + 二期开工（`ApproveMode::Bus`、SA 判定含证据核对、bus 停车补投与自动重连、journal 快照/截断与在线投影、多任务 task 命名空间、openai-responses wire、worker 池、预算按 token 结算的价格表、journal 轮转的默认策略、按类型核对的证据与 stage 要求表、审批请求的 at-least-once 投递与按 req 幂等、验证 FAIL 回跳写者、bash `output_path` 交出可核对的 test_log）——这批改动 2026-11-04 走完真端点联跑（`pipeline complete`；那两轮联跑抓出并修掉三个「测试全绿但跑不起来」的缺陷，见 docs/design.md §9.32 / §9.33）。2026-11-05 又跑七次联跑：第二次四关一次过，抓出报账的两处「说不清」——没有费率的运行把 token 印成 `0 / 0`、同一颗审批请求的两张矛盾回执先到先得（§9.42，两处都已修）；第三次带一份测试费率表（`--prices`），§9.27 的两段式结算与 §9.36 的「读数不可信」分支第一次同时在真端点落地；第四次换成**真实费率**（官方页当天读数 + USD/CNY 换算 + `context_window`/`max_out` 收成官方 1M/384K 与 1M/128K，写进用户层 `providers.toml`，见 §9.43），报账只剩一个名义来源：`0.0732 usd, of which 0.0667 nominal (under-reported 0.0667)`——`no rate` 归零；第五次故意只给 RD 填价，把「没有结算」那条分支走回现场，用量列在没有 `budget_settled` 的情况下仍然印出 `tokens in 0 / out 8503`（§9.42② 的实证，见 smoke-report §30）；第六次把第四次那套换算整段拿掉——**直接记厂商原文的人民币**，钱的单位由 provider 的 `currency` 声明而不是写在 flag 与字段名里（§9.44；SA 后端同日从百炼 Token Plan 换成小米 MiMo，`-p` 单发两轮实测通过、官方 元 价也查到并记进配置，见 §9.44⑥⑧ 与 smoke-report §32），`ledger total: 3.5153 cny, of which 3.4752 nominal (under-reported 3.4752)`；第七次把 QA 换到 GLM 的 **OpenAI 兼容表面**，input usage 回来了，名义值第一次整段清零：`0.1806 cny, of which 0.0000 nominal`（§9.45、smoke-report §33；顺带修掉「空账印成 `-0.0000`」）。fmt / clippy `-D warnings` / test 三闸门全绿（人工执行：本仓库不挂 CI）。上面那行数字由 `tests/discipline.rs` 与源码树对照校验：改完代码不更新它，闸门就红。
-Status: M0-M4 complete + 二期主体落地。三期于 2026-11-10 开工：worker 池的并发执行护栏同时提供每 task 的 `--max-parallel-tools`（缺省 4）和 worker 全局的 `--max-worker-tools`（缺省 8），任一为 `0` 时显式关闭对应上限；两级限制都不改变源序回写、串行工具写锁和取消语义（design §9.46 / §9.48）。journal 的已封闭段可移入 `<journal>.segments/`，`replay_all()` 同时读取两处，移动而非删除历史（§9.47）。名义成本分类已细到 `peer × reason`，报账的逐 peer 行能直接指出谁没价、谁读数不可信（§9.49）。判定 issue 已改为自带 `Artifact | Turn` 归因的类型，新增问题类别不能再忘记标边（§9.50）。`journal-status --approvals` 可汇总未裁决、未回执、已生效、过期未生效和孤立审批记录（§9.51）。内存 RSS 硬上限和归档段压缩仍属未完成边界。二期已落地 `ApproveMode::Bus`、SA 判定含证据核对、bus 停车补投与自动重连、journal 快照/截断与在线投影、多任务 task 命名空间、openai-responses wire、worker 池、预算按 token 结算的价格表、journal 轮转的默认策略、按类型核对的证据与 stage 要求表、审批请求的 at-least-once 投递与按 req 幂等、验证 FAIL 回跳写者、bash `output_path` 交出可核对的 test_log。2026-11-05 最后一次真实联跑四关一次通过，QA 切到 GLM 的 OpenAI 兼容表面后报账为 `0.1806 cny, of which 0.0000 nominal`（§9.45、smoke-report §33）。2026-11-10 新增实现已通过 fmt / clippy / test 三道源码闸门，尚未做三期真端点联跑。上面那行数字由 `tests/discipline.rs` 与源码树对照校验。
+Status: M0-M4 complete + 二期主体落地。三期于 2026-11-10 开工：worker 池的并发执行护栏同时提供每 task 的 `--max-parallel-tools`（缺省 4）和 worker 全局的 `--max-worker-tools`（缺省 8），任一为 `0` 时显式关闭对应上限；两级限制都不改变源序回写、串行工具写锁和取消语义（design §9.46 / §9.48）。journal 的已封闭段可移入 `<journal>.segments/`，`replay_all()` 同时读取两处，移动而非删除历史（§9.47）；`journal-archive --keep/--dry-run` 与 `journal-status --json/--check/--list/--approvals` 把归档的预览、执行、库存与审批链都变成可查项。`serve --status-file` 原子发布活动 task、未决审批与各级上限（§9.52），`serve --max-rss-mb` 给整个 worker 一条内存**软**上限：peak RSS 越线后进入 drain，新 task 被显式拒绝、在跑的跑完（§9.53）。名义成本分类已细到 `peer × reason`（§9.49），判定 issue 已改为自带 `Artifact | Turn` 归因的类型（§9.50）。剩下的未完成边界：单个 task 的内存回收与强制 kill 式硬上限、归档段压缩、跨回合审批槽位、三期真端点联跑。二期已落地 `ApproveMode::Bus`、SA 判定含证据核对、bus 停车补投与自动重连、journal 快照/截断与在线投影、多任务 task 命名空间、openai-responses wire、worker 池、预算按 token 结算的价格表、journal 轮转的默认策略、按类型核对的证据与 stage 要求表、审批请求的 at-least-once 投递与按 req 幂等、验证 FAIL 回跳写者、bash `output_path` 交出可核对的 test_log。2026-11-05 最后一次真实联跑四关一次通过，QA 切到 GLM 的 OpenAI 兼容表面后报账为 `0.1806 cny, of which 0.0000 nominal`（§9.45、smoke-report §33）。2026-11-10 的三期改动都过了 fmt / clippy `-D warnings` / test 三道人工闸门，尚未做真端点联跑。上面那行数字由 `tests/discipline.rs` 与源码树对照校验。
 
 ## Quick start
 
@@ -215,8 +214,14 @@ t2:harness-rd --journal t2.jsonl` 告诉 SA 打哪一对 worker；task id 会盖
 压缩时序的地基，并行靠加引擎而不是放宽槽位。
 
 `serve --status-file /path/worker.json --status-interval-secs 5` 会周期性原子写入运行状态：
-session、role、排序后的活动 task、未决审批数、两级工具上限和 Unix 时间戳。状态写入失败只 warn，
-不会拖垮 worker；状态文件是观测，不是调度真相源。
+session、role、排序后的活动 task、未决审批数、各级上限、`peak_rss_bytes` / `draining` 和
+Unix 时间戳。状态写入失败只 warn，不会拖垮 worker；状态文件是观测，不是调度真相源。
+
+`serve --max-rss-mb N`（缺省 `0` = 不设限）给整个 worker 一条内存**软**上限：每次派铃前读
+一次 `getrusage` 的 peak RSS（`ru_maxrss`，macOS 字节 / Linux KB，换算在库里做），越线就进入
+drain——新 task 照旧被显式拒绝成 error 铃，已经起好的引擎继续跑完。这里刻意不用 `setrlimit`
+之类的硬上限：那会把一次超限变成别人工具调用里随机的分配失败，而 drain 至少说得出「这颗铃
+为什么没干成」。它是准入闸门，不是内存回收。
 
 ## Journal 截断
 

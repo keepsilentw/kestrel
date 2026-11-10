@@ -48,6 +48,9 @@ async fn harness_with(
     approver: Option<&str>,
     factory: EngineFactory,
     wires: Wires,
+    // Soft memory ceiling in bytes; 0 = no ceiling. The tests that do not care
+    // about it pass 0 rather than growing a second copy of this wiring.
+    rss_ceiling: u64,
 ) -> Harness {
     let dir = temp(tag);
     let socket = dir.join("bus.sock");
@@ -73,6 +76,7 @@ async fn harness_with(
         max_tasks,
         max_parallel_tools: kestrel::tools::DEFAULT_MAX_PARALLEL_TOOLS,
         max_worker_tools: kestrel::tools::DEFAULT_MAX_WORKER_TOOLS,
+        max_rss_bytes: rss_ceiling,
         approval_retry,
         status_file: None,
         status_interval: Duration::from_secs(5),
@@ -155,6 +159,7 @@ async fn harness(max_tasks: usize, tag: &str) -> Harness {
         None,
         factory,
         wires,
+        0,
     )
     .await
 }
@@ -330,6 +335,7 @@ async fn a_glued_annotation_is_cut_before_it_reaches_the_artifact() {
         None,
         factory,
         wires,
+        0,
     )
     .await;
     h.sa.notify("harness-rd", bell("shape", "dev", "implement"));
@@ -378,6 +384,7 @@ async fn an_unanswered_approval_request_is_resent_and_answered_once() {
         Some("harness-sa"),
         factory,
         wires,
+        0,
     )
     .await;
     h.sa.notify("harness-rd", bell("t1", "dev", "run the command"));
@@ -505,6 +512,7 @@ async fn an_expired_approval_is_never_booked_as_applied() {
         Some("harness-sa"),
         factory,
         wires,
+        0,
     )
     .await;
     h.sa.notify("harness-rd", bell("t1", "dev", "run it, nobody answers"));
@@ -565,6 +573,45 @@ async fn an_expired_approval_is_never_booked_as_applied() {
         artifact["result"], "DONE: turn finished after the approval window",
         "deny 要以错误结果回到模型手里并让它收尾: {}",
         artifact["result"]
+    );
+    h.pool.abort();
+}
+
+/// A crossed memory ceiling refuses the bell out loud and never builds the
+/// engine: the SA sees an error bell, not a lost one, and can decide what to do
+/// with the task instead of guessing.
+#[tokio::test]
+async fn the_rss_ceiling_refuses_a_new_task_without_building_an_engine() {
+    let (factory, wires) = answer_factory();
+    let h = harness_with(
+        "rss-drain",
+        4,
+        Duration::from_millis(40),
+        None,
+        factory,
+        wires,
+        1,
+    )
+    .await;
+    h.sa.notify("harness-rd", bell("t1", "dev", "build the lru"));
+
+    let refused = tokio::time::timeout(Duration::from_secs(5), h.sa.recv_notify())
+        .await
+        .expect("no refusal bell")
+        .unwrap();
+    assert_eq!(refused.payload["task_id"], "t1");
+    let reason = refused.payload["error"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("draining"),
+        "the refusal says why: {reason}"
+    );
+    assert!(
+        refused.payload.get("result_ref").is_none(),
+        "a refusal is not a result"
+    );
+    assert!(
+        h.wires.lock().unwrap().is_empty(),
+        "the ceiling must be checked before an engine is built"
     );
     h.pool.abort();
 }

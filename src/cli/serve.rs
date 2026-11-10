@@ -55,6 +55,10 @@ pub struct ServeArgs {
     /// How many tools all tasks in this worker may execute concurrently.
     /// 0 means no worker-wide ceiling.
     pub max_worker_tools: usize,
+    /// Soft memory ceiling in megabytes for the whole worker process. Once the
+    /// peak resident size reaches it the worker drains: new tasks are refused
+    /// with a visible error bell, running tasks finish. 0 = no ceiling.
+    pub max_rss_mb: u64,
     /// Optional machine-readable worker status path.
     pub status_file: Option<PathBuf>,
     pub status_interval: Duration,
@@ -111,6 +115,7 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         max_tasks: args.max_tasks,
         max_parallel_tools: args.max_parallel_tools,
         max_worker_tools: args.max_worker_tools,
+        max_rss_bytes: args.max_rss_mb.saturating_mul(1024 * 1024),
         // 审批请求的重发节奏跟着这个 worker 的审批窗口走（runtime > role，
         // 与 approve 模式同一份来源，不在这里再读一次 role）
         approval_retry: approve.approval_retry_period(),

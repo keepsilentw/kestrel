@@ -7,8 +7,8 @@
 
 ## 1. 自动化测试基线（cargo test）
 
-**Metrics** — src 51 files / 18462 lines · tests 9 files / 3581 lines · 257 tests (lib 202 + bin 4 + integration 51)
-**Integration** — core_loop 5 / discipline 2 / m1_tools 11 / m2_session 6 / m4_bus 15 / m5_pool 6 / sandbox_e2e 4 / wire_anthropic 2
+**Metrics** — src 51 files / 18578 lines · tests 9 files / 3628 lines · 260 tests (lib 204 + bin 4 + integration 52)
+**Integration** — core_loop 5 / discipline 2 / m1_tools 11 / m2_session 6 / m4_bus 15 / m5_pool 7 / sandbox_e2e 4 / wire_anthropic 2
 
 | 组 | 覆盖 |
 |---|---|
@@ -1041,3 +1041,21 @@ receipt、pending、unacked、applied、stale 与 orphan 数量。重复回执�
 
 测试 `worker_status_document_is_atomic_and_reports_router_state` 验证活动 task 排序、审批数、
 上限、落盘 JSON 与临时文件不残留。该状态只提供可见性，不改变 task 永不退休的现有边界。
+
+## 42. 2026-11-10 三期第八格：worker 的内存软上限
+
+`serve --max-rss-mb N`（缺省 0 = 不设限）。每次派铃前读一次 `getrusage` 的 peak RSS，
+越线后 worker 进入 drain：新 task 被显式拒绝成 error 铃，已经起的引擎继续跑到完成。
+单位换算（macOS 字节 / Linux KB）放在库里，状态文件新增 `draining` / `peak_rss_bytes` /
+`max_rss_bytes`。
+
+三条新测试：
+
+- `peak_rss_reports_a_plausible_high_water_mark`：读数非零且落在合理区间，挡单位错配；
+- `drain_mode_refuses_new_tasks_and_keeps_running_ones`：drain 只拒新 task，已知 task 仍投递，
+  且第一个理由胜出（重复检查不改写历史）；
+- `the_rss_ceiling_refuses_a_new_task_without_building_an_engine`：真总线上拒绝带 `draining`
+  字样、不带 `result_ref`，并且引擎工厂一次都没被调用。
+
+**验证边界**：这是准入闸门，不是内存回收——不杀引擎、不释放已占内存，也不区分是哪个 task
+吃掉的。`harness/run-demo.sh` 没传这个 flag（缺省不设限），真端点联跑未重跑。

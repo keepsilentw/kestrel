@@ -129,6 +129,12 @@ struct ServeCmd {
     #[arg(long, default_value_t = kestrel::tools::DEFAULT_MAX_WORKER_TOOLS)]
     max_worker_tools: usize,
 
+    /// Soft memory ceiling for the whole worker, in megabytes. Crossing it puts
+    /// the worker into drain mode: new tasks are refused out loud, running ones
+    /// finish. 0 = no ceiling.
+    #[arg(long, default_value_t = 0)]
+    max_rss_mb: u64,
+
     /// Atomically write a machine-readable worker status document.
     #[arg(long)]
     status_file: Option<PathBuf>,
@@ -449,6 +455,7 @@ async fn main() -> anyhow::Result<()> {
                 max_tasks: s.max_tasks,
                 max_parallel_tools: s.max_parallel_tools,
                 max_worker_tools: s.max_worker_tools,
+                max_rss_mb: s.max_rss_mb,
                 status_file: s.status_file,
                 status_interval: Duration::from_secs(s.status_interval_secs),
                 approve: approve.map(|mode| with_role_deadline(mode, Some(&role))),
