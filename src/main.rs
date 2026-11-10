@@ -286,6 +286,10 @@ struct JournalStatusCmd {
     /// included in this mode.
     #[arg(long)]
     json: bool,
+
+    /// Exit non-zero when duplicate segment ranges or staged residue are found.
+    #[arg(long)]
+    check: bool,
 }
 
 #[tokio::main]
@@ -348,6 +352,13 @@ async fn main() -> anyhow::Result<()> {
             let status = journal.status();
             if s.json {
                 println!("{}", serde_json::to_string_pretty(&status)?);
+                if s.check && !status.is_healthy() {
+                    anyhow::bail!(
+                        "journal status is unhealthy: {} duplicate range(s), {} staged residue file(s)",
+                        status.duplicate_segments,
+                        status.staged_files
+                    );
+                }
                 return Ok(());
             }
             println!(
@@ -361,9 +372,13 @@ async fn main() -> anyhow::Result<()> {
                 status.root_segments + status.archived_segments,
                 status.total_segment_bytes
             );
+            println!(
+                "integrity: {} duplicate range(s)",
+                status.duplicate_segments
+            );
             println!("staged residue: {} file(s)", status.staged_files);
             if s.list {
-                for segment in status.segments {
+                for segment in &status.segments {
                     println!(
                         "{} seg{}-{} / {} byte(s) / {}",
                         if segment.archived { "archived" } else { "root" },
@@ -373,6 +388,13 @@ async fn main() -> anyhow::Result<()> {
                         segment.path.display()
                     );
                 }
+            }
+            if s.check && !status.is_healthy() {
+                anyhow::bail!(
+                    "journal status is unhealthy: {} duplicate range(s), {} staged residue file(s)",
+                    status.duplicate_segments,
+                    status.staged_files
+                );
             }
             return Ok(());
         }

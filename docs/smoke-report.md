@@ -7,7 +7,7 @@
 
 ## 1. 自动化测试基线（cargo test）
 
-**Metrics** — src 51 files / 18140 lines · tests 9 files / 3577 lines · 255 tests (lib 200 + bin 4 + integration 51)
+**Metrics** — src 51 files / 18194 lines · tests 9 files / 3577 lines · 255 tests (lib 200 + bin 4 + integration 51)
 **Integration** — core_loop 5 / discipline 2 / m1_tools 11 / m2_session 6 / m4_bus 15 / m5_pool 6 / sandbox_e2e 4 / wire_anthropic 2
 
 | 组 | 覆盖 |
@@ -971,6 +971,8 @@ execute 阶段，不改变逐条 prepare、审批顺序、`RwLock` 的串行工�
   `journal_status_counts_live_segments_archive_and_staged_residue` 验证移动前后计数。
 - `journal-status --json` 输出机器可读明细；`journal-archive --dry-run` 与实际移动复用
   `archive_plan()`，预览中的源、目标、字节数和冲突与真实执行一致，且预览不落任何 rename。
+- `journal-status --check` 将重复区间或 `.new` 残留视为不健康并返回非零；测试构造同区间
+  根/归档副本和 staged 文件，验证 `duplicate_segments`、健康状态及清理后的恢复。
 
 **闸门**：新增并发护栏与归档实现已通过 `cargo fmt --check`、
 `cargo clippy --all-targets -- -D warnings`、`cargo test`；完整真端点联跑仍未执行。

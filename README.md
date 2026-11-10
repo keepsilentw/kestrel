@@ -2,7 +2,7 @@
 
 为星型多 Agent harness 写的 Rust harness kernel：引擎 + wire 层 + 工具/权限/沙箱 + 会话 + 总线/journal + CLI/配置。设计文档（中文）见本仓库 `docs/design.md`。
 
-**Metrics** — src 51 files / 18140 lines · tests 9 files / 3577 lines · 255 tests (lib 200 + bin 4 + integration 51)
+**Metrics** — src 51 files / 18194 lines · tests 9 files / 3577 lines · 255 tests (lib 200 + bin 4 + integration 51)
 
 Status: M0-M4 complete + 二期开工（`ApproveMode::Bus`、SA 判定含证据核对、bus 停车补投与自动重连、journal 快照/截断与在线投影、多任务 task 命名空间、openai-responses wire、worker 池、预算按 token 结算的价格表、journal 轮转的默认策略、按类型核对的证据与 stage 要求表、审批请求的 at-least-once 投递与按 req 幂等、验证 FAIL 回跳写者、bash `output_path` 交出可核对的 test_log）——这批改动 2026-11-04 走完真端点联跑（`pipeline complete`；那两轮联跑抓出并修掉三个「测试全绿但跑不起来」的缺陷，见 docs/design.md §9.32 / §9.33）。2026-11-05 又跑七次联跑：第二次四关一次过，抓出报账的两处「说不清」——没有费率的运行把 token 印成 `0 / 0`、同一颗审批请求的两张矛盾回执先到先得（§9.42，两处都已修）；第三次带一份测试费率表（`--prices`），§9.27 的两段式结算与 §9.36 的「读数不可信」分支第一次同时在真端点落地；第四次换成**真实费率**（官方页当天读数 + USD/CNY 换算 + `context_window`/`max_out` 收成官方 1M/384K 与 1M/128K，写进用户层 `providers.toml`，见 §9.43），报账只剩一个名义来源：`0.0732 usd, of which 0.0667 nominal (under-reported 0.0667)`——`no rate` 归零；第五次故意只给 RD 填价，把「没有结算」那条分支走回现场，用量列在没有 `budget_settled` 的情况下仍然印出 `tokens in 0 / out 8503`（§9.42② 的实证，见 smoke-report §30）；第六次把第四次那套换算整段拿掉——**直接记厂商原文的人民币**，钱的单位由 provider 的 `currency` 声明而不是写在 flag 与字段名里（§9.44；SA 后端同日从百炼 Token Plan 换成小米 MiMo，`-p` 单发两轮实测通过、官方 元 价也查到并记进配置，见 §9.44⑥⑧ 与 smoke-report §32），`ledger total: 3.5153 cny, of which 3.4752 nominal (under-reported 3.4752)`；第七次把 QA 换到 GLM 的 **OpenAI 兼容表面**，input usage 回来了，名义值第一次整段清零：`0.1806 cny, of which 0.0000 nominal`（§9.45、smoke-report §33；顺带修掉「空账印成 `-0.0000`」）。fmt / clippy `-D warnings` / test 三闸门全绿（人工执行：本仓库不挂 CI）。上面那行数字由 `tests/discipline.rs` 与源码树对照校验：改完代码不更新它，闸门就红。
 Status: M0-M4 complete + 二期主体落地。三期于 2026-11-10 开工：worker 池的并发执行护栏同时提供每 task 的 `--max-parallel-tools`（缺省 4）和 worker 全局的 `--max-worker-tools`（缺省 8），任一为 `0` 时显式关闭对应上限；两级限制都不改变源序回写、串行工具写锁和取消语义（design §9.46 / §9.48）。journal 的已封闭段可移入 `<journal>.segments/`，`replay_all()` 同时读取两处，移动而非删除历史（§9.47）。名义成本分类已细到 `peer × reason`，报账的逐 peer 行能直接指出谁没价、谁读数不可信（§9.49）。判定 issue 已改为自带 `Artifact | Turn` 归因的类型，新增问题类别不能再忘记标边（§9.50）。内存 RSS 硬上限和归档段压缩仍属未完成边界。二期已落地 `ApproveMode::Bus`、SA 判定含证据核对、bus 停车补投与自动重连、journal 快照/截断与在线投影、多任务 task 命名空间、openai-responses wire、worker 池、预算按 token 结算的价格表、journal 轮转的默认策略、按类型核对的证据与 stage 要求表、审批请求的 at-least-once 投递与按 req 幂等、验证 FAIL 回跳写者、bash `output_path` 交出可核对的 test_log。2026-11-05 最后一次真实联跑四关一次通过，QA 切到 GLM 的 OpenAI 兼容表面后报账为 `0.1806 cny, of which 0.0000 nominal`（§9.45、smoke-report §33）。2026-11-10 新增实现已通过 fmt / clippy / test 三道源码闸门，尚未做三期真端点联跑。上面那行数字由 `tests/discipline.rs` 与源码树对照校验。
@@ -260,6 +260,7 @@ cargo run -- journal-status --journal journal.jsonl --list
 
 默认输出活文件记录数/字节数、根目录与归档段数量、段总字节和残留 `.new` 文件数；
 `--list` 再逐段列出区间、位置和大小；`--json` 输出包含段明细的稳定 JSON 文档，便于监控脚本消费。
+`--check` 在发现重复区间或 `.new` 残留时以非零状态退出，可直接用于健康检查。
 
 ## Module map
 

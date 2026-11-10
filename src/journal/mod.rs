@@ -57,9 +57,19 @@ pub struct JournalStatus {
     pub live_bytes: u64,
     pub root_segments: usize,
     pub archived_segments: usize,
+    pub duplicate_segments: usize,
     pub total_segment_bytes: u64,
     pub staged_files: usize,
     pub segments: Vec<SegmentStatus>,
+}
+
+impl JournalStatus {
+    /// Operational health: replay can resolve duplicate ranges deterministically,
+    /// but a duplicate or staged residue means a previous archive/rotation needs
+    /// inspection. It is not "healthy enough to ignore".
+    pub fn is_healthy(&self) -> bool {
+        self.duplicate_segments == 0 && self.staged_files == 0
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -162,7 +172,7 @@ impl Journal {
     /// projection is rebuilt. File sizes come from metadata.
     pub fn status(&self) -> JournalStatus {
         let mut segments = Vec::new();
-        let (root_segments, archived_segments) = match (
+        let (root_segments, archived_segments, duplicate_segments) = match (
             self.path.parent(),
             self.path.file_stem().and_then(|s| s.to_str()),
         ) {
@@ -175,6 +185,12 @@ impl Journal {
                     .unwrap_or_default();
                 let root_len = root.len();
                 let archive_len = archived.len();
+                let root_ranges: std::collections::BTreeSet<(u64, u64)> =
+                    root.iter().map(|(from, to, _)| (*from, *to)).collect();
+                let duplicates = archived
+                    .iter()
+                    .filter(|(from, to, _)| root_ranges.contains(&(*from, *to)))
+                    .count();
                 for (from, to, path) in &root {
                     segments.push(SegmentStatus {
                         from: *from,
@@ -193,15 +209,16 @@ impl Journal {
                         path,
                     });
                 }
-                (root_len, archive_len)
+                (root_len, archive_len, duplicates)
             }
-            _ => (0, 0),
+            _ => (0, 0, 0),
         };
         JournalStatus {
             live_records: self.live_records(),
             live_bytes: self.file_bytes(),
             root_segments,
             archived_segments,
+            duplicate_segments,
             total_segment_bytes: segments.iter().map(|segment| segment.bytes).sum(),
             staged_files: staged_files(self.path.parent()),
             segments,
@@ -871,6 +888,21 @@ mod tests {
         assert_eq!(archived.segments.len(), 1);
         assert!(archived.segments[0].archived);
         assert_eq!(archived.total_segment_bytes, root.total_segment_bytes);
+        assert!(!archived.is_healthy());
+        let archived_path = archived.segments[0].path.clone();
+        let duplicate_path = dir.join(archived_path.file_name().unwrap());
+        std::fs::copy(&archived_path, &duplicate_path).unwrap();
+        let duplicate = journal.status();
+        assert_eq!(duplicate.root_segments, 1);
+        assert_eq!(duplicate.archived_segments, 1);
+        assert_eq!(duplicate.duplicate_segments, 1);
+        assert!(!duplicate.is_healthy());
+        std::fs::remove_file(duplicate_path).unwrap();
+        std::fs::remove_file(dir.join("journal.seg0-0.jsonl.new")).unwrap();
+        let healthy = journal.status();
+        assert_eq!(healthy.duplicate_segments, 0);
+        assert_eq!(healthy.staged_files, 0);
+        assert!(healthy.is_healthy());
         std::fs::remove_dir_all(&dir).ok();
     }
 
