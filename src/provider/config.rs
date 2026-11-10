@@ -342,16 +342,20 @@ output = 0.0
             "fallback"
         );
         // cmd + memoize (single execution)
-        let count_file = "/tmp/kestrel-cmd-count";
-        std::fs::write(count_file, "0").unwrap();
-        let counting = "!printf x >>/tmp/kestrel-cmd-count; printf cmd-key";
-        let r1 = resolver.resolve(counting).unwrap();
-        let r2 = resolver.resolve(counting).unwrap();
+        // The counter lives under `env::temp_dir()` (which the sandbox may mount
+        // read-only for `/tmp`, and which `TMPDIR` redirects) and carries the
+        // pid, so concurrent runners cannot step on each other's file.
+        let count_file =
+            std::env::temp_dir().join(format!("kestrel-cmd-count-{}-resolve", std::process::id()));
+        let counting = format!("!printf x >>{}; printf cmd-key", count_file.display());
+        std::fs::write(&count_file, "0").unwrap();
+        let r1 = resolver.resolve(&counting).unwrap();
+        let r2 = resolver.resolve(&counting).unwrap();
         assert_eq!(r1, "cmd-key");
         assert_eq!(r2, "cmd-key");
-        let counter = std::fs::read_to_string(count_file).unwrap();
+        let counter = std::fs::read_to_string(&count_file).unwrap();
         assert_eq!(counter, "0x", "cmd executed exactly once (memoized)");
-        std::fs::remove_file(count_file).ok();
+        std::fs::remove_file(&count_file).ok();
     }
 
     #[test]

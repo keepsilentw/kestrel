@@ -7,7 +7,7 @@ use std::time::Duration;
 use clap::{ArgAction, Args, Parser, Subcommand};
 use kestrel::cli::run::{RunArgs, run_once};
 use kestrel::config::RoleConfig;
-use kestrel::journal::Journal;
+use kestrel::journal::{Journal, JournalStatus};
 use kestrel::provider::config::{KeyResolver, Registry};
 use kestrel::provider::wire::{ModelMeta, WireId};
 
@@ -290,6 +290,12 @@ struct JournalArchiveCmd {
     /// Print the exact moves and collisions without renaming anything.
     #[arg(long)]
     dry_run: bool,
+
+    /// Before moving, quarantine the non-authoritative copy of any duplicated
+    /// segment range into `<journal-stem>.segments/duplicates/`. Nothing is
+    /// deleted; without this a duplicated range blocks the move by design.
+    #[arg(long)]
+    resolve_duplicates: bool,
 }
 
 #[derive(Args, Debug)]
@@ -339,6 +345,13 @@ async fn main() -> anyhow::Result<()> {
             let journal = Journal::open(&path)?;
             if a.dry_run {
                 let plan = journal.archive_plan(a.keep)?;
+                let duplicates = journal.status().duplicate_segments;
+                if a.resolve_duplicates {
+                    println!(
+                        "journal archive dry-run: {duplicates} duplicate copy/copies would \
+                         be quarantined first"
+                    );
+                }
                 println!("journal archive dry-run: {} planned move(s)", plan.len());
                 for item in plan {
                     println!(
@@ -361,7 +374,7 @@ async fn main() -> anyhow::Result<()> {
                 }
                 return Ok(());
             }
-            let moved = journal.archive_segments(a.keep)?;
+            let moved = journal.archive_segments(a.keep, a.resolve_duplicates)?;
             match journal.segment_archive_dir() {
                 Some(dir) => println!(
                     "journal archive: moved {moved} sealed segment(s) into {}",
@@ -381,11 +394,7 @@ async fn main() -> anyhow::Result<()> {
             if s.json {
                 println!("{}", serde_json::to_string_pretty(&status)?);
                 if s.check && !status.is_healthy() {
-                    anyhow::bail!(
-                        "journal status is unhealthy: {} duplicate range(s), {} staged residue file(s)",
-                        status.duplicate_segments,
-                        status.staged_files
-                    );
+                    anyhow::bail!("{}", unhealthy_report(&status));
                 }
                 return Ok(());
             }
@@ -404,6 +413,16 @@ async fn main() -> anyhow::Result<()> {
                 "integrity: {} duplicate range(s)",
                 status.duplicate_segments
             );
+            if status.coverage_gaps.is_empty() {
+                println!("coverage chain: complete");
+            } else {
+                for gap in &status.coverage_gaps {
+                    println!(
+                        "coverage chain: records {}..{} are covered by no segment",
+                        gap.expected_from, gap.found_from
+                    );
+                }
+            }
             println!("staged residue: {} file(s)", status.staged_files);
             if let Some(approvals) = &status.approvals {
                 println!(
@@ -432,11 +451,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             if s.check && !status.is_healthy() {
-                anyhow::bail!(
-                    "journal status is unhealthy: {} duplicate range(s), {} staged residue file(s)",
-                    status.duplicate_segments,
-                    status.staged_files
-                );
+                anyhow::bail!("{}", unhealthy_report(&status));
             }
             return Ok(());
         }
@@ -543,6 +558,20 @@ async fn main() -> anyhow::Result<()> {
     })
     .await?;
     std::process::exit(code);
+}
+
+/// The one sentence `journal-status --check` refuses with. `--json` and the
+/// human report call the same helper, because coverage gaps joined
+/// `is_healthy()` on one branch only and `--check` went on refusing while
+/// blaming duplicates and residue — a message that contradicted its own verdict.
+fn unhealthy_report(status: &JournalStatus) -> String {
+    format!(
+        "journal status is unhealthy: {} duplicate range(s), {} coverage gap(s), {} staged \
+         residue file(s)",
+        status.duplicate_segments,
+        status.coverage_gaps.len(),
+        status.staged_files
+    )
 }
 
 /// `--approve none|all|bus` — how an Ask-class tool call gets answered:
@@ -655,10 +684,36 @@ fn resolve_key(spec: &str) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, parse_approve, with_role_deadline};
+    use super::{Cli, JournalStatus, parse_approve, unhealthy_report, with_role_deadline};
     use clap::Parser;
     use kestrel::config::RoleConfig;
+    use kestrel::journal::CoverageGap;
     use kestrel::tools::ApproveMode;
+
+    /// `--check` must name every signal that made the journal unhealthy — the
+    /// same sentence in both output modes.
+    #[test]
+    fn check_message_names_the_coverage_gap() {
+        let status = JournalStatus {
+            live_records: 0,
+            live_bytes: 0,
+            root_segments: 1,
+            archived_segments: 0,
+            duplicate_segments: 0,
+            total_segment_bytes: 0,
+            staged_files: 0,
+            coverage_gaps: vec![CoverageGap {
+                expected_from: 0,
+                found_from: 5,
+            }],
+            segments: vec![],
+            approvals: None,
+        };
+        assert!(!status.is_healthy(), "a hole in the chain is not healthy");
+        let text = unhealthy_report(&status);
+        assert!(text.contains("1 coverage gap(s)"), "{text}");
+        assert!(text.contains("0 duplicate range(s)"), "{text}");
+    }
 
     #[test]
     fn tools_flag_is_opt_in_and_still_switchable_off() {

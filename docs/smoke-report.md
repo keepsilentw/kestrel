@@ -7,7 +7,7 @@
 
 ## 1. 自动化测试基线（cargo test）
 
-**Metrics** — src 51 files / 18783 lines · tests 9 files / 3704 lines · 263 tests (lib 206 + bin 4 + integration 53)
+**Metrics** — src 51 files / 19097 lines · tests 9 files / 3704 lines · 267 tests (lib 209 + bin 5 + integration 53)
 **Integration** — core_loop 5 / discipline 2 / m1_tools 11 / m2_session 6 / m4_bus 15 / m5_pool 8 / sandbox_e2e 4 / wire_anthropic 2
 
 | 组 | 覆盖 |
@@ -1092,3 +1092,54 @@ task 发信的人，而 mpsc 先把已排队的门铃送达才返回 `None`，�
 **闸门**：`cargo fmt --check` / `cargo clippy --all-targets -- -D warnings` / `cargo test`
 本轮实跑全绿（263 项）。退休只看空闲，不看「pipeline 是否真结束」——SA 崩溃留下的 task
 一样会被回收；它也不回收正在跑的引擎的内存。
+
+## 45. 2026-11-10 三期第十一格：归档链完整性与重复段出口
+
+`journal-status` 新增 `coverage_gaps`：以 replay 真正读取的权威段集合为链，要求首段从
+记录 0 开始、后段起点等于前段终点，断口逐条打印并计入 `is_healthy()` / `--check`。
+少一段比多一段危险——`replay_all()` 对缺段不报错，只是静默少读。
+
+`journal-archive --resolve-duplicates` 先把非权威孪生副本移入
+`<stem>.segments/duplicates/`（不删除、不覆盖，冲突在动手前整体拒绝），再执行照常移动。
+不带这个 flag 时仍然拒绝覆盖，只是错误信息会指出下一步。
+
+两条新测试：`journal_status_flags_a_hole_in_the_coverage_chain`、
+`quarantining_a_duplicate_keeps_the_authoritative_copy_and_the_bytes`。第一条最初把归档
+记录数硬编码成 6，被实际值 7 打红——那不是我想要的关系，改成只断言「链从 0 开始」。
+
+**边界**：链检查不比对活文件检查点的 `covers`（要解析记录，而默认 status 只读 metadata）。
+
+**顺带修的一处环境依赖**：`provider::config::tests::key_sources_resolve` 原先把 memoize 计数器
+写在硬编码的 `/tmp/kestrel-cmd-count`，本轮在 `/tmp` 只读的沙箱里以 `EPERM` 打红（207 passed /
+1 failed）。断言没错，错在它假设了写路径——已改为 `env::temp_dir()` + pid 命名，计数器仍必须
+是 `0x`（cmd 只执行一次）。
+
+**闸门**：`cargo fmt --check` 通过；`cargo clippy --all-targets -- -D warnings` 通过；
+两条新测试都做过变异验证——把 `chain_gaps` 改成恒返回空、把 quarantine 调用换成空操作，各自打红
+对应的那一条，改回即绿。
+`cargo test` 在沙箱外全绿 267 tests（lib 209 + bin 5 + integration 53）。沙箱内跑同一轮会是
+258 passed / 9 failed——全部是 `m4_bus` 的 UDS `bind`（`EPERM`），与本轮改动无关，符合 §1 那条
+已记录的环境限制；本轮实测复核过：沙箱内失败、沙箱外同一条通过。`**Metrics**` 行被拦红两次
+（src 19021→19025→19097）并回写三处文档。
+
+**CLI 实跑（不是只有单元测试）**：拿 `target/debug/kestrel` 在 `~/tmp` 造了两组假段文件跑
+`journal-status` / `journal-archive`。第一组当场打出一个 fail-open——见下条；第二组走完整流程：
+重复区间 1 → `--resolve-duplicates --keep 1` → 孪生副本落在 `journal.segments/duplicates/`（字节
+还在盘上）、`integrity: 0 duplicate range(s)`、`coverage chain: complete`、`--check` 退出码 0。
+
+**实跑抓出的两个缺陷（已修）**：
+① `--journal journal.jsonl`（不带目录名）时 `Path::parent()` 是**空路径**而不是 `None`，
+   `read_dir("")` 失败被段扫描吞成「盘上没有段」——`journal-status` 对明确有段的账本报
+   `sealed: 0 in root` / `coverage chain: complete`，`--check` 退出码 0，`journal-archive` 报
+   「无事可移」。这是健康检查上的 fail-open，比崩掉更坏。修法是 `journal_dir()` 把空 parent
+   归一化成 `.`，六处取目录的地方统一走它；新增测试
+   `a_bare_file_name_resolves_to_the_current_directory` 钉住归一化本身（改相对路径要动进程
+   cwd，并行测试里不安全，所以断的是纯函数，端到端那一层由上面的 CLI 实跑覆盖）。
+   修完同一条命令报出 `sealed: 2 in root, 1 archived` / `1 duplicate range(s)`，实跑复核过。
+② `--check` 的拒绝语在 `--json` 与人读两条分支里各写了一遍，本轮只改了 `--json` 那遍——
+   结果 `is_healthy()` 已把断口算进去，人读的输出还在只怪「重复区间 + staged 残留」，
+   消息与它解释的结论自相矛盾。收成 `unhealthy_report()` 一处，新增 bin 测试
+   `check_message_names_the_coverage_gap`；实跑两条分支现在都输出
+   `1 coverage gap(s)`，退出码 1。
+
+**未跑**：三期真端点 demo 仍未实测（需要 provider 凭据）。

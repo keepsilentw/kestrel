@@ -26,7 +26,7 @@
 > 护栏接到 `harness/run-demo.sh` 的入口上（§9.54）、空闲 task 退休与会话树重开（§9.55）。
 > 代码部分都过了 fmt / clippy / test；
 > **真端点联跑未重跑**，demo 的接法只到语法与 flag 解析这一层。
-> **Metrics** — src 51 files / 18783 lines · tests 9 files / 3704 lines · 263 tests (lib 206 + bin 4 + integration 53)
+> **Metrics** — src 51 files / 19097 lines · tests 9 files / 3704 lines · 267 tests (lib 209 + bin 5 + integration 53)
 > **Integration** — core_loop 5 / discipline 2 / m1_tools 11 / m2_session 6 / m4_bus 15 / m5_pool 8 / sandbox_e2e 4 / wire_anthropic 2
 > 规模已过 plan 预算（10-13k）的上沿：多出来的部分几乎都花在「取消安全」与「对账」这两条纪律上。
 > 上面两行数字由 `tests/discipline.rs::metrics_lines_match_the_tree` 对照源码树重算校验——
@@ -483,6 +483,44 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
     ⑧ 边界：退休不看「这条 pipeline 是不是真结束了」，只看空闲——SA 崩溃留下的 task 一样会被
        回收，这是有意的（那正是 slot 泄漏的主要来源）。它也不动**正在跑**的引擎的内存，内存仍
        只有 §9.53 那道准入闸门。
+
+56. **三期第十一格：归档链完整性与重复段的出口（2026-11-10）**：
+    ① §9.47 的 `duplicate_segments` 说的是「多了一份」，而真正危险的是**少了一份**：
+       `replay_all()` 不报错，它只是把断掉的那段当成没发生过——审计账本静默变短。新增
+       `coverage_gaps`：以 replay 实际读取的权威集合（同区间根目录优先）为链，要求首段
+       `from == 0`、后段 `from == 前段 to`，断口报 `expected_from..found_from`。
+    ② `is_healthy()` 现在是三项合取：无重复区间、无 `.new` 残留、无链断口；`--check` 随之
+       返回非零，人类输出逐条打印断口。
+    ③ 重复区间的出口是 `journal-archive --resolve-duplicates`：先把**非权威**那份（§9.47③
+       定的是根目录优先，所以归档目录里的孪生副本才是没人读的那一份）移进
+       `<stem>.segments/duplicates/`，再执行照常的移动。仍然不删任何字节；隔离目录里已有同名
+       文件就在动手之前整体拒绝。子目录不在 `segment_files` 的扫描范围内，所以隔离之后重复数
+       归零、链依旧完整——这不是「换个地方继续报错」，状态确实变干净了。
+    ④ 默认行为没退让：不带 `--resolve-duplicates` 时依旧拒绝覆盖，只是错误信息现在会说出
+       下一步该跑什么（拒绝要看得见，也要可行动）。
+    ⑤ 边界：链检查只看段与段之间，不比对活文件检查点里的 `covers`——那要解析记录，而默认
+       `status` 承诺只读 metadata。所以「尾部少一段」能查（起点或衔接对不上），「最后一段与
+       检查点不一致」这类只在记录层才看得出的偏差暂不在范围内。
+    ⑥ 测试 `journal_status_flags_a_hole_in_the_coverage_chain` 用改名制造断口，
+       `quarantining_a_duplicate_keeps_the_authoritative_copy_and_the_bytes` 覆盖
+       「默认拒绝 → resolve 后权威副本仍在、孪生副本进了隔离目录、`replay_all` 的状态与
+       在途铃一字不变」。第一条的第一版把「seed 两个派发归档 6 条记录」写进了断言，被自己的
+       `seed()` 语义（3 条/派发 + 回铃 = 7）打脸；改成只断「链从 0 开始」这条真正要用的不变式。
+   ⑦ 顺带补掉一处环境依赖的测试：`provider::config::tests::key_sources_resolve` 把
+      memoize 计数器写在硬编码的 `/tmp/kestrel-cmd-count`，在 `/tmp` 被挂成只读的沙箱里
+      以 `EPERM` 失败（同一条测试在别的机器上是绿的——这正是它危险的地方：断言本身没错，
+      错的是它假设了写路径）。改成 `env::temp_dir()` + pid 命名，与仓库其余临时文件同一条
+      规矩；断言语义不变（计数器内容仍必须是 `0x`，即 cmd 只跑过一次）。
+   ⑧ CLI 实跑打出的 fail-open（本条才是真正的收获，单元测试没覆盖到）：`--journal
+       journal.jsonl` 不带目录时 `Path::parent()` 返回**空路径**而非 `None`，`read_dir("")`
+       失败被扫描器当作「盘上没有段」。于是 `journal-status` 对一个明确有段的账本报
+       `sealed: 0 in root` + `coverage chain: complete`，`--check` 退出码 0，
+       `journal-archive` 报「无事可移」——健康检查在最常见的调用写法下静默说「没问题」。
+       修法是 `journal_dir()`：空 parent 归一化成 `.`，取目录的六处统一走它。链检查本身没错，
+       错在它的数据源被静默清空了——这也说明「加了检查项」与「检查项真的看得见东西」是两件事。
+   ⑨ `--check` 的拒绝语原先在 `--json` 与人读两条分支各写一遍，本轮只改了前一遍，人读那条
+       于是把「断口」漏在了消息里，与它自己要拒绝的结论矛盾。收成 `unhealthy_report()` 一处
+       （重复的句子是这类漏改的制造机）。
 
 ## 10 二期清单
 

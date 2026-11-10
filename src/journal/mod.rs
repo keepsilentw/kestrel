@@ -60,18 +60,31 @@ pub struct JournalStatus {
     pub duplicate_segments: usize,
     pub total_segment_bytes: u64,
     pub staged_files: usize,
+    /// Holes in the segment coverage chain: a range of archived records that no
+    /// segment file covers any more. `duplicate_segments` means a file was
+    /// copied; THIS means one went missing, which is the worse failure for an
+    /// audit ledger — replay still succeeds, it just silently reads less.
+    pub coverage_gaps: Vec<CoverageGap>,
     pub segments: Vec<SegmentStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approvals: Option<ApprovalStatus>,
 }
 
 impl JournalStatus {
-    /// Operational health: replay can resolve duplicate ranges deterministically,
-    /// but a duplicate or staged residue means a previous archive/rotation needs
-    /// inspection. It is not "healthy enough to ignore".
+    /// Operational health. Every item here is inspectable without deleting
+    /// anything: a duplicated range, a hole in the coverage chain, or a staged
+    /// `.new` left behind by an interrupted rotation.
     pub fn is_healthy(&self) -> bool {
-        self.duplicate_segments == 0 && self.staged_files == 0
+        self.duplicate_segments == 0 && self.staged_files == 0 && self.coverage_gaps.is_empty()
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CoverageGap {
+    /// First record the chain should have covered here.
+    pub expected_from: u64,
+    /// First record the next surviving segment actually starts at.
+    pub found_from: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -194,13 +207,13 @@ impl Journal {
     /// projection is rebuilt. File sizes come from metadata.
     pub fn status(&self) -> JournalStatus {
         let mut segments = Vec::new();
-        let (root_segments, archived_segments, duplicate_segments) = match (
-            self.path.parent(),
+        let (root_segments, archived_segments, duplicate_segments, coverage_gaps) = match (
+            journal_dir(&self.path),
             self.path.file_stem().and_then(|s| s.to_str()),
         ) {
             (Some(dir), Some(stem)) => {
                 let prefix = format!("{stem}.seg");
-                let root = segment_files(dir, &prefix);
+                let root = segment_files(&dir, &prefix);
                 let archived = self
                     .segment_archive_dir()
                     .map(|archive| segment_files(&archive, &prefix))
@@ -213,6 +226,9 @@ impl Journal {
                     .iter()
                     .filter(|(from, to, _)| root_ranges.contains(&(*from, *to)))
                     .count();
+                // The chain is checked against what replay ACTUALLY reads
+                // (root wins over the archive), not against the raw file list.
+                let gaps = chain_gaps(&self.authoritative_segments());
                 for (from, to, path) in &root {
                     segments.push(SegmentStatus {
                         from: *from,
@@ -231,9 +247,9 @@ impl Journal {
                         path,
                     });
                 }
-                (root_len, archive_len, duplicates)
+                (root_len, archive_len, duplicates, gaps)
             }
-            _ => (0, 0, 0),
+            _ => (0, 0, 0, Vec::new()),
         };
         JournalStatus {
             live_records: self.live_records(),
@@ -241,8 +257,9 @@ impl Journal {
             root_segments,
             archived_segments,
             duplicate_segments,
+            coverage_gaps,
             total_segment_bytes: segments.iter().map(|segment| segment.bytes).sum(),
-            staged_files: staged_files(self.path.parent()),
+            staged_files: staged_files(journal_dir(&self.path).as_deref()),
             segments,
             approvals: None,
         }
@@ -314,7 +331,16 @@ impl Journal {
     /// leaves the same range in both places, the live copy wins: it is the one a
     /// retried rotation most recently fsynced.
     fn segments(&self) -> Vec<PathBuf> {
-        let Some(dir) = self.path.parent() else {
+        self.authoritative_segments()
+            .into_iter()
+            .map(|(_, _, path)| path)
+            .collect()
+    }
+
+    /// The same set `replay_all` folds: one entry per covered range, root copy
+    /// winning over an archived duplicate of the same range.
+    fn authoritative_segments(&self) -> Vec<(u64, u64, PathBuf)> {
+        let Some(dir) = journal_dir(&self.path) else {
             return vec![];
         };
         let Some(stem) = self.path.file_stem().and_then(|s| s.to_str()) else {
@@ -322,7 +348,7 @@ impl Journal {
         };
         let prefix = format!("{stem}.seg");
         let mut found = BTreeMap::new();
-        for (from, to, path) in segment_files(dir, &prefix) {
+        for (from, to, path) in segment_files(&dir, &prefix) {
             found.insert((from, to), path);
         }
         if let Some(archive) = self.segment_archive_dir() {
@@ -330,14 +356,99 @@ impl Journal {
                 found.entry((from, to)).or_insert(path);
             }
         }
-        found.into_values().collect()
+        found
+            .into_iter()
+            .map(|((from, to), path)| (from, to, path))
+            .collect()
+    }
+
+    /// Where a non-authoritative duplicate is parked: moved, never deleted.
+    pub fn duplicate_quarantine_dir(&self) -> Option<PathBuf> {
+        Some(self.segment_archive_dir()?.join("duplicates"))
+    }
+
+    /// Quarantine the copies `replay_all` does NOT read. Root wins a duplicated
+    /// range (§9.47③), so the archived twin is the redundant one — but deleting
+    /// it would cross the "rotation is not deletion" line, so it moves into
+    /// `<stem>.segments/duplicates/` and the bytes stay on disk. An existing
+    /// quarantine entry is refused, never overwritten.
+    pub fn quarantine_duplicate_segments(&self) -> anyhow::Result<usize> {
+        let _file = self.file.lock().unwrap();
+        self.quarantine_duplicate_segments_locked()
+    }
+
+    fn quarantine_duplicate_segments_locked(&self) -> anyhow::Result<usize> {
+        let Some(dir) = journal_dir(&self.path) else {
+            anyhow::bail!("journal path has no parent directory");
+        };
+        let Some(stem) = self.path.file_stem().and_then(|s| s.to_str()) else {
+            anyhow::bail!("journal path has no usable file stem");
+        };
+        let prefix = format!("{stem}.seg");
+        let root_ranges: std::collections::BTreeSet<(u64, u64)> = segment_files(&dir, &prefix)
+            .into_iter()
+            .map(|(f, t, _)| (f, t))
+            .collect();
+        if root_ranges.is_empty() {
+            return Ok(0);
+        }
+        let archive = self
+            .segment_archive_dir()
+            .context("journal path has no archive directory")?;
+        let duplicates = segment_files(&archive, &prefix)
+            .into_iter()
+            .filter(|(from, to, _)| root_ranges.contains(&(*from, *to)))
+            .collect::<Vec<_>>();
+        if duplicates.is_empty() {
+            return Ok(0);
+        }
+        let quarantine = self
+            .duplicate_quarantine_dir()
+            .context("journal path has no quarantine directory")?;
+        let plan = duplicates
+            .iter()
+            .map(|(_, _, source)| {
+                let destination = quarantine.join(
+                    source
+                        .file_name()
+                        .expect("segment_files only returns named files"),
+                );
+                (source.clone(), destination)
+            })
+            .collect::<Vec<_>>();
+        for (source, destination) in &plan {
+            if destination.exists() {
+                anyhow::bail!(
+                    "refusing to overwrite quarantined segment {} while moving {}",
+                    destination.display(),
+                    source.display()
+                );
+            }
+        }
+        std::fs::create_dir_all(&quarantine)
+            .with_context(|| format!("create quarantine {}", quarantine.display()))?;
+        for (source, destination) in &plan {
+            std::fs::rename(source, destination).with_context(|| {
+                format!(
+                    "quarantine duplicate segment {} into {}",
+                    source.display(),
+                    quarantine.display()
+                )
+            })?;
+        }
+        for dir in [&archive, &quarantine] {
+            if let Ok(d) = File::open(dir) {
+                let _ = d.sync_all();
+            }
+        }
+        Ok(plan.len())
     }
 
     /// Where `archive_segments` parks sealed files. The directory is derived
     /// from the journal name, so `replay_all` finds it after a restart without
     /// another configuration source.
     pub fn segment_archive_dir(&self) -> Option<PathBuf> {
-        let dir = self.path.parent()?;
+        let dir = journal_dir(&self.path)?;
         let stem = self.path.file_stem()?.to_str()?;
         Some(dir.join(format!("{stem}.segments")))
     }
@@ -350,14 +461,14 @@ impl Journal {
     }
 
     fn archive_plan_locked(&self, keep_latest: usize) -> anyhow::Result<Vec<ArchiveMove>> {
-        let Some(dir) = self.path.parent() else {
+        let Some(dir) = journal_dir(&self.path) else {
             anyhow::bail!("journal path has no parent directory");
         };
         let Some(stem) = self.path.file_stem().and_then(|s| s.to_str()) else {
             anyhow::bail!("journal path has no usable file stem");
         };
         let prefix = format!("{stem}.seg");
-        let mut segments = segment_files(dir, &prefix);
+        let mut segments = segment_files(&dir, &prefix);
         let move_count = segments.len().saturating_sub(keep_latest);
         segments.truncate(move_count);
         let archive = self
@@ -388,15 +499,26 @@ impl Journal {
     /// The newest `keep_latest` segments stay in place, so a caller can retain a
     /// small hot window. `replay_all` reads both locations; a destination
     /// collision is refused before any file moves.
-    pub fn archive_segments(&self, keep_latest: usize) -> anyhow::Result<usize> {
+    ///
+    /// `resolve_duplicates` quarantines the non-authoritative twin first, so a
+    /// duplicated range stops blocking the move without anything being deleted.
+    pub fn archive_segments(
+        &self,
+        keep_latest: usize,
+        resolve_duplicates: bool,
+    ) -> anyhow::Result<usize> {
         let _file = self.file.lock().unwrap();
+        if resolve_duplicates {
+            self.quarantine_duplicate_segments_locked()?;
+        }
         let moves = self.archive_plan_locked(keep_latest)?;
         if moves.is_empty() {
             return Ok(0);
         }
         if let Some(conflict) = moves.iter().find(|plan| plan.destination_exists) {
             anyhow::bail!(
-                "refusing to overwrite archived segment {} while moving {}",
+                "refusing to overwrite archived segment {} while moving {} — a \
+                 `--resolve-duplicates` run quarantines the non-authoritative copy first",
                 conflict.destination.display(),
                 conflict.source.display()
             );
@@ -560,6 +682,41 @@ fn file_bytes(path: &Path) -> u64 {
     std::fs::metadata(path)
         .map(|metadata| metadata.len())
         .unwrap_or(0)
+}
+
+/// Holes in the coverage chain of the segments replay actually reads. The chain
+/// is expected to start at record 0 and continue end-to-start; a jump means the
+/// records in between are covered by no file any more.
+fn chain_gaps(segments: &[(u64, u64, PathBuf)]) -> Vec<CoverageGap> {
+    let mut gaps = Vec::new();
+    let mut expected = 0u64;
+    for (from, to, _) in segments {
+        if *from != expected {
+            gaps.push(CoverageGap {
+                expected_from: expected,
+                found_from: *from,
+            });
+        }
+        expected = expected.max(*to);
+    }
+    gaps
+}
+
+/// The directory holding the live file and its root segments.
+///
+/// `Path::parent()` of a bare name (`journal.jsonl`, i.e. what a CLI gets when
+/// the operator types no directory) is the EMPTY path, not `None` — and
+/// `read_dir("")` fails, which the segment scanner swallows as "no segments".
+/// The health check then reports "chain complete" for a journal that plainly has
+/// segments on disk, and `archive` reports "nothing to move". A fail-open
+/// inventory is worse than a crash, so the empty parent becomes `.`.
+fn journal_dir(path: &Path) -> Option<PathBuf> {
+    let dir = path.parent()?;
+    Some(if dir.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        dir.to_path_buf()
+    })
 }
 
 fn staged_files(dir: Option<&Path>) -> usize {
@@ -818,7 +975,7 @@ mod tests {
         let before = reconcile(&journal.replay());
 
         let rotated = journal.rotate(5).unwrap().expect("rotation");
-        assert_eq!(journal.archive_segments(0).unwrap(), 1);
+        assert_eq!(journal.archive_segments(0, false).unwrap(), 1);
         let archive = journal.segment_archive_dir().unwrap();
         let archived = archive.join(rotated.archived_to.file_name().unwrap());
         assert!(
@@ -831,7 +988,7 @@ mod tests {
         );
         assert_eq!(replay_path(&archived).len(), 10);
         assert_eq!(
-            journal.archive_segments(0).unwrap(),
+            journal.archive_segments(0, false).unwrap(),
             0,
             "archiving an empty root is idempotent"
         );
@@ -894,12 +1051,12 @@ mod tests {
         let before = reconcile(&journal.replay_all());
         assert_eq!(segment_files(&dir, "journal.seg").len(), 3);
 
-        assert_eq!(journal.archive_segments(1).unwrap(), 2);
+        assert_eq!(journal.archive_segments(1, false).unwrap(), 2);
         let archive = journal.segment_archive_dir().unwrap();
         assert_eq!(segment_files(&dir, "journal.seg").len(), 1);
         assert_eq!(segment_files(&archive, "journal.seg").len(), 2);
         assert_eq!(
-            journal.archive_segments(10).unwrap(),
+            journal.archive_segments(10, false).unwrap(),
             0,
             "keep larger than the hot window moves nothing"
         );
@@ -936,7 +1093,7 @@ mod tests {
         assert!(plan[0].source.exists(), "planning must not move a file");
         assert_eq!(plan[0].bytes, root.total_segment_bytes);
 
-        journal.archive_segments(0).unwrap();
+        journal.archive_segments(0, false).unwrap();
         std::fs::write(dir.join("journal.seg0-0.jsonl.new"), "").unwrap();
         let archived = journal.status();
         assert_eq!(archived.root_segments, 0);
@@ -1025,6 +1182,104 @@ mod tests {
         status.approvals = Some(approvals);
         let json = serde_json::to_value(status).unwrap();
         assert_eq!(json["approvals"]["unacked"], 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 裸文件名（`--journal journal.jsonl`）的 parent 是空路径而不是 `None`，而
+    /// `read_dir("")` 会失败——段扫描把它吞成「盘上没有段」，健康检查于是对一个明确
+    /// 有段的账本报「链完整」。这条断言钉住归一化本身。
+    #[test]
+    fn a_bare_file_name_resolves_to_the_current_directory() {
+        assert_eq!(
+            journal_dir(std::path::Path::new("journal.jsonl")),
+            Some(std::path::PathBuf::from(".")),
+            "an empty parent must not become a silent 'no segments on disk'"
+        );
+        assert_eq!(
+            journal_dir(std::path::Path::new("runs/a/journal.jsonl")),
+            Some(std::path::PathBuf::from("runs/a"))
+        );
+        assert_eq!(
+            journal_dir(std::path::Path::new("/srv/journal.jsonl")),
+            Some(std::path::PathBuf::from("/srv"))
+        );
+        assert_eq!(
+            journal_dir(std::path::Path::new("/")),
+            None,
+            "no parent to report"
+        );
+    }
+
+    /// 少一段比多一段更坏：replay 不会报错，它只是悄悄少读。链检查就是把这件事
+    /// 变成能被 `--check` 抓到的信号。
+    #[test]
+    fn journal_status_flags_a_hole_in_the_coverage_chain() {
+        let dir = scratch("chain-gap");
+        let path = dir.join("journal.jsonl");
+        let journal = Journal::create(&path).unwrap();
+        seed(&journal, 2);
+        journal.rotate(0).unwrap().expect("first sealed segment");
+
+        let whole = journal.status();
+        assert!(whole.coverage_gaps.is_empty(), "{:?}", whole.coverage_gaps);
+        assert!(whole.is_healthy());
+
+        let segment = &whole.segments[0];
+        let (from, to) = (segment.from, segment.to);
+        // 不硬编码记录条数：链从 0 开始这个不变式才是这条测试要用的前提。
+        assert_eq!(from, 0, "a fresh chain starts at record 0");
+        assert!(to > 1, "the test needs room to open a hole: {to}");
+        let renamed = dir.join(format!("journal.seg{}-{to}.jsonl", to - 1));
+        std::fs::rename(&segment.path, &renamed).unwrap();
+
+        let broken = journal.status();
+        assert_eq!(broken.coverage_gaps.len(), 1, "{:?}", broken.coverage_gaps);
+        assert_eq!(broken.coverage_gaps[0].expected_from, 0);
+        assert_eq!(broken.coverage_gaps[0].found_from, to - 1);
+        assert!(!broken.is_healthy(), "a hole is not a healthy journal");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 重复区间的出口必须是「移走」而不是「删掉」，而且处置完之后重放结论不能变。
+    #[test]
+    fn quarantining_a_duplicate_keeps_the_authoritative_copy_and_the_bytes() {
+        let dir = scratch("quarantine");
+        let path = dir.join("journal.jsonl");
+        let journal = Journal::create(&path).unwrap();
+        seed(&journal, 4);
+        journal.rotate(5).unwrap().expect("rotation");
+        journal.archive_segments(0, false).unwrap();
+        let archived = journal.segment_archive_dir().unwrap();
+        let authoritative = archived.join("journal.seg0-10.jsonl");
+        std::fs::copy(&authoritative, dir.join("journal.seg0-10.jsonl")).unwrap();
+        let before = reconcile(&journal.replay_all());
+        assert_eq!(journal.status().duplicate_segments, 1);
+
+        // 默认仍然拒绝覆盖：这是 §9.47③ 的保守，不是漏判。
+        let refused = journal.archive_segments(0, false).unwrap_err();
+        assert!(
+            refused.to_string().contains("--resolve-duplicates"),
+            "the refusal says what to do next: {refused}"
+        );
+
+        let moved = journal.archive_segments(0, true).unwrap();
+        assert_eq!(moved, 1, "the root copy moved once the twin was parked");
+        let quarantine = journal.duplicate_quarantine_dir().unwrap();
+        assert!(
+            quarantine.join("journal.seg0-10.jsonl").exists(),
+            "the non-authoritative copy was moved, not deleted"
+        );
+        assert!(
+            authoritative.exists(),
+            "the authoritative copy is still read"
+        );
+        assert!(!dir.join("journal.seg0-10.jsonl").exists());
+        let after = reconcile(&journal.replay_all());
+        assert_eq!(after.state, before.state, "no record changed hands");
+        assert_eq!(after.in_flight, before.in_flight);
+        let healthy = journal.status();
+        assert_eq!(healthy.duplicate_segments, 0);
+        assert!(healthy.is_healthy(), "{healthy:?}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
