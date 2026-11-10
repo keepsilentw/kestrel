@@ -62,6 +62,14 @@ pub enum Outbound {
     ApprovalClosed {
         req: String,
     },
+    /// An idle worker PROPOSING its own retirement. Only the pump may drop the
+    /// sender, and `mpsc` delivers everything already queued before the receiver
+    /// sees `None` — so a bell that raced ahead of this proposal is still served.
+    /// That is the whole reason the worker asks instead of breaking out of its
+    /// own loop: a self-chosen exit is a bell-loss window.
+    RetireRequested {
+        task: String,
+    },
 }
 
 /// Routing decision. Kept as data so the policy is testable without a bus or
@@ -85,6 +93,10 @@ pub struct Router {
     tasks: HashSet<String>,
     req_owner: HashMap<String, String>,
     max_tasks: usize,
+    /// How many engines this worker has released. "task_count pinned at the cap"
+    /// and "tasks churning through the cap" look identical from the outside
+    /// unless something counts the releases.
+    retired_total: usize,
     /// A resource ceiling was crossed: new tasks are refused out loud, while
     /// tasks that already own an engine keep running. Refusing is the honest
     /// half of a soft ceiling — killing the process would take the in-flight
@@ -101,6 +113,7 @@ impl Router {
             tasks: HashSet::new(),
             req_owner: HashMap::new(),
             max_tasks,
+            retired_total: 0,
             draining: None,
         }
     }
@@ -171,6 +184,24 @@ impl Router {
         self.req_owner.len()
     }
 
+    /// Release one task slot. Retirement frees an engine, never history: the
+    /// next bell reopens the same session tree (`cli::serve::TaskSessions`).
+    /// Approval ownership goes with the task — a worker closes every in-flight
+    /// request when its turn ends, so anything left here is already stale, and a
+    /// reply for a retired task must not resurrect the entry.
+    pub fn retire_task(&mut self, task: &str) -> bool {
+        if !self.tasks.remove(task) {
+            return false;
+        }
+        self.req_owner.retain(|_, owner| owner != task);
+        self.retired_total += 1;
+        true
+    }
+
+    pub fn retired_total(&self) -> usize {
+        self.retired_total
+    }
+
     fn active_tasks(&self) -> Vec<String> {
         let mut tasks: Vec<String> = self.tasks.iter().cloned().collect();
         tasks.sort();
@@ -208,6 +239,9 @@ pub struct PoolConfig {
     /// Soft memory ceiling in bytes: once the process' PEAK resident size
     /// reaches it the worker drains (refuses new tasks). 0 = no ceiling.
     pub max_rss_bytes: u64,
+    /// Idle time after which a task's engine proposes retirement. 0 = never,
+    /// which leaves the slot taken for the life of the process.
+    pub task_idle_timeout: Duration,
 }
 
 /// An approval request that is still in flight: the frame itself (so a retry is
@@ -384,6 +418,27 @@ pub async fn run_pool(
                     Some(Outbound::Notify { session, payload }) => client.notify(&session, payload),
                     Some(Outbound::ApprovalOpened { req, task }) => router.on_approval_opened(&req, &task),
                     Some(Outbound::ApprovalClosed { req }) => router.close_request(&req),
+                    Some(Outbound::RetireRequested { task }) => {
+                        // Dropping the sender IS the retirement: the worker's
+                        // pending `recv()` takes anything already queued first and
+                        // only then sees `None`, so no bell can be lost to this.
+                        if let Some(tx) = workers.remove(&task) {
+                            drop(tx);
+                            router.retire_task(&task);
+                            tracing::warn!(
+                                "pump: task {task} retired after {}s idle — the engine is \
+                                 gone, the session tree stays for the next bell",
+                                cfg.task_idle_timeout.as_secs()
+                            );
+                            // Reap the finished handles. Only *finished* ones:
+                            // dropping an `AbortOnDropHandle` that is still
+                            // running would abort that worker mid-turn. Without
+                            // this, a long-lived worker accumulates one entry per
+                            // task it ever hosted — retirement would have freed
+                            // the engine and kept the ledger.
+                            joins.retain(|join| !join.is_finished());
+                        }
+                    }
                     None => {
                         // every worker is gone; re-enable only when a bell returns
                         tokio::task::yield_now().await;
@@ -423,6 +478,7 @@ fn status_document(cfg: &PoolConfig, router: &Router) -> Value {
         "max_rss_bytes": cfg.max_rss_bytes,
         "peak_rss_bytes": peak_rss_bytes().ok(),
         "draining": router.draining(),
+        "retirements": router.retired_total(),
         "updated_unix_secs": SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -478,18 +534,40 @@ fn spawn_worker(
         loop {
             let (sender, payload) = match pending.pop_front() {
                 Some(b) => b,
-                None => match inbox.recv().await {
-                    Some(TaskMsg::Bell { sender, payload }) => (sender, payload),
-                    Some(TaskMsg::Approval { req, decision, by }) => {
-                        // a reply with no turn running has nobody to wake
-                        tracing::warn!(
-                            "task {task}: late {} reply {req} from {by} is dropped, not queued",
-                            decision_name(decision)
-                        );
-                        continue;
+                None => {
+                    // Idle timing runs only when there is genuinely nothing to
+                    // do. A timeout is a PROPOSAL: the pump decides, because it
+                    // owns the only sender (see `Outbound::RetireRequested`).
+                    let received = if cfg.task_idle_timeout.is_zero() {
+                        inbox.recv().await
+                    } else {
+                        match tokio::time::timeout(cfg.task_idle_timeout, inbox.recv()).await {
+                            Ok(msg) => msg,
+                            Err(_elapsed) => {
+                                let _ =
+                                    out_tx.send(Outbound::RetireRequested { task: task.clone() });
+                                // After proposing, stop timing: either the pump
+                                // drops the sender (None -> clean shutdown below)
+                                // or it hands over a bell that was already on its
+                                // way. A second proposal would be noise.
+                                inbox.recv().await
+                            }
+                        }
+                    };
+                    match received {
+                        Some(TaskMsg::Bell { sender, payload }) => (sender, payload),
+                        Some(TaskMsg::Approval { req, decision, by }) => {
+                            // a reply with no turn running has nobody to wake
+                            tracing::warn!(
+                                "task {task}: late {} reply {req} from {by} is dropped, \
+                                 not queued",
+                                decision_name(decision)
+                            );
+                            continue;
+                        }
+                        None => break,
                     }
-                    None => break,
-                },
+                }
             };
             let stage = payload["stage"].as_str().unwrap_or("unknown").to_string();
             let iteration = payload["iteration"].as_u64().unwrap_or(0);
@@ -859,6 +937,30 @@ mod tests {
         );
     }
 
+    /// 退休释放 slot，也释放它名下的审批归属：引擎都没了，一条给旧 req 的批复
+    /// 不能被重新捡起来路由（§9.26② 的路由表有界在这条上继续成立）。
+    #[test]
+    fn retiring_a_task_frees_the_slot_and_prunes_its_requests() {
+        let mut r = Router::new(1);
+        assert!(matches!(r.on_bell("t1"), Action::Spawn(_)));
+        r.on_approval_opened("req-1", "t1");
+        assert_eq!(r.task_count(), 1);
+        assert_eq!(r.open_requests(), 1);
+
+        assert!(r.retire_task("t1"));
+        assert!(!r.retire_task("t1"), "retiring twice is a no-op");
+        assert_eq!(r.task_count(), 0);
+        assert_eq!(r.open_requests(), 0, "归属跟着引擎一起走");
+        assert_eq!(r.retired_total(), 1);
+
+        // 上限现在接得住新 task —— 这格存在的理由
+        assert!(matches!(r.on_bell("t2"), Action::Spawn(_)));
+        assert!(matches!(
+            r.on_approval_reply(Some("req-1")),
+            Action::Drop(_)
+        ));
+    }
+
     #[test]
     fn worker_status_document_is_atomic_and_reports_router_state() {
         let mut router = Router::new(4);
@@ -874,6 +976,7 @@ mod tests {
             max_parallel_tools: 4,
             max_worker_tools: 8,
             max_rss_bytes: 0,
+            task_idle_timeout: Duration::ZERO,
             approval_retry: Duration::from_secs(1),
             status_file: None,
             status_interval: Duration::from_secs(5),

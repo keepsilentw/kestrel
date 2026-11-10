@@ -8,9 +8,10 @@
 //! 总线的读、写与审批归属都在 `cli::pool` 的 pump 里；这里只负责装载角色配置并
 //! 提供「为一个 task 造一台引擎」的工厂。
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -62,6 +63,33 @@ pub struct ServeArgs {
     /// Optional machine-readable worker status path.
     pub status_file: Option<PathBuf>,
     pub status_interval: Duration,
+    /// Idle time before a task's engine is released (0 = keep it forever). The
+    /// session tree survives a release and is reopened by the next bell.
+    pub task_idle_timeout: Duration,
+}
+
+/// task -> the session tree it was first given.
+///
+/// 退休释放的是引擎，不是历史：下一颗同 task 的铃必须接着同一棵树跑，否则「空闲就
+/// 放掉 slot」等于悄悄把这条 pipeline 的记忆清掉——那比占着 slot 更坏。所以 create
+/// 只发生一次，之后一律 open。
+#[derive(Default)]
+pub struct TaskSessions {
+    paths: BTreeMap<String, PathBuf>,
+}
+
+impl TaskSessions {
+    pub fn known(&self, task: &str) -> Option<PathBuf> {
+        self.paths.get(task).cloned()
+    }
+
+    pub fn record(&mut self, task: &str, path: PathBuf) {
+        self.paths.insert(task.to_string(), path);
+    }
+
+    pub fn tracked(&self) -> usize {
+        self.paths.len()
+    }
 }
 
 /// Resident worker: one long-lived process, one engine + session tree per task.
@@ -116,6 +144,7 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         max_parallel_tools: args.max_parallel_tools,
         max_worker_tools: args.max_worker_tools,
         max_rss_bytes: args.max_rss_mb.saturating_mul(1024 * 1024),
+        task_idle_timeout: args.task_idle_timeout,
         // 审批请求的重发节奏跟着这个 worker 的审批窗口走（runtime > role，
         // 与 approve 模式同一份来源，不在这里再读一次 role）
         approval_retry: approve.approval_retry_period(),
@@ -133,24 +162,44 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     };
     let engine_policy = Arc::clone(&engine_policy);
     let worker_tool_slots = worker_tool_slots.clone();
+    let task_sessions = Arc::new(Mutex::new(TaskSessions::default()));
+    let task_sessions = Arc::clone(&task_sessions);
     let factory: EngineFactory = Arc::new(move |task: &str| -> anyhow::Result<PooledEngine> {
         // One session tree per task: two pipelines must not share a history, a
-        // read-before-edit ledger or a compaction checkpoint.
-        let store = SessionStore::create(
-            &home,
-            &cwd,
-            &role_name,
-            model.wire_id_str(),
-            &model.id,
-            Arc::new(UuidGen),
-            Arc::new(SystemClock),
-        )
-        .with_context(|| {
-            format!(
-                "open the session tree for task {task} under cwd {}",
-                cwd.display()
-            )
-        })?;
+        // read-before-edit ledger or a compaction checkpoint. A task that was
+        // retired and rings again reopens the SAME tree instead of starting cold.
+        let known = task_sessions.lock().unwrap().known(task);
+        let store = match known {
+            Some(path) => SessionStore::open(&path, Arc::new(UuidGen), Arc::new(SystemClock))
+                .with_context(|| {
+                    format!(
+                        "reopen the session tree of task {task} from {}",
+                        path.display()
+                    )
+                })?,
+            None => {
+                let store = SessionStore::create(
+                    &home,
+                    &cwd,
+                    &role_name,
+                    model.wire_id_str(),
+                    &model.id,
+                    Arc::new(UuidGen),
+                    Arc::new(SystemClock),
+                )
+                .with_context(|| {
+                    format!(
+                        "open the session tree for task {task} under cwd {}",
+                        cwd.display()
+                    )
+                })?;
+                task_sessions
+                    .lock()
+                    .unwrap()
+                    .record(task, store.path().to_path_buf());
+                store
+            }
+        };
         let handle = AgentHandle::spawn(EngineConfig {
             provider: Arc::clone(&wire),
             model: model.clone(),
@@ -307,10 +356,17 @@ pub fn bell_prompt(payload: &serde_json::Value) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+    use std::sync::Arc;
+
     use super::{
-        ApprovalDecision, approval_command, approval_receipt_frame, approval_receipt_from_frame,
-        approval_request_frame, bell_prompt, decision_from_frame, decision_name,
+        ApprovalDecision, TaskSessions, approval_command, approval_receipt_frame,
+        approval_receipt_from_frame, approval_request_frame, bell_prompt, decision_from_frame,
+        decision_name,
     };
+    use crate::core::events::MessageItem;
+    use crate::core::id::{SystemClock, UuidGen};
+    use crate::session::SessionStore;
     use serde_json::json;
 
     /// The approver judges the command, so the frame must carry it: a request
@@ -383,6 +439,45 @@ mod tests {
         assert!(fallback.starts_with("task inside ref"), "{fallback}");
     }
 
+    /// 退休释放引擎、不释放历史：记下的树能重新打开，读回来还是同一段上下文
+    /// （`AgentHandle::spawn` 从 prompt_snapshot 重建 history 与 read-before-edit
+    /// 台账）。没见过的 task 仍然走 create，不会跟别人的树串台。
+    #[test]
+    fn a_retired_task_reopens_the_same_session_tree() {
+        let home =
+            std::env::temp_dir().join(format!("kestrel-serve-sessions-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let mut sessions = TaskSessions::default();
+
+        let store = SessionStore::create(
+            &home,
+            Path::new("/ws"),
+            "rd",
+            "faux",
+            "faux-model",
+            Arc::new(UuidGen),
+            Arc::new(SystemClock),
+        )
+        .unwrap();
+        store.append_item(MessageItem::user_text("the first turn"), None);
+        sessions.record("t1", store.path().to_path_buf());
+        drop(store);
+
+        let path = sessions.known("t1").expect("the tree is remembered");
+        let reopened = SessionStore::open(&path, Arc::new(UuidGen), Arc::new(SystemClock)).unwrap();
+        let snapshot = reopened.prompt_snapshot();
+        assert_eq!(
+            snapshot.len(),
+            1,
+            "history survives the release: {snapshot:?}"
+        );
+        assert_eq!(sessions.tracked(), 1);
+        assert!(
+            sessions.known("t2").is_none(),
+            "another task still gets its own tree"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
     /// 回执是审批账的闭环，所以它的读侧要严格：少 `req` 或少 `applied` 都不当回执
     /// 处理——落进 journal 的东西不能靠猜。
     #[test]

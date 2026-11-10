@@ -20,13 +20,14 @@
 > 质量闸门保持人工执行（本仓库不挂 CI，见 §9.19⑥）。
 > 二期十一项已于 2026-11-04 在真端点联跑中走完（`pipeline complete`，四阶段全 pass，
 > 审批请求/判定/回执各 5 条成对）；那一次联跑抓出并修掉两个「测试全绿但跑不起来」的缺陷，见 §9.32。
-> 2026-11-10：三期开工（§9.46–§9.54）——worker 的两级工具并发上限与内存软上限（drain）、
+> 2026-11-10：三期开工（§9.46–§9.55）——worker 的两级工具并发上限、内存软上限（drain）与
 > journal 归档段的离线移动 / 热窗口 / 预览 / 库存 / 健康检查、审批链审计、常驻 worker 状态
 > 文件，外加名义成本细到 `peer × 原因`（§9.49）、判定 issue 自带归因（§9.50），以及把这些
-> 护栏接到 `harness/run-demo.sh` 的入口上（§9.54）。代码部分都过了 fmt / clippy / test；
+> 护栏接到 `harness/run-demo.sh` 的入口上（§9.54）、空闲 task 退休与会话树重开（§9.55）。
+> 代码部分都过了 fmt / clippy / test；
 > **真端点联跑未重跑**，demo 的接法只到语法与 flag 解析这一层。
-> **Metrics** — src 51 files / 18578 lines · tests 9 files / 3628 lines · 260 tests (lib 204 + bin 4 + integration 52)
-> **Integration** — core_loop 5 / discipline 2 / m1_tools 11 / m2_session 6 / m4_bus 15 / m5_pool 7 / sandbox_e2e 4 / wire_anthropic 2
+> **Metrics** — src 51 files / 18783 lines · tests 9 files / 3704 lines · 263 tests (lib 206 + bin 4 + integration 53)
+> **Integration** — core_loop 5 / discipline 2 / m1_tools 11 / m2_session 6 / m4_bus 15 / m5_pool 8 / sandbox_e2e 4 / wire_anthropic 2
 > 规模已过 plan 预算（10-13k）的上沿：多出来的部分几乎都花在「取消安全」与「对账」这两条纪律上。
 > 上面两行数字由 `tests/discipline.rs::metrics_lines_match_the_tree` 对照源码树重算校验——
 > 这些计数此前在三处文档里手抄过三次、漂移过三次（§9.19），现在它是闸门不是仪式。
@@ -436,7 +437,8 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
        `the_rss_ceiling_refuses_a_new_task_without_building_an_engine` 在真总线上钉「带 error 铃、
        引擎根本没起」。状态文件同步带 `draining` / `peak_rss_bytes` / `max_rss_bytes`。
     ⑤ 边界：这是**准入闸门**，不是内存回收——不杀引擎、不释放已占的内存，也说不清是哪个
-       task 吃掉的；空闲 task 的退休仍是要单独定语义的一格（会话续接 + 取消握手）。
+       task 吃掉的；空闲 task 的退休当时仍是要单独定语义的一格（会话续接 + 不丢铃的握手）——
+       下一格就是它，见 §9.55。
 
 54. **三期第九格：demo 入口接上资源护栏（2026-11-10）**：
     ① §9.46–§9.53 的护栏都长在 `serve` 的 flag 上，而 `harness/run-demo.sh` 从来不知道它们
@@ -453,11 +455,40 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
     ⑤ 验证边界：`bash -n` 通过，`serve` 的 flag 解析用不存在的 role 文件验过（clap 认这些
        名字，错误停在角色加载那步）。**demo 本身没跑**：那需要真端点凭据，本节不声称它跑过。
 
+55. **三期第十格：空闲 task 退休与会话树重开（2026-11-10）**：
+    ① §9.53⑤ 留的「任务集合只增不减」是这一格。`--max-tasks` 之前是**终身**上限：跑完的
+       pipeline 继续占着 slot，长跑的 worker 会被自己的历史堵死。
+    ② `serve --task-idle-timeout-secs N`（缺省 1800；`0` = 永不退休）。这个默认值不是猜派发
+       节奏，是「比 SA 等回铃的 300s 长一个量级，也比一次人工介入短」。
+    ③ **退休释放引擎，不释放历史**。`serve` 侧新增 `TaskSessions`：task 第一次起引擎时记下
+       那棵 append-only 树的路径，之后一律 `SessionStore::open`。`AgentHandle::spawn` 本来
+       就会从 `prompt_snapshot()` 重建 history 与 read-before-edit 台账（`-p --resume` 走的
+       就是这条路），所以续接不是新机制，是把已有机制接到对的位置上。少了这一步，「空闲就
+       放掉 slot」等于把 pipeline 的记忆清掉——那比占着 slot 更坏。
+    ④ 退休是**提议-批准**两拍，不是一拍自己退出：worker 到点只递交 `RetireRequested`，由
+       pump 丢 sender。理由与 §9.26④ 那两个缺陷同源——pump 是唯一能往这个 task 发信的人，
+       而 `mpsc` 会先把已排队的门铃送达再让 `recv()` 返回 `None`；worker 自己 `break` 就留下
+       一个「刚排进去的铃没人取」的窗口，那是这里最贵的失败。提议之后不再计时，免得同一个
+       空闲期反复提议。
+    ⑤ 归属跟着引擎一起走：`retire_task` 清掉该 task 名下的 `req_owner` 条目（回合结束时在途
+       请求本就该关掉，留着只会把迟到批复路由给已不存在的引擎），并计 `retired_total` 进状态
+       文件——「slot 一直满」和「slot 在轮换」从外面看一模一样。
+    ⑥ 顺手回收已完成的 join handle（只碰 `is_finished()` 的：`AbortOnDropHandle` 丢掉还在跑
+       的任务会中止那个 worker），否则退休释放了引擎却把账越留越长。
+    ⑦ 测试：`retiring_a_task_frees_the_slot_and_prunes_its_requests`、
+       `a_retired_task_reopens_the_same_session_tree`（真 SessionStore 落盘再 open）、
+       `an_idle_task_frees_its_slot_for_the_next_pipeline`。第三条做了**变异验证**：把空闲
+       超时改回 `Duration::ZERO`，它以 `worker is at its task cap (1)` 失败——不这么做就分不出
+       「测到了退休」和「什么都没测」。
+    ⑧ 边界：退休不看「这条 pipeline 是不是真结束了」，只看空闲——SA 崩溃留下的 task 一样会被
+       回收，这是有意的（那正是 slot 泄漏的主要来源）。它也不动**正在跑**的引擎的内存，内存仍
+       只有 §9.53 那道准入闸门。
+
 ## 10 二期清单
 
 已落地（2026-10-28 起）：~~`ApproveMode::Bus`~~（授权表 + 超时 fail-closed + journal 审计，§9.20）、~~SA 判定升级到「工件 + 证据文件」~~（绝对路径存在性/非空核对，§9.20）、~~bus 重连重放~~（离线 session 停车补投 + 客户端自动重连；RPC 与「写入即死」的帧不重放，§9.21）、~~journal 快照/截断语义~~（检查点 + 归档段 + 崩溃安全轮转，§9.22）、~~多任务并行~~（task 命名空间三处同源 + 前缀寻址，§9.23）、~~openai-responses wire~~（第三条 v1 wire，金身 + fixture 验证，**真端点未实测**，§9.24）、~~journal 投影增量化与轮转触发~~（在线投影 = 全量重放 + 条数/字节双上限，§9.25）、~~一个引擎内真正并发地服务多个 task~~（改为「一 task 一引擎」的 worker 池，单活跃槽不动，§9.26）、~~`BudgetSpent` 的价格表~~（预留 → 结算两段式、按 token 换账单、无价退回名义值并报出来，§9.27；2026-11-03）、~~journal 轮转的**默认策略**~~（活文件 512 条 / 1 MiB 双上限、三态 CLI、生产与测试同一条 `rotate_at_boundary`，§9.28；2026-11-03）、~~证据的类型化~~（`file` / `test_log` / `diff` / `screenshot` 各自可在盘上反驳 + `--evidence-spec` 的 stage 要求，坏表硬失败，§9.29；2026-11-03）、~~审批批复的可靠投递~~（请求 at-least-once + 按 req 幂等 + 台账从 journal 播种，判定仍只一次，§9.30；2026-11-03）、~~批复到底有没有生效~~（回执 `approval_receipt` + `ApprovalAcked` 落账 + 到点撤摊，**没生效的批准不许记成生效**，§9.31；2026-11-03）。
 
-仍在清单上（审批已闭环到「有没有生效」这一层：请求 at-least-once、批复有回执、未回执的批复重启后补投一次。剩下的是**跨回合挂起的审批槽位**——「SA 下班、明早再批」需要未决请求的第二份真相与新的取消语义，见 §9.31⑤）：tree-sitter-bash 命令解析、execpolicy DSL（Starlark）、landlock/bwrap（Linux 沙箱）、TUI（行级 diff 形制，pi-tui 蓝本）、MCP 客户端、model-in-the-loop evals（含 openai-responses 的真端点实测，§9.24）、worker 池资源护栏的剩余部分（工具并发数由 `--max-parallel-tools` / `--max-worker-tools` 封顶，见 §9.46 / §9.48；内存是 `--max-rss-mb` 的**软**准入闸门，见 §9.53——**回收单个 task 的内存**与真·多进程编排仍留给 harness 上层）、归档段的**压缩与保留策略**（离线移动 / 预览 / 库存 / 健康检查已由 `journal-archive` + `journal-status` 落地，见 §9.47；磁盘占用仍只增不减，自动删除会撞上「这不是删除」的语义边界）。
+仍在清单上（审批已闭环到「有没有生效」这一层：请求 at-least-once、批复有回执、未回执的批复重启后补投一次。剩下的是**跨回合挂起的审批槽位**——「SA 下班、明早再批」需要未决请求的第二份真相与新的取消语义，见 §9.31⑤）：tree-sitter-bash 命令解析、execpolicy DSL（Starlark）、landlock/bwrap（Linux 沙箱）、TUI（行级 diff 形制，pi-tui 蓝本）、MCP 客户端、model-in-the-loop evals（含 openai-responses 的真端点实测，§9.24）、worker 池资源护栏的剩余部分（工具并发数由 `--max-parallel-tools` / `--max-worker-tools` 封顶，见 §9.46 / §9.48；内存是 `--max-rss-mb` 的**软**准入闸门，见 §9.53；空闲 task 的引擎由 `--task-idle-timeout-secs` 回收、会话树重开续接，见 §9.55——**正在跑的引擎的内存**与真·多进程编排仍留给 harness 上层）、归档段的**压缩与保留策略**（离线移动 / 预览 / 库存 / 健康检查已由 `journal-archive` + `journal-status` 落地，见 §9.47；磁盘占用仍只增不减，自动删除会撞上「这不是删除」的语义边界）。
 
 2026-11-04 联跑新添的两格同日落地（§9.33）：验证类 stage 的 FAIL 回跳给写者返工（带额度 `max_reworks`、带原因 `ref.rework`、每关 iter 跨回跳不清零），bash 用 `output_path` 参数交出可核对的 `test_log`（内核把 stdout/stderr 连 `exit: ExitStatus{...}` 一起写进那个文件）。下一格因此有了明确的落点：SA 只要去读那行 `exit:`，「形状」就能升级成「结论」——现在它还只证明「这份文件是测试汇总」。
 

@@ -41,17 +41,36 @@ struct Harness {
 /// The engine factory is a parameter because the routing tests and the approval
 /// tests need different engines — and the second copy of this wiring nobody
 /// wants is the reason `harness` used to build its engine inline.
-async fn harness_with(
-    tag: &str,
+/// Worker knobs. A test names only the limit it asserts; the rest come from
+/// `standard()`. Positional arguments here had outgrown the point of the
+/// helper — every new guard added another slot to every call site.
+#[derive(Default)]
+struct Limits {
     max_tasks: usize,
     approval_retry: Duration,
-    approver: Option<&str>,
-    factory: EngineFactory,
-    wires: Wires,
-    // Soft memory ceiling in bytes; 0 = no ceiling. The tests that do not care
-    // about it pass 0 rather than growing a second copy of this wiring.
+    approver: Option<&'static str>,
+    /// Soft memory ceiling in bytes; 0 = no ceiling.
     rss_ceiling: u64,
-) -> Harness {
+    /// Idle timeout before a task's engine proposes retirement; ZERO = never.
+    task_idle_timeout: Duration,
+}
+
+impl Limits {
+    /// The ordinary multi-task worker: four slots and a fast approval retry.
+    /// `max_tasks: 0` would mean "no ceiling" to the router, so the default is
+    /// deliberately not zero — a test that wants the ceiling off says so.
+    fn standard() -> Self {
+        Self {
+            max_tasks: 4,
+            approval_retry: Duration::from_millis(40),
+            approver: None,
+            rss_ceiling: 0,
+            task_idle_timeout: Duration::ZERO,
+        }
+    }
+}
+
+async fn harness_with(tag: &str, factory: EngineFactory, wires: Wires, limits: Limits) -> Harness {
     let dir = temp(tag);
     let socket = dir.join("bus.sock");
     let artifacts = dir.join("artifacts");
@@ -72,12 +91,13 @@ async fn harness_with(
         session: "harness-rd".into(),
         role: "rd".into(),
         artifacts_dir: artifacts.clone(),
-        approver: approver.map(str::to_string),
-        max_tasks,
+        approver: limits.approver.map(str::to_string),
+        max_tasks: limits.max_tasks,
         max_parallel_tools: kestrel::tools::DEFAULT_MAX_PARALLEL_TOOLS,
         max_worker_tools: kestrel::tools::DEFAULT_MAX_WORKER_TOOLS,
-        max_rss_bytes: rss_ceiling,
-        approval_retry,
+        max_rss_bytes: limits.rss_ceiling,
+        task_idle_timeout: limits.task_idle_timeout,
+        approval_retry: limits.approval_retry,
         status_file: None,
         status_interval: Duration::from_secs(5),
     });
@@ -154,12 +174,12 @@ async fn harness(max_tasks: usize, tag: &str) -> Harness {
     let (factory, wires) = answer_factory();
     harness_with(
         tag,
-        max_tasks,
-        Duration::from_millis(40),
-        None,
         factory,
         wires,
-        0,
+        Limits {
+            max_tasks,
+            ..Limits::standard()
+        },
     )
     .await
 }
@@ -330,12 +350,12 @@ async fn a_glued_annotation_is_cut_before_it_reaches_the_artifact() {
     });
     let h = harness_with(
         "shape-write",
-        2,
-        Duration::from_millis(40),
-        None,
         factory,
         wires,
-        0,
+        Limits {
+            max_tasks: 2,
+            ..Limits::standard()
+        },
     )
     .await;
     h.sa.notify("harness-rd", bell("shape", "dev", "implement"));
@@ -379,12 +399,14 @@ async fn an_unanswered_approval_request_is_resent_and_answered_once() {
 
     let h = harness_with(
         "approval-resent",
-        2,
-        Duration::from_millis(150),
-        Some("harness-sa"),
         factory,
         wires,
-        0,
+        Limits {
+            max_tasks: 2,
+            approval_retry: Duration::from_millis(150),
+            approver: Some("harness-sa"),
+            ..Limits::standard()
+        },
     )
     .await;
     h.sa.notify("harness-rd", bell("t1", "dev", "run the command"));
@@ -507,12 +529,14 @@ async fn an_expired_approval_is_never_booked_as_applied() {
     let (factory, wires) = approval_factory(Duration::from_millis(400));
     let h = harness_with(
         "approval-expired",
-        1,
-        Duration::from_millis(120),
-        Some("harness-sa"),
         factory,
         wires,
-        0,
+        Limits {
+            max_tasks: 1,
+            approval_retry: Duration::from_millis(120),
+            approver: Some("harness-sa"),
+            ..Limits::standard()
+        },
     )
     .await;
     h.sa.notify("harness-rd", bell("t1", "dev", "run it, nobody answers"));
@@ -585,12 +609,12 @@ async fn the_rss_ceiling_refuses_a_new_task_without_building_an_engine() {
     let (factory, wires) = answer_factory();
     let h = harness_with(
         "rss-drain",
-        4,
-        Duration::from_millis(40),
-        None,
         factory,
         wires,
-        1,
+        Limits {
+            rss_ceiling: 1,
+            ..Limits::standard()
+        },
     )
     .await;
     h.sa.notify("harness-rd", bell("t1", "dev", "build the lru"));
@@ -613,5 +637,57 @@ async fn the_rss_ceiling_refuses_a_new_task_without_building_an_engine() {
         h.wires.lock().unwrap().is_empty(),
         "the ceiling must be checked before an engine is built"
     );
+    h.pool.abort();
+}
+
+/// 退休要证明的是「slot 真的回来了」：上限 1 的 worker 在 t1 空闲退休之后必须接得住
+/// t2。没有退休的话 t2 会被显式拒绝——那是上限该有的行为，不是这一条要的结果。
+#[tokio::test]
+async fn an_idle_task_frees_its_slot_for_the_next_pipeline() {
+    let (factory, wires) = answer_factory();
+    let h = harness_with(
+        "idle-retire",
+        factory,
+        wires,
+        Limits {
+            max_tasks: 1,
+            task_idle_timeout: Duration::from_millis(150),
+            ..Limits::standard()
+        },
+    )
+    .await;
+
+    h.sa.notify("harness-rd", bell("t1", "dev", "first pipeline"));
+    let first = tokio::time::timeout(Duration::from_secs(5), h.sa.recv_notify())
+        .await
+        .expect("no result bell for the first task")
+        .unwrap();
+    assert!(
+        first.payload["result_ref"].is_string(),
+        "the first task is served: {}",
+        first.payload
+    );
+
+    // 空闲 150ms 就提议退休：这里给一拍让 worker 提议、pump 决定都落地
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    h.sa.notify("harness-rd", bell("t2", "dev", "second pipeline"));
+    let second = tokio::time::timeout(Duration::from_secs(5), h.sa.recv_notify())
+        .await
+        .expect("the freed slot never served the second task")
+        .unwrap();
+    assert!(
+        second.payload.get("error").is_none(),
+        "a retired slot must not still count against the cap: {}",
+        second.payload
+    );
+    assert_eq!(second.payload["task_id"], "t2");
+    assert!(
+        second.payload["result_ref"].is_string(),
+        "the second task gets its own result: {}",
+        second.payload
+    );
+    read_artifact(&h.artifacts, "harness-rd-t1-dev-iter1.json").await;
+    read_artifact(&h.artifacts, "harness-rd-t2-dev-iter1.json").await;
     h.pool.abort();
 }

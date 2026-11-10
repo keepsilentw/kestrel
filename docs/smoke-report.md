@@ -7,8 +7,8 @@
 
 ## 1. 自动化测试基线（cargo test）
 
-**Metrics** — src 51 files / 18578 lines · tests 9 files / 3628 lines · 260 tests (lib 204 + bin 4 + integration 52)
-**Integration** — core_loop 5 / discipline 2 / m1_tools 11 / m2_session 6 / m4_bus 15 / m5_pool 7 / sandbox_e2e 4 / wire_anthropic 2
+**Metrics** — src 51 files / 18783 lines · tests 9 files / 3704 lines · 263 tests (lib 206 + bin 4 + integration 53)
+**Integration** — core_loop 5 / discipline 2 / m1_tools 11 / m2_session 6 / m4_bus 15 / m5_pool 8 / sandbox_e2e 4 / wire_anthropic 2
 
 | 组 | 覆盖 |
 |---|---|
@@ -1074,3 +1074,21 @@ receipt、pending、unacked、applied、stale 与 orphan 数量。重复回执�
 
 **验证边界**：只做了 `bash -n` 语法检查，加一次 `serve` 的 flag 解析（拿一个不存在的 role
 文件停在角色加载那步，说明 clap 认这批名字）。**没有跑 demo**：那需要真端点凭据。
+
+## 44. 2026-11-10 三期第十格：空闲 task 退休与会话树重开
+
+`serve --task-idle-timeout-secs N`（缺省 1800，`0` = 永不退休）。空闲到点的 task 引擎被释放，
+`--max-tasks` 的 slot 还给下一条 pipeline；task ↔ 会话树记在 `serve` 侧，同一 task 再响时
+重开**同一棵**树，history 与 read-before-edit 台账从 `prompt_snapshot()` 重建。
+
+退休走提议-批准两拍：worker 只递 `RetireRequested`，由 pump 丢 sender。pump 是唯一能向该
+task 发信的人，而 mpsc 先把已排队的门铃送达才返回 `None`，所以两个顺序都丢不了铃。
+
+三条新测试：`retiring_a_task_frees_the_slot_and_prunes_its_requests`、
+`a_retired_task_reopens_the_same_session_tree`、
+`an_idle_task_frees_its_slot_for_the_next_pipeline`。第三条做了变异验证：空闲超时改回
+`Duration::ZERO` 后它以 `worker is at its task cap (1)` 失败，说明它确实在测退休。
+
+**闸门**：`cargo fmt --check` / `cargo clippy --all-targets -- -D warnings` / `cargo test`
+本轮实跑全绿（263 项）。退休只看空闲，不看「pipeline 是否真结束」——SA 崩溃留下的 task
+一样会被回收；它也不回收正在跑的引擎的内存。
