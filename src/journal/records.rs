@@ -333,6 +333,8 @@ pub struct StateSnapshot {
     /// 名义钱按来源分类（总额仍在 `nominal` 里）。看账的人要能分得出
     /// 「该补价」与「该修读数」是哪些钱（§9.37）。
     pub nominal_by_reason: BTreeMap<NominalReason, f64>,
+    /// 同上，但保留 peer 维度：报账要能指认是哪台 worker 说不清。
+    pub nominal_by_peer_reason: BTreeMap<String, BTreeMap<NominalReason, f64>>,
     /// 每个 (task, stage) **最后一次提交**读出的测试结论（§9.35）。这是状态不是
     /// 历史：历史在 `result_committed` 记录里，这里只回答「现在这一关的测试结论是
     /// 什么」，所以停损报账与返工铃都能 O(1) 读到，不必重读工件。
@@ -396,6 +398,9 @@ pub struct Checkpoint {
     /// 名义钱的来源分类也必须跨检查点活着，否则截断之后「说不清」就只剩一个总数了。
     #[serde(default)]
     pub nominal_by_reason: BTreeMap<NominalReason, f64>,
+    /// peer × 来源分类，跨轮转仍能回答「哪个 peer 为什么说不清」。
+    #[serde(default)]
+    pub nominal_by_peer_reason: BTreeMap<String, BTreeMap<NominalReason, f64>>,
     /// 每个 (task, stage) 最后一次的测试结论。截断把旧前缀折进检查点，若这里空着，
     /// 「这一关测试过没过」就会在轮转后凭空消失——而它现在是状态。
     #[serde(default)]
@@ -421,6 +426,7 @@ impl Checkpoint {
                 .collect(),
             tests: report.state.tests.clone(),
             nominal_by_reason: report.state.nominal_by_reason.clone(),
+            nominal_by_peer_reason: report.state.nominal_by_peer_reason.clone(),
         }
     }
 }
@@ -472,15 +478,31 @@ pub struct Folder {
     /// 名义钱按来源的总额（`nominal` 的分类账）。归零就删键，于是报账不会写出
     /// 「under_reported 0.0000」这种空话。
     nominal_by_reason: BTreeMap<NominalReason, f64>,
+    nominal_by_peer_reason: BTreeMap<String, BTreeMap<NominalReason, f64>>,
 }
 
 impl Folder {
     /// 挪动某个来源的名义金额：加完就删零，避免分类账里留一堆 0.0 的键。
-    fn shift_nominal(&mut self, reason: NominalReason, delta: f64) {
+    fn shift_nominal(&mut self, peer: &str, reason: NominalReason, delta: f64) {
         let slot = self.nominal_by_reason.entry(reason).or_insert(0.0);
         *slot += delta;
         if slot.abs() < 1e-12 {
             self.nominal_by_reason.remove(&reason);
+        }
+        let peer_empty = {
+            let by_reason = self
+                .nominal_by_peer_reason
+                .entry(peer.to_string())
+                .or_default();
+            let slot = by_reason.entry(reason).or_insert(0.0);
+            *slot += delta;
+            if slot.abs() < 1e-12 {
+                by_reason.remove(&reason);
+            }
+            by_reason.is_empty()
+        };
+        if peer_empty {
+            self.nominal_by_peer_reason.remove(peer);
         }
     }
 
@@ -546,7 +568,7 @@ impl Folder {
                     *self.nominal.entry(peer.clone()).or_insert(0.0) += cost;
                     // 预留在记下来时就是名义的，只可能是「价格表里查不到这个 peer 的
                     // model」——按构造如此（§9.27），所以这里不需要额外字段。
-                    self.shift_nominal(NominalReason::NoRate, *cost);
+                    self.shift_nominal(peer, NominalReason::NoRate, *cost);
                 }
                 self.reserved
                     .insert(budget_key(task, peer, *stage, *iteration), (*cost, *priced));
@@ -577,12 +599,16 @@ impl Folder {
                             *slot = 0.0;
                         }
                         // 之前那笔名义钱来自预留（BudgetSpent），来源只能是「没有价」。
-                        self.shift_nominal(NominalReason::NoRate, -prior_cost);
+                        self.shift_nominal(peer, NominalReason::NoRate, -prior_cost);
                     }
                     if !priced {
                         *self.nominal.entry(peer.clone()).or_insert(0.0) += cost;
                         // 老记录没有这个字段：按「没有价」处理，而不是按 0 或猜别的。
-                        self.shift_nominal(nominal_reason.unwrap_or(NominalReason::NoRate), *cost);
+                        self.shift_nominal(
+                            peer,
+                            nominal_reason.unwrap_or(NominalReason::NoRate),
+                            *cost,
+                        );
                     }
                 }
             }
@@ -625,6 +651,9 @@ impl Folder {
                 self.nominal_by_reason.clear();
                 self.nominal_by_reason
                     .extend(checkpoint.nominal_by_reason.clone());
+                self.nominal_by_peer_reason.clear();
+                self.nominal_by_peer_reason
+                    .extend(checkpoint.nominal_by_peer_reason.clone());
                 self.settled.last_stage = checkpoint.stage;
                 self.settled.max_iteration = checkpoint.iteration;
                 // Receipt keys of the archived prefix go with it: the bells they
@@ -650,6 +679,7 @@ impl Folder {
                 spent: self.spent.clone(),
                 nominal: self.nominal.clone(),
                 nominal_by_reason: self.nominal_by_reason.clone(),
+                nominal_by_peer_reason: self.nominal_by_peer_reason.clone(),
                 tokens: self.tokens.clone(),
                 reserved: self.reserved.clone(),
                 tests: self.tests.clone(),
@@ -1081,6 +1111,7 @@ mod tests {
             reserved: vec![(key, (0.5, true))],
             tests: Default::default(),
             nominal_by_reason: Default::default(),
+            nominal_by_peer_reason: Default::default(),
         };
         let records = vec![
             JournalRecord::Snapshot {
@@ -1176,6 +1207,7 @@ mod tests {
             reserved: vec![(key, (0.5, true))],
             tests: Default::default(),
             nominal_by_reason: Default::default(),
+            nominal_by_peer_reason: Default::default(),
         };
         let record = JournalRecord::Snapshot {
             covers: 1,
@@ -1304,6 +1336,13 @@ mod tests {
             "来源还要说得出这笔为什么算不成账单: {:?}",
             rep.state.nominal_by_reason
         );
+        assert!(
+            (rep.state.nominal_by_peer_reason["qa"][&NominalReason::UnderReported] - 0.160_768)
+                .abs()
+                < 1e-12,
+            "分类还要落到具体 peer: {:?}",
+            rep.state.nominal_by_peer_reason
+        );
     }
 
     /// 名义钱分得清来源了（§9.37）：「没填价」与「读数不可信」是两种不同的说不清，
@@ -1344,9 +1383,30 @@ mod tests {
         );
         let by_peer: f64 = rep.state.nominal.values().sum();
         let by_reason: f64 = rep.state.nominal_by_reason.values().sum();
+        let by_peer_reason: f64 = rep
+            .state
+            .nominal_by_peer_reason
+            .values()
+            .flat_map(|reasons| reasons.values())
+            .sum();
         assert!(
             (by_peer - by_reason).abs() < 1e-12,
             "分类账加起来必须等于总数: {by_peer} vs {by_reason}"
+        );
+        assert!(
+            (by_peer - by_peer_reason).abs() < 1e-12,
+            "peer × 原因也必须等于总数: {by_peer} vs {by_peer_reason}"
+        );
+        assert!(
+            (rep.state.nominal_by_peer_reason["rd"][&NominalReason::NoRate] - 0.5).abs() < 1e-12,
+            "{:?}",
+            rep.state.nominal_by_peer_reason
+        );
+        assert!(
+            (rep.state.nominal_by_peer_reason["qa"][&NominalReason::UnderReported] - 0.032).abs()
+                < 1e-12,
+            "{:?}",
+            rep.state.nominal_by_peer_reason
         );
 
         // 老记录没有这个字段：按「没有价」处理，不去猜别的来源。
@@ -1367,10 +1427,19 @@ mod tests {
             "没有来源标记就不能算成「少报」: {:?}",
             legacy.state.nominal_by_reason
         );
+        assert!(
+            (legacy.state.nominal_by_peer_reason["qa"][&NominalReason::NoRate] - 0.4).abs() < 1e-12,
+            "{:?}",
+            legacy.state.nominal_by_peer_reason
+        );
 
         // 检查点必须带着分类账：否则截断之后「说不清」只剩一个总数。
         let cp = Checkpoint::capture(&rep);
         assert_eq!(cp.nominal_by_reason.len(), 2, "{:?}", cp.nominal_by_reason);
+        assert_eq!(
+            cp.nominal_by_peer_reason, rep.state.nominal_by_peer_reason,
+            "peer 维度也必须进检查点"
+        );
         let line = serde_json::to_string(&JournalRecord::Snapshot {
             covers: 3,
             checkpoint: cp,
@@ -1381,6 +1450,10 @@ mod tests {
         assert_eq!(
             after.state.nominal_by_reason, rep.state.nominal_by_reason,
             "截断前后分类必须一致"
+        );
+        assert_eq!(
+            after.state.nominal_by_peer_reason, rep.state.nominal_by_peer_reason,
+            "截断前后 peer × 原因分类必须一致"
         );
     }
 

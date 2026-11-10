@@ -7,7 +7,7 @@
 
 ## 1. 自动化测试基线（cargo test）
 
-**Metrics** — src 51 files / 17825 lines · tests 9 files / 3577 lines · 254 tests (lib 199 + bin 4 + integration 51)
+**Metrics** — src 51 files / 17910 lines · tests 9 files / 3577 lines · 254 tests (lib 199 + bin 4 + integration 51)
 **Integration** — core_loop 5 / discipline 2 / m1_tools 11 / m2_session 6 / m4_bus 15 / m5_pool 6 / sandbox_e2e 4 / wire_anthropic 2
 
 | 组 | 覆盖 |
@@ -986,3 +986,21 @@ execute 阶段，不改变逐条 prepare、审批顺序、`RwLock` 的串行工�
 
 **验证边界**：本格通过 fmt、clippy 与完整测试；真实端点联跑未执行。共享工具槽限制的是
 同时执行的工具数量，不是 RSS 上限。
+
+## 38. 2026-11-10 三期第四格：名义成本细到 peer × 原因
+
+`StateSnapshot` 与 `Checkpoint` 新增 `nominal_by_peer_reason`。原有全局
+`nominal_by_reason`、按 peer 的 `nominal` 和新的二维分类必须同时存在且总额相等；旧检查点
+缺字段时读出空表，不影响重放。
+
+报账逐 peer 行现在显示来源明细，例如 `(nominal: no rate 0.5000)` 或
+`(nominal: under-reported 0.0320)`；总账行继续保留全局来源分类。
+
+测试 `nominal_money_says_which_reason_it_is` 已扩展为同时断言：
+
+- `nominal` 总额 = 全局原因分类总额 = `peer × 原因` 展平总额；
+- RD 的 `no rate` 与 QA 的 `under-reported` 各自落到正确 peer；
+- 检查点捕获和序列化往返后二维分类不变。
+
+**验证边界**：当前是投影、检查点与单测级验证；没有用真实端点生成同时含两个 peer 和两种
+名义原因的 pipeline 样本。

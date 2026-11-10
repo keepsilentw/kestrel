@@ -1006,6 +1006,22 @@ fn report_ledger(journal: &Journal, ledger: &PriceLedger, unit: &str) {
         .collect();
     for (peer, cost) in &state.spent {
         let tokens = state.tokens.get(peer).copied().unwrap_or_default();
+        let peer_reasons: Vec<String> = state
+            .nominal_by_peer_reason
+            .get(peer)
+            .into_iter()
+            .flatten()
+            .map(|(reason, amount)| format!("{} {}", reason.label(), money(*amount)))
+            .collect();
+        let nominal_note = if peer_reasons.is_empty() {
+            if ledger.is_priced(peer) {
+                String::new()
+            } else {
+                " (nominal backend: no rate)".to_string()
+            }
+        } else {
+            format!(" (nominal: {})", peer_reasons.join(", "))
+        };
         let unsettled = state
             .reserved
             .iter()
@@ -1014,11 +1030,7 @@ fn report_ledger(journal: &Journal, ledger: &PriceLedger, unit: &str) {
         println!(
             "[sa] ledger {peer}: {} {unit}{}{} ; tokens in {} / out {}{}",
             money(*cost),
-            if ledger.is_priced(peer) {
-                ""
-            } else {
-                " (nominal backend: no rate)"
-            },
+            nominal_note,
             if unsettled > 0 {
                 format!("; {unsettled} reservation(s) unsettled")
             } else {
