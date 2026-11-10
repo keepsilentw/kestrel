@@ -11,6 +11,7 @@
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use serde_json::Value;
@@ -54,6 +55,9 @@ pub struct ServeArgs {
     /// How many tools all tasks in this worker may execute concurrently.
     /// 0 means no worker-wide ceiling.
     pub max_worker_tools: usize,
+    /// Optional machine-readable worker status path.
+    pub status_file: Option<PathBuf>,
+    pub status_interval: Duration,
 }
 
 /// Resident worker: one long-lived process, one engine + session tree per task.
@@ -88,6 +92,13 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         .cloned()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let role_name = role.role.clone();
+    if let Some(path) = &args.status_file
+        && let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create worker status dir {}", parent.display()))?;
+    }
     let worker_tool_slots = (args.max_worker_tools > 0)
         .then(|| Arc::new(tokio::sync::Semaphore::new(args.max_worker_tools)));
     let cfg = Arc::new(PoolConfig {
@@ -98,9 +109,13 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         // whoever rang this bell", which in the star topology is the SA.
         approver: role.approver().map(str::to_string),
         max_tasks: args.max_tasks,
+        max_parallel_tools: args.max_parallel_tools,
+        max_worker_tools: args.max_worker_tools,
         // 审批请求的重发节奏跟着这个 worker 的审批窗口走（runtime > role，
         // 与 approve 模式同一份来源，不在这里再读一次 role）
         approval_retry: approve.approval_retry_period(),
+        status_file: args.status_file.clone(),
+        status_interval: args.status_interval,
     });
 
     let model = args.model.clone();

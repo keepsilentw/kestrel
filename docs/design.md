@@ -20,7 +20,7 @@
 > 质量闸门保持人工执行（本仓库不挂 CI，见 §9.19⑥）。
 > 二期十一项已于 2026-11-04 在真端点联跑中走完（`pipeline complete`，四阶段全 pass，
 > 审批请求/判定/回执各 5 条成对）；那一次联跑抓出并修掉两个「测试全绿但跑不起来」的缺陷，见 §9.32。
-> **Metrics** — src 51 files / 18338 lines · tests 9 files / 3577 lines · 256 tests (lib 201 + bin 4 + integration 51)
+> **Metrics** — src 51 files / 18462 lines · tests 9 files / 3581 lines · 257 tests (lib 202 + bin 4 + integration 51)
 > **Integration** — core_loop 5 / discipline 2 / m1_tools 11 / m2_session 6 / m4_bus 15 / m5_pool 6 / sandbox_e2e 4 / wire_anthropic 2
 > 规模已过 plan 预算（10-13k）的上沿：多出来的部分几乎都花在「取消安全」与「对账」这两条纪律上。
 > 上面两行数字由 `tests/discipline.rs::metrics_lines_match_the_tree` 对照源码树重算校验——
@@ -406,6 +406,13 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
     ③ 另报 `orphan_decisions` 与 `orphan_receipts`：没有请求记录的裁决/回执不猜成正常链路，它们是审计链断裂的现场。
     ④ JSON 与人类输出都可选包含审批汇总；`--check` 仍只把重复段和 `.new` 残留判为失败，审批状态目前是观测项，不擅自把 pending 当成故障——长审批窗口是合法状态。
     ⑤ 测试 `approval_status_counts_pending_unacked_applied_stale_and_orphans` 覆盖全部计数与 JSON 字段；真实端点审批流量未重跑。
+
+52. **三期第七格：常驻 worker 状态文件（2026-11-10）**：
+    ① `serve --status-file <path>` 周期性输出 JSON，包含 session、role、排序后的 active tasks、task count、open approvals、`max_tasks` / `max_parallel_tools` / `max_worker_tools` 与 `updated_unix_secs`。默认间隔 5 秒，`--status-interval-secs 0` 在有状态文件时启动失败，避免零周期忙等。
+    ② 写入顺序是同目录临时文件 → `rename` 原子替换，读者不会看到半份 JSON。父目录在 serve 启动时创建；单次状态写入失败只 warn，不终止 worker。状态文件是观测面，不参与路由、审批或停损决策。
+    ③ 状态源来自 pump 持有的 Router：task 集合与 `req_owner` 是同一份真相，不再由旁路探测总线或猜活动任务。活动 task 排序后输出，便于稳定 diff。
+    ④ 测试 `worker_status_document_is_atomic_and_reports_router_state` 覆盖活动 task 排序、未决审批数、并发上限、session、落盘 JSON 以及 `.tmp` 不残留。
+    ⑤ 边界：这解决“worker 现在在做什么”的可见性，不解决空闲 task 永不退休。`--max-tasks` 目前仍是硬上限且任务集合只增不减；退休/重建引擎需要另定义会话续接与取消握手。
 
 ## 10 二期清单
 

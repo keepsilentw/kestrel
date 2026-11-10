@@ -71,7 +71,11 @@ async fn harness_with(
         artifacts_dir: artifacts.clone(),
         approver: approver.map(str::to_string),
         max_tasks,
+        max_parallel_tools: kestrel::tools::DEFAULT_MAX_PARALLEL_TOOLS,
+        max_worker_tools: kestrel::tools::DEFAULT_MAX_WORKER_TOOLS,
         approval_retry,
+        status_file: None,
+        status_interval: Duration::from_secs(5),
     });
     let pool = tokio::spawn(async move {
         if let Err(e) = run_pool(worker, cfg, factory).await {

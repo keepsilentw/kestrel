@@ -12,7 +12,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use serde_json::Value;
@@ -146,6 +146,12 @@ impl Router {
     pub fn open_requests(&self) -> usize {
         self.req_owner.len()
     }
+
+    fn active_tasks(&self) -> Vec<String> {
+        let mut tasks: Vec<String> = self.tasks.iter().cloned().collect();
+        tasks.sort();
+        tasks
+    }
 }
 
 /// A task's engine plus the event stream the worker drives.
@@ -166,10 +172,15 @@ pub struct PoolConfig {
     /// `approve = "bus"`: the peer that answers; `None` means "whoever rang".
     pub approver: Option<String>,
     pub max_tasks: usize,
+    pub max_parallel_tools: usize,
+    pub max_worker_tools: usize,
     /// How often an unanswered approval request is re-sent (§10 批复的可靠投递).
     /// `serve` folds it out of the role's `approve_timeout_secs` so the retries
     /// land *inside* the window that ends in a deny.
     pub approval_retry: Duration,
+    /// Optional machine-readable worker status, atomically replaced on each tick.
+    pub status_file: Option<PathBuf>,
+    pub status_interval: Duration,
 }
 
 /// An approval request that is still in flight: the frame itself (so a retry is
@@ -193,6 +204,16 @@ pub async fn run_pool(
     let mut router = Router::new(cfg.max_tasks);
     let mut workers: HashMap<String, mpsc::UnboundedSender<TaskMsg>> = HashMap::new();
     let mut joins: Vec<AbortOnDropHandle<()>> = Vec::new();
+    if cfg.status_file.is_some() && cfg.status_interval.is_zero() {
+        anyhow::bail!("worker status interval must be greater than zero");
+    }
+    let status_interval = if cfg.status_file.is_some() {
+        cfg.status_interval
+    } else {
+        Duration::from_secs(3600)
+    };
+    let mut status_tick = tokio::time::interval(status_interval);
+    status_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // A dedicated reader task, not a `select!` arm: when select! loses a race it
     // drops the losing future, and a frame that was already on its way would be
@@ -320,6 +341,14 @@ pub async fn run_pool(
                     }
                 }
             }
+            _ = status_tick.tick(), if cfg.status_file.is_some() => {
+                if let Some(path) = &cfg.status_file {
+                    let document = status_document(&cfg, &router);
+                    if let Err(error) = write_status_file(path, &document) {
+                        tracing::warn!("write worker status {}: {error}", path.display());
+                    }
+                }
+            }
         }
     }
 
@@ -330,6 +359,33 @@ pub async fn run_pool(
         let _ = join.await;
     }
     Ok(())
+}
+
+fn status_document(cfg: &PoolConfig, router: &Router) -> Value {
+    serde_json::json!({
+        "session": cfg.session,
+        "role": cfg.role,
+        "active_tasks": router.active_tasks(),
+        "task_count": router.task_count(),
+        "open_approvals": router.open_requests(),
+        "max_tasks": cfg.max_tasks,
+        "max_parallel_tools": cfg.max_parallel_tools,
+        "max_worker_tools": cfg.max_worker_tools,
+        "updated_unix_secs": SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    })
+}
+
+fn write_status_file(path: &std::path::Path, document: &Value) -> anyhow::Result<()> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("worker-status.json");
+    let staged = path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
+    std::fs::write(&staged, serde_json::to_vec(document)?)?;
+    Ok(std::fs::rename(staged, path)?)
 }
 
 /// One task's loop: bell -> turn -> artifact -> result bell, plus the approval
@@ -698,5 +754,48 @@ mod tests {
         assert_eq!(r.open_requests(), 1);
         r.close_request("req-8");
         assert_eq!(r.open_requests(), 0);
+    }
+
+    #[test]
+    fn worker_status_document_is_atomic_and_reports_router_state() {
+        let mut router = Router::new(4);
+        assert!(matches!(router.on_bell("t2"), Action::Spawn(_)));
+        assert!(matches!(router.on_bell("t1"), Action::Spawn(_)));
+        router.on_approval_opened("req-1", "t2");
+        let cfg = PoolConfig {
+            session: "harness-rd".into(),
+            role: "rd".into(),
+            artifacts_dir: std::env::temp_dir().join("unused-artifacts"),
+            approver: None,
+            max_tasks: 4,
+            max_parallel_tools: 4,
+            max_worker_tools: 8,
+            approval_retry: Duration::from_secs(1),
+            status_file: None,
+            status_interval: Duration::from_secs(5),
+        };
+        let document = status_document(&cfg, &router);
+        assert_eq!(document["active_tasks"], serde_json::json!(["t1", "t2"]));
+        assert_eq!(document["task_count"], 2);
+        assert_eq!(document["open_approvals"], 1);
+        assert_eq!(document["max_worker_tools"], 8);
+
+        let path =
+            std::env::temp_dir().join(format!("kestrel-worker-status-{}.json", std::process::id()));
+        write_status_file(&path, &document).unwrap();
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written["session"], "harness-rd");
+        assert!(
+            !path
+                .with_file_name(format!(
+                    ".{}.{}.tmp",
+                    path.file_name().unwrap().to_str().unwrap(),
+                    std::process::id()
+                ))
+                .exists(),
+            "the staged status file was renamed, not left behind"
+        );
+        std::fs::remove_file(path).ok();
     }
 }

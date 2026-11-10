@@ -7,7 +7,7 @@
 
 ## 1. 自动化测试基线（cargo test）
 
-**Metrics** — src 51 files / 18338 lines · tests 9 files / 3577 lines · 256 tests (lib 201 + bin 4 + integration 51)
+**Metrics** — src 51 files / 18462 lines · tests 9 files / 3581 lines · 257 tests (lib 202 + bin 4 + integration 51)
 **Integration** — core_loop 5 / discipline 2 / m1_tools 11 / m2_session 6 / m4_bus 15 / m5_pool 6 / sandbox_e2e 4 / wire_anthropic 2
 
 | 组 | 覆盖 |
@@ -1032,3 +1032,12 @@ receipt、pending、unacked、applied、stale 与 orphan 数量。重复回执�
 
 测试 `approval_status_counts_pending_unacked_applied_stale_and_orphans` 覆盖全部计数与 JSON
 字段。真实审批流量未重跑。
+
+## 41. 2026-11-10 三期第七格：常驻 worker 状态文件
+
+`serve --status-file <path> [--status-interval-secs 5]` 周期性原子写入 session、role、
+排序后的活动 task、未决审批数和并发上限。写入采用同目录临时文件加 rename；失败只 warn，
+不终止 worker。
+
+测试 `worker_status_document_is_atomic_and_reports_router_state` 验证活动 task 排序、审批数、
+上限、落盘 JSON 与临时文件不残留。该状态只提供可见性，不改变 task 永不退休的现有边界。

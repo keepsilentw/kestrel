@@ -129,6 +129,14 @@ struct ServeCmd {
     #[arg(long, default_value_t = kestrel::tools::DEFAULT_MAX_WORKER_TOOLS)]
     max_worker_tools: usize,
 
+    /// Atomically write a machine-readable worker status document.
+    #[arg(long)]
+    status_file: Option<PathBuf>,
+
+    /// Status refresh interval in seconds.
+    #[arg(long, default_value_t = 5)]
+    status_interval_secs: u64,
+
     #[command(flatten)]
     backend: BackendArgs,
 }
@@ -441,6 +449,8 @@ async fn main() -> anyhow::Result<()> {
                 max_tasks: s.max_tasks,
                 max_parallel_tools: s.max_parallel_tools,
                 max_worker_tools: s.max_worker_tools,
+                status_file: s.status_file,
+                status_interval: Duration::from_secs(s.status_interval_secs),
                 approve: approve.map(|mode| with_role_deadline(mode, Some(&role))),
             })
             .await;
