@@ -7,7 +7,7 @@
 
 ## 1. 自动化测试基线（cargo test）
 
-**Metrics** — src 51 files / 18194 lines · tests 9 files / 3577 lines · 255 tests (lib 200 + bin 4 + integration 51)
+**Metrics** — src 51 files / 18338 lines · tests 9 files / 3577 lines · 256 tests (lib 201 + bin 4 + integration 51)
 **Integration** — core_loop 5 / discipline 2 / m1_tools 11 / m2_session 6 / m4_bus 15 / m5_pool 6 / sandbox_e2e 4 / wire_anthropic 2
 
 | 组 | 覆盖 |
@@ -1020,3 +1020,15 @@ execute 阶段，不改变逐条 prepare、审批顺序、`RwLock` 的串行工�
 
 测试 `judgment_issues_are_typed_and_legacy_strings_still_parse` 覆盖旧字符串、新对象、
 混合归因与字节往返。真实端点未重跑。
+
+## 40. 2026-11-10 三期第六格：审批链审计状态
+
+`journal-status --approvals` 重放归档段和活文件里的审批审计记录，汇总 request / decision /
+receipt、pending、unacked、applied、stale 与 orphan 数量。重复回执按强弱合并，`true`
+不会被后到的 `false` 降级。
+
+`--json` 可在同一 JSON 文档中包含审批汇总；`--check` 不把合法长等待的 pending 当故障，
+目前只对重复段和 `.new` 残留返回非零。
+
+测试 `approval_status_counts_pending_unacked_applied_stale_and_orphans` 覆盖全部计数与 JSON
+字段。真实审批流量未重跑。

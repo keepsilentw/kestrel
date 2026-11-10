@@ -20,7 +20,7 @@
 > 质量闸门保持人工执行（本仓库不挂 CI，见 §9.19⑥）。
 > 二期十一项已于 2026-11-04 在真端点联跑中走完（`pipeline complete`，四阶段全 pass，
 > 审批请求/判定/回执各 5 条成对）；那一次联跑抓出并修掉两个「测试全绿但跑不起来」的缺陷，见 §9.32。
-> **Metrics** — src 51 files / 18194 lines · tests 9 files / 3577 lines · 255 tests (lib 200 + bin 4 + integration 51)
+> **Metrics** — src 51 files / 18338 lines · tests 9 files / 3577 lines · 256 tests (lib 201 + bin 4 + integration 51)
 > **Integration** — core_loop 5 / discipline 2 / m1_tools 11 / m2_session 6 / m4_bus 15 / m5_pool 6 / sandbox_e2e 4 / wire_anthropic 2
 > 规模已过 plan 预算（10-13k）的上沿：多出来的部分几乎都花在「取消安全」与「对账」这两条纪律上。
 > 上面两行数字由 `tests/discipline.rs::metrics_lines_match_the_tree` 对照源码树重算校验——
@@ -399,6 +399,13 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
     ③ 线形兼容：新 issue 序列化为 `{"message": "...", "attribution": "turn"}`；旧 journal 的字符串 issue 反序列化为 `Artifact`，旧行的全局 `attribution: turn` 原样保留。读侧 `JudgmentIssue` 实现 `Deref<str>`、`Borrow<str>` 和字符串比较，现有报账/返工文案不重复拼一遍。
     ④ 判定产出的每个入口都已显式选边：空结果/abort/worker stop/工件缺失属于 `Turn`；FAIL 文案、缺证据、类型不符与 stage 要求缺失属于 `Artifact`。测试 `judgment_issues_are_typed_and_legacy_strings_still_parse` 钉住新旧线形与混合归因。
     ⑤ 边界：这是编译期与线形约束，不改变当前路由策略；真正的 `JudgmentIssue` 变体是否要拆得更细仍可后议。当前验证是单测与完整源码闸门，真端点未重跑。
+
+51. **三期第六格：审批链审计状态（2026-11-10）**：
+    ① `journal-status --approvals` 对 `replay_all()` 中的 `ApprovalRequested` / `ApprovalDecided` / `ApprovalAcked` 做一次只读汇总。默认状态路径仍然只读 metadata；只有显式请求才重放审批记录。
+    ② 计数分成 `requests` / `decisions` / `receipts`，以及 `pending`（有请求无裁决）、`unacked`（有裁决无回执）、`applied`（最强回执为 true）、`stale`（最强回执为 false）。同一 req 的重复回执按强弱合并，`true` 不会被后到的 `false` 降级，与 §9.42 的台账语义一致。
+    ③ 另报 `orphan_decisions` 与 `orphan_receipts`：没有请求记录的裁决/回执不猜成正常链路，它们是审计链断裂的现场。
+    ④ JSON 与人类输出都可选包含审批汇总；`--check` 仍只把重复段和 `.new` 残留判为失败，审批状态目前是观测项，不擅自把 pending 当成故障——长审批窗口是合法状态。
+    ⑤ 测试 `approval_status_counts_pending_unacked_applied_stale_and_orphans` 覆盖全部计数与 JSON 字段；真实端点审批流量未重跑。
 
 ## 10 二期清单
 

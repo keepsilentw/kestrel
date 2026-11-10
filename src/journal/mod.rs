@@ -61,6 +61,8 @@ pub struct JournalStatus {
     pub total_segment_bytes: u64,
     pub staged_files: usize,
     pub segments: Vec<SegmentStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approvals: Option<ApprovalStatus>,
 }
 
 impl JournalStatus {
@@ -80,6 +82,26 @@ pub struct ArchiveMove {
     pub source: PathBuf,
     pub destination: PathBuf,
     pub destination_exists: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ApprovalStatus {
+    pub requests: usize,
+    pub decisions: usize,
+    pub receipts: usize,
+    pub pending: usize,
+    pub unacked: usize,
+    pub applied: usize,
+    pub stale: usize,
+    pub orphan_decisions: usize,
+    pub orphan_receipts: usize,
+}
+
+#[derive(Default)]
+struct ApprovalAudit {
+    requested: bool,
+    decided: bool,
+    applied: Option<bool>,
 }
 
 use std::sync::Mutex;
@@ -222,7 +244,42 @@ impl Journal {
             total_segment_bytes: segments.iter().map(|segment| segment.bytes).sum(),
             staged_files: staged_files(self.path.parent()),
             segments,
+            approvals: None,
         }
+    }
+
+    /// Full approval audit, including archived segments. This reads records, so
+    /// it is opt-in rather than part of the cheap default status path.
+    pub fn approval_status(&self) -> ApprovalStatus {
+        let mut by_req: BTreeMap<String, ApprovalAudit> = BTreeMap::new();
+        for record in self.replay_all() {
+            match record {
+                JournalRecord::ApprovalRequested { req, .. } => {
+                    by_req.entry(req).or_default().requested = true;
+                }
+                JournalRecord::ApprovalDecided { req, .. } => {
+                    by_req.entry(req).or_default().decided = true;
+                }
+                JournalRecord::ApprovalAcked { req, applied, .. } => {
+                    let entry = by_req.entry(req).or_default();
+                    entry.applied = Some(entry.applied.unwrap_or(false) || applied);
+                }
+                _ => {}
+            }
+        }
+        let mut status = ApprovalStatus::default();
+        for entry in by_req.values() {
+            status.requests += usize::from(entry.requested);
+            status.decisions += usize::from(entry.decided);
+            status.receipts += usize::from(entry.applied.is_some());
+            status.pending += usize::from(entry.requested && !entry.decided);
+            status.unacked += usize::from(entry.decided && entry.applied.is_none());
+            status.applied += usize::from(entry.applied == Some(true));
+            status.stale += usize::from(entry.applied == Some(false));
+            status.orphan_decisions += usize::from(!entry.requested && entry.decided);
+            status.orphan_receipts += usize::from(!entry.requested && entry.applied.is_some());
+        }
+        status
     }
 
     /// Records currently in the live file (torn tail excluded).
@@ -903,6 +960,71 @@ mod tests {
         assert_eq!(healthy.duplicate_segments, 0);
         assert_eq!(healthy.staged_files, 0);
         assert!(healthy.is_healthy());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn approval_status_counts_pending_unacked_applied_stale_and_orphans() {
+        let dir = scratch("approval-status");
+        let path = dir.join("journal.jsonl");
+        let journal = Journal::create(&path).unwrap();
+        for record in [
+            JournalRecord::ApprovalRequested {
+                task: "t".into(),
+                peer: "rd".into(),
+                req: "a".into(),
+                command: "cargo test".into(),
+            },
+            JournalRecord::ApprovalDecided {
+                req: "a".into(),
+                decision: "allow".into(),
+                by: "sa".into(),
+            },
+            JournalRecord::ApprovalAcked {
+                req: "a".into(),
+                by: "rd".into(),
+                applied: false,
+            },
+            JournalRecord::ApprovalAcked {
+                req: "a".into(),
+                by: "rd".into(),
+                applied: true,
+            },
+            JournalRecord::ApprovalRequested {
+                task: "t".into(),
+                peer: "rd".into(),
+                req: "b".into(),
+                command: "cargo build".into(),
+            },
+            JournalRecord::ApprovalDecided {
+                req: "c".into(),
+                decision: "deny".into(),
+                by: "sa".into(),
+            },
+            JournalRecord::ApprovalAcked {
+                req: "d".into(),
+                by: "rd".into(),
+                applied: false,
+            },
+        ] {
+            journal.append(&record).unwrap();
+        }
+
+        let approvals = journal.approval_status();
+        assert_eq!(approvals.requests, 2);
+        assert_eq!(approvals.decisions, 2);
+        assert_eq!(approvals.receipts, 2);
+        assert_eq!(approvals.pending, 1);
+        assert_eq!(approvals.unacked, 1);
+        assert_eq!(approvals.applied, 1);
+        assert_eq!(approvals.stale, 1);
+        assert_eq!(approvals.orphan_decisions, 1);
+        assert_eq!(approvals.orphan_receipts, 1);
+
+        let mut status = journal.status();
+        status.approvals = Some(approvals);
+        let json = serde_json::to_value(status).unwrap();
+        assert_eq!(json["approvals"]["unacked"], 1);
         std::fs::remove_dir_all(&dir).ok();
     }
 

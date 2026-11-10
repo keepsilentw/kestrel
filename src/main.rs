@@ -290,6 +290,11 @@ struct JournalStatusCmd {
     /// Exit non-zero when duplicate segment ranges or staged residue are found.
     #[arg(long)]
     check: bool,
+
+    /// Replay approval audit records and include pending, decided, receipted and
+    /// orphaned request counts.
+    #[arg(long)]
+    approvals: bool,
 }
 
 #[tokio::main]
@@ -349,7 +354,10 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::JournalStatus(s)) => {
             let path = shellexpand_home(&s.journal.to_string_lossy());
             let journal = Journal::open(&path)?;
-            let status = journal.status();
+            let mut status = journal.status();
+            if s.approvals {
+                status.approvals = Some(journal.approval_status());
+            }
             if s.json {
                 println!("{}", serde_json::to_string_pretty(&status)?);
                 if s.check && !status.is_healthy() {
@@ -377,6 +385,20 @@ async fn main() -> anyhow::Result<()> {
                 status.duplicate_segments
             );
             println!("staged residue: {} file(s)", status.staged_files);
+            if let Some(approvals) = &status.approvals {
+                println!(
+                    "approvals: {} request(s), {} decision(s), {} receipt(s), {} pending, {} unacked, {} applied, {} stale, {} orphan decision(s), {} orphan receipt(s)",
+                    approvals.requests,
+                    approvals.decisions,
+                    approvals.receipts,
+                    approvals.pending,
+                    approvals.unacked,
+                    approvals.applied,
+                    approvals.stale,
+                    approvals.orphan_decisions,
+                    approvals.orphan_receipts
+                );
+            }
             if s.list {
                 for segment in &status.segments {
                     println!(
