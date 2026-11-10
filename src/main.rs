@@ -90,6 +90,8 @@ enum Command {
     Hub(HubCmd),
     /// Move sealed journal segments into `<journal-stem>.segments/`.
     JournalArchive(JournalArchiveCmd),
+    /// Summarize live records, sealed segments and staged-file residue.
+    JournalStatus(JournalStatusCmd),
 }
 
 #[derive(Args, Debug)]
@@ -266,6 +268,17 @@ struct JournalArchiveCmd {
     keep: usize,
 }
 
+#[derive(Args, Debug)]
+struct JournalStatusCmd {
+    /// Journal whose live file and sealed segments should be summarized.
+    #[arg(long, default_value = "journal.jsonl")]
+    journal: PathBuf,
+
+    /// Print each segment instead of only the aggregate counts.
+    #[arg(long)]
+    list: bool,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -293,6 +306,36 @@ async fn main() -> anyhow::Result<()> {
                     dir.display()
                 ),
                 None => println!("journal archive: moved {moved} sealed segment(s)"),
+            }
+            return Ok(());
+        }
+        Some(Command::JournalStatus(s)) => {
+            let path = shellexpand_home(&s.journal.to_string_lossy());
+            let journal = Journal::open(&path)?;
+            let status = journal.status();
+            println!(
+                "journal: {} live record(s) / {} byte(s)",
+                status.live_records, status.live_bytes
+            );
+            println!(
+                "sealed: {} in root, {} archived, {} total / {} byte(s)",
+                status.root_segments,
+                status.archived_segments,
+                status.root_segments + status.archived_segments,
+                status.total_segment_bytes
+            );
+            println!("staged residue: {} file(s)", status.staged_files);
+            if s.list {
+                for segment in status.segments {
+                    println!(
+                        "{} seg{}-{} / {} byte(s) / {}",
+                        if segment.archived { "archived" } else { "root" },
+                        segment.from,
+                        segment.to,
+                        segment.bytes,
+                        segment.path.display()
+                    );
+                }
             }
             return Ok(());
         }

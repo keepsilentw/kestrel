@@ -41,6 +41,26 @@ pub struct Rotation {
     pub covered: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentStatus {
+    pub from: u64,
+    pub to: u64,
+    pub bytes: u64,
+    pub archived: bool,
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JournalStatus {
+    pub live_records: usize,
+    pub live_bytes: u64,
+    pub root_segments: usize,
+    pub archived_segments: usize,
+    pub total_segment_bytes: u64,
+    pub staged_files: usize,
+    pub segments: Vec<SegmentStatus>,
+}
+
 use std::sync::Mutex;
 
 impl Journal {
@@ -125,6 +145,56 @@ impl Journal {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Cheap operational inventory: no journal record is parsed and no
+    /// projection is rebuilt. File sizes come from metadata.
+    pub fn status(&self) -> JournalStatus {
+        let mut segments = Vec::new();
+        let (root_segments, archived_segments) = match (
+            self.path.parent(),
+            self.path.file_stem().and_then(|s| s.to_str()),
+        ) {
+            (Some(dir), Some(stem)) => {
+                let prefix = format!("{stem}.seg");
+                let root = segment_files(dir, &prefix);
+                let archived = self
+                    .segment_archive_dir()
+                    .map(|archive| segment_files(&archive, &prefix))
+                    .unwrap_or_default();
+                let root_len = root.len();
+                let archive_len = archived.len();
+                for (from, to, path) in &root {
+                    segments.push(SegmentStatus {
+                        from: *from,
+                        to: *to,
+                        bytes: file_bytes(path),
+                        archived: false,
+                        path: path.clone(),
+                    });
+                }
+                for (from, to, path) in archived {
+                    segments.push(SegmentStatus {
+                        from,
+                        to,
+                        bytes: file_bytes(path.as_path()),
+                        archived: true,
+                        path,
+                    });
+                }
+                (root_len, archive_len)
+            }
+            _ => (0, 0),
+        };
+        JournalStatus {
+            live_records: self.live_records(),
+            live_bytes: self.file_bytes(),
+            root_segments,
+            archived_segments,
+            total_segment_bytes: segments.iter().map(|segment| segment.bytes).sum(),
+            staged_files: staged_files(self.path.parent()),
+            segments,
+        }
     }
 
     /// Records currently in the live file (torn tail excluded).
@@ -374,6 +444,23 @@ fn segment_files(dir: &Path, prefix: &str) -> Vec<(u64, u64, PathBuf)> {
     }
     found.sort();
     found
+}
+
+fn file_bytes(path: &Path) -> u64 {
+    std::fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+}
+
+fn staged_files(dir: Option<&Path>) -> usize {
+    let Some(dir) = dir else { return 0 };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".new"))
+        .count()
 }
 
 fn write_records(path: &Path, records: &[JournalRecord]) -> anyhow::Result<()> {
@@ -709,6 +796,36 @@ mod tests {
         let after = reconcile(&journal.replay_all());
         assert_eq!(after.state, before.state);
         assert_eq!(after.in_flight, before.in_flight);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn journal_status_counts_live_segments_archive_and_staged_residue() {
+        let dir = scratch("status");
+        let path = dir.join("journal.jsonl");
+        let journal = Journal::create(&path).unwrap();
+        seed(&journal, 2);
+        journal.rotate(0).unwrap().expect("sealed segment");
+
+        let root = journal.status();
+        assert!(root.live_records > 0);
+        assert!(root.live_bytes > 0);
+        assert_eq!(root.root_segments, 1);
+        assert_eq!(root.archived_segments, 0);
+        assert!(root.total_segment_bytes > 0);
+        assert_eq!(root.staged_files, 0);
+        assert_eq!(root.segments.len(), 1);
+        assert!(!root.segments[0].archived);
+
+        journal.archive_segments(0).unwrap();
+        std::fs::write(dir.join("journal.seg0-0.jsonl.new"), "").unwrap();
+        let archived = journal.status();
+        assert_eq!(archived.root_segments, 0);
+        assert_eq!(archived.archived_segments, 1);
+        assert_eq!(archived.staged_files, 1);
+        assert_eq!(archived.segments.len(), 1);
+        assert!(archived.segments[0].archived);
+        assert_eq!(archived.total_segment_bytes, root.total_segment_bytes);
         std::fs::remove_dir_all(&dir).ok();
     }
 

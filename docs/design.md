@@ -20,7 +20,7 @@
 > 质量闸门保持人工执行（本仓库不挂 CI，见 §9.19⑥）。
 > 二期十一项已于 2026-11-04 在真端点联跑中走完（`pipeline complete`，四阶段全 pass，
 > 审批请求/判定/回执各 5 条成对）；那一次联跑抓出并修掉两个「测试全绿但跑不起来」的缺陷，见 §9.32。
-> **Metrics** — src 51 files / 17665 lines · tests 9 files / 3577 lines · 253 tests (lib 198 + bin 4 + integration 51)
+> **Metrics** — src 51 files / 17825 lines · tests 9 files / 3577 lines · 254 tests (lib 199 + bin 4 + integration 51)
 > **Integration** — core_loop 5 / discipline 2 / m1_tools 11 / m2_session 6 / m4_bus 15 / m5_pool 6 / sandbox_e2e 4 / wire_anthropic 2
 > 规模已过 plan 预算（10-13k）的上沿：多出来的部分几乎都花在「取消安全」与「对账」这两条纪律上。
 > 上面两行数字由 `tests/discipline.rs::metrics_lines_match_the_tree` 对照源码树重算校验——
@@ -375,6 +375,7 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
     ③ 区间名仍是幂等键。根目录与归档目录出现同一区间时，根目录副本胜出——它是重试轮转刚刚 fsync 过的较新副本。归档命令在移动前先检查全部目标；任一目标已存在就整体拒绝，不做覆盖，也不留下只移动了一半的新冲突。
     ④ `--keep N` 把最新 N 个已封闭段留在根目录，只移动更旧的部分；缺省 0 表示全部移动。重复执行返回移动 0 个。测试 `sealed_segments_move_to_an_archive_without_changing_history` 覆盖移动后历史等价、二次执行为空、归档旧段与后续新段共存；`archive_keeps_the_requested_newest_segments_in_place` 覆盖热窗口保留和 `keep > 段数` 的空操作。
     ⑤ 边界：这只治理目录，不压缩字节，也不提供自动删除。长运行仍会持续占盘，下一步若是压缩或保留策略，必须另外定义可恢复性和审计窗口，不能借用「轮转不是删除」这条语义偷渡。
+    ⑥ `journal-status` 提供不重放历史的库存摘要：活文件记录/字节、根目录段数、归档段数、段总字节与残留 `.new` 文件数；`--list` 再逐段列出区间、位置和大小。测试 `journal_status_counts_live_segments_archive_and_staged_residue` 覆盖移动前后计数和崩溃残留可见性。
 
 48. **三期第三格：worker 级共享工具并发上限（2026-11-10）**：
     ① 每 task 的 4 个工具槽只能约束一台引擎；`--max-tasks 4` 时全 worker 仍可能同时跑 16 个工具。新增 `--max-worker-tools`（缺省 8，`0` 显式关闭），由一个 `Arc<Semaphore>` 跨该 worker 的所有 task 引擎共享。
