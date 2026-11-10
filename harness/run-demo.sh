@@ -23,6 +23,17 @@
 #   KESTREL_DEMO_PRICES       费率表（默认用 ~/.kestrel/providers.toml）。仓库外的
 #                             实验文件，用来验证「按 token 结算」这条路径——单价跟着
 #                             provider 住，不把费率数字钉进 demo。
+#   KESTREL_DEMO_MAX_TASKS / KESTREL_DEMO_MAX_PARALLEL_TOOLS /
+#   KESTREL_DEMO_MAX_WORKER_TOOLS / KESTREL_DEMO_MAX_RSS_MB
+#                             worker 的三级资源护栏（task 数 / 单 task 工具并发 /
+#                             全 worker 工具并发 / 内存软上限）。**没设就不传 flag**，
+#                             让 serve 用自己的默认值（4 / 4 / 8 / 0 = 不设限）——
+#                             和轮转上限同一套三态语义，脚本不替默认值做决定。
+#                             RSS 那条是软上限：越线后新 task 被显式拒绝成 error 铃，
+#                             已经起好的引擎继续跑完（design §9.53）。
+#   KESTREL_DEMO_STATUS_DIR   设了才给每个 worker 传 --status-file（该目录下
+#                             harness-rd.json / harness-qa.json）；不设 = 不写状态文件。
+#   KESTREL_DEMO_STATUS_INTERVAL  状态刷新秒数（不设 = serve 的默认 5）。
 #
 # 用法：./run-demo.sh
 set -euo pipefail
@@ -76,11 +87,31 @@ if [ ! -S "$SOCKET" ]; then
 fi
 
 # --- 1. worker ×2：角色决定权限/沙箱/提示词与后端（一角色一后端）
+# 资源护栏：没设环境变量就**不传 flag**，走 serve 的默认值（与下面的 ROTATE_ARGS 同理）。
+RESOURCE_ARGS=()
+[ -z "${KESTREL_DEMO_MAX_TASKS+set}" ] || RESOURCE_ARGS+=(--max-tasks "$KESTREL_DEMO_MAX_TASKS")
+[ -z "${KESTREL_DEMO_MAX_PARALLEL_TOOLS+set}" ] || RESOURCE_ARGS+=(--max-parallel-tools "$KESTREL_DEMO_MAX_PARALLEL_TOOLS")
+[ -z "${KESTREL_DEMO_MAX_WORKER_TOOLS+set}" ] || RESOURCE_ARGS+=(--max-worker-tools "$KESTREL_DEMO_MAX_WORKER_TOOLS")
+[ -z "${KESTREL_DEMO_MAX_RSS_MB+set}" ] || RESOURCE_ARGS+=(--max-rss-mb "$KESTREL_DEMO_MAX_RSS_MB")
+[ -z "${KESTREL_DEMO_STATUS_INTERVAL+set}" ] || RESOURCE_ARGS+=(--status-interval-secs "$KESTREL_DEMO_STATUS_INTERVAL")
+
+# 状态文件按 session 分开：两个 worker 写同一个路径就会互相覆盖，读到的「几个 task」
+# 就成了别人的数。
+STATUS_RD=()
+STATUS_QA=()
+if [ -n "${KESTREL_DEMO_STATUS_DIR:-}" ]; then
+  mkdir -p "$KESTREL_DEMO_STATUS_DIR"
+  STATUS_RD+=(--status-file "$KESTREL_DEMO_STATUS_DIR/harness-rd.json")
+  STATUS_QA+=(--status-file "$KESTREL_DEMO_STATUS_DIR/harness-qa.json")
+fi
+
 "$BIN" serve --session harness-rd --bus-socket "$SOCKET" \
-  --role "$HERE/roles/rd.toml" --artifacts-dir "$ARTIFACTS" &
+  --role "$HERE/roles/rd.toml" --artifacts-dir "$ARTIFACTS" \
+  ${RESOURCE_ARGS[@]+"${RESOURCE_ARGS[@]}"} ${STATUS_RD[@]+"${STATUS_RD[@]}"} &
 PIDS+=($!)
 "$BIN" serve --session harness-qa --bus-socket "$SOCKET" \
-  --role "$HERE/roles/qa.toml" --artifacts-dir "$ARTIFACTS" &
+  --role "$HERE/roles/qa.toml" --artifacts-dir "$ARTIFACTS" \
+  ${RESOURCE_ARGS[@]+"${RESOURCE_ARGS[@]}"} ${STATUS_QA[@]+"${STATUS_QA[@]}"} &
 PIDS+=($!)
 
 # 总线上没有"谁已注册"的查询接口，也没有就绪握手：worker 在 Hello 后即可被寻址，
@@ -100,7 +131,6 @@ sleep 1
 #     缺省那份只要求 `file`，也就是类型化之前的语义；把某一格改成 `test_log` / `diff` /
 #     `screenshot` 之后，worker 光说「跑过了」不管用——那份文件必须真经得起按类型核对。
 #     用 KESTREL_DEMO_EVIDENCE_SPEC 换表，设为空串则不传（回到「不要求任何类型」）。
-# 轮转上限：没设环境变量就**不传 flag**，让 SA 走默认策略（512 条 / 1 MiB）；显式设 0
 # 轮转上限：没设环境变量就**不传 flag**，让 SA 走默认策略（512 条 / 1 MiB）；显式设 0
 # 才是关闭。写成 `${X:-0}` 会把「没设」当成「关掉」，默认策略就此变成死代码——这正是
 # 这条清单上「库不猜派发节奏」曾经的位置，现在阈值有了来历，脚本不再替它选 0。

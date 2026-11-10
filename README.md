@@ -50,7 +50,12 @@ cargo build && ./harness/run-demo.sh      # hub + RD + QA + demo-sa 四进程
 demo 传 `cny`）、`--roles-dir`/`--prices`（预算价格表，见下）、
 `--evidence-spec`（每个 stage 要哪类证据，见下）、
 `--worktree`（RD 的写入目录，广播进每颗门铃的 `ref`，QA 据此取证；`KESTREL_WORKTREE`
-同时喂给 role 的 `write_roots`）、`--approvals`（SA 的审批授权表，见下）。
+同时喂给 role 的 `write_roots`）、`--approvals`（SA 的审批授权表，见下）。worker 侧的资源
+护栏走脚本已有的那套三态语义：**没设 env 就不传 flag**，交给 `serve` 的默认值 —
+`KESTREL_DEMO_MAX_TASKS` / `KESTREL_DEMO_MAX_PARALLEL_TOOLS` /
+`KESTREL_DEMO_MAX_WORKER_TOOLS` / `KESTREL_DEMO_MAX_RSS_MB` /
+`KESTREL_DEMO_STATUS_INTERVAL`；`KESTREL_DEMO_STATUS_DIR` 设了才写状态文件，并按 session
+分成 `harness-rd.json` / `harness-qa.json`。
 
 ### 预算：账单还是名义值
 

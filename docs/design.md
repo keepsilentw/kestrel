@@ -20,10 +20,11 @@
 > 质量闸门保持人工执行（本仓库不挂 CI，见 §9.19⑥）。
 > 二期十一项已于 2026-11-04 在真端点联跑中走完（`pipeline complete`，四阶段全 pass，
 > 审批请求/判定/回执各 5 条成对）；那一次联跑抓出并修掉两个「测试全绿但跑不起来」的缺陷，见 §9.32。
-> 2026-11-10：三期开工（§9.46–§9.53）——worker 的两级工具并发上限、journal 归档段的离线移动 /
-> 热窗口 / 预览 / 库存 / 健康检查、审批链审计、常驻 worker 状态文件、内存软上限（drain），
-> 外加名义成本细到 `peer × 原因`（§9.49）与判定 issue 自带归因（§9.50）。这一批都过了
-> fmt / clippy / test，**真端点联跑未重跑**。
+> 2026-11-10：三期开工（§9.46–§9.54）——worker 的两级工具并发上限与内存软上限（drain）、
+> journal 归档段的离线移动 / 热窗口 / 预览 / 库存 / 健康检查、审批链审计、常驻 worker 状态
+> 文件，外加名义成本细到 `peer × 原因`（§9.49）、判定 issue 自带归因（§9.50），以及把这些
+> 护栏接到 `harness/run-demo.sh` 的入口上（§9.54）。代码部分都过了 fmt / clippy / test；
+> **真端点联跑未重跑**，demo 的接法只到语法与 flag 解析这一层。
 > **Metrics** — src 51 files / 18578 lines · tests 9 files / 3628 lines · 260 tests (lib 204 + bin 4 + integration 52)
 > **Integration** — core_loop 5 / discipline 2 / m1_tools 11 / m2_session 6 / m4_bus 15 / m5_pool 7 / sandbox_e2e 4 / wire_anthropic 2
 > 规模已过 plan 预算（10-13k）的上沿：多出来的部分几乎都花在「取消安全」与「对账」这两条纪律上。
@@ -436,6 +437,21 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
        引擎根本没起」。状态文件同步带 `draining` / `peak_rss_bytes` / `max_rss_bytes`。
     ⑤ 边界：这是**准入闸门**，不是内存回收——不杀引擎、不释放已占的内存，也说不清是哪个
        task 吃掉的；空闲 task 的退休仍是要单独定语义的一格（会话续接 + 取消握手）。
+
+54. **三期第九格：demo 入口接上资源护栏（2026-11-10）**：
+    ① §9.46–§9.53 的护栏都长在 `serve` 的 flag 上，而 `harness/run-demo.sh` 从来不知道它们
+       存在——「能力落地但唯一的真端点入口拿不到」和「没实现」在运维上等价。现在补上：
+       `KESTREL_DEMO_MAX_TASKS` / `_MAX_PARALLEL_TOOLS` / `_MAX_WORKER_TOOLS` /
+       `_MAX_RSS_MB` / `_STATUS_INTERVAL`。
+    ② 沿用脚本自己那套三态语义：**没设 env 就不传 flag**，默认值归 `serve` 说了算。把
+       「没设」写成 `${X:-0}` 会替默认值做决定（轮转上限那格就是这么从「默认策略」退回
+       「关掉」的，§9.28 记过）。
+    ③ `KESTREL_DEMO_STATUS_DIR` 设了才写，并按 session 拆成 `harness-rd.json` /
+       `harness-qa.json`：两个 worker 写同一个路径会互相覆盖，读到的「几个 task」就成了
+       别人的数——状态文件本身也会犯 §9.11④ 那一类「两端各拼一遍名字」的错。
+    ④ 顺手删了脚本里重复的一行轮转注释（同一句出现两次，早于本次改动）。
+    ⑤ 验证边界：`bash -n` 通过，`serve` 的 flag 解析用不存在的 role 文件验过（clap 认这些
+       名字，错误停在角色加载那步）。**demo 本身没跑**：那需要真端点凭据，本节不声称它跑过。
 
 ## 10 二期清单
 

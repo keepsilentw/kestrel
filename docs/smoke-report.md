@@ -1058,4 +1058,19 @@ receipt、pending、unacked、applied、stale 与 orphan 数量。重复回执�
   字样、不带 `result_ref`，并且引擎工厂一次都没被调用。
 
 **验证边界**：这是准入闸门，不是内存回收——不杀引擎、不释放已占内存，也不区分是哪个 task
-吃掉的。`harness/run-demo.sh` 没传这个 flag（缺省不设限），真端点联跑未重跑。
+吃掉的。真端点联跑未重跑（demo 侧的接法见 §43）。
+
+## 43. 2026-11-10 三期第九格：demo 入口接上资源护栏
+
+§9.46–§9.53 那几级护栏之前只在 `serve` 的 flag 上，`harness/run-demo.sh` 没有传它们的路径
+——「能力落地但入口拿不到」。现在按脚本已有的**三态语义**接上：
+`KESTREL_DEMO_MAX_TASKS` / `KESTREL_DEMO_MAX_PARALLEL_TOOLS` /
+`KESTREL_DEMO_MAX_WORKER_TOOLS` / `KESTREL_DEMO_MAX_RSS_MB` /
+`KESTREL_DEMO_STATUS_INTERVAL` 没设就**不传 flag**，交给 `serve` 的默认值；
+`KESTREL_DEMO_STATUS_DIR` 设了才写，且按 session 分成 `harness-rd.json` /
+`harness-qa.json` — 两个 worker 写同一路径会互相覆盖，那时读到的「几个 task」就是别人的数。
+
+顺带删掉了脚本里重复的一行轮转注释（同一句话出现两次，早于本次改动）。
+
+**验证边界**：只做了 `bash -n` 语法检查，加一次 `serve` 的 flag 解析（拿一个不存在的 role
+文件停在角色加载那步，说明 clap 认这批名字）。**没有跑 demo**：那需要真端点凭据。
