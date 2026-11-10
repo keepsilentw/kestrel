@@ -266,6 +266,10 @@ struct JournalArchiveCmd {
     /// remaining segments move into the archive. 0 = move every sealed segment.
     #[arg(long, default_value_t = 0)]
     keep: usize,
+
+    /// Print the exact moves and collisions without renaming anything.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Args, Debug)]
@@ -277,6 +281,11 @@ struct JournalStatusCmd {
     /// Print each segment instead of only the aggregate counts.
     #[arg(long)]
     list: bool,
+
+    /// Emit the complete status document as JSON. Segment details are always
+    /// included in this mode.
+    #[arg(long)]
+    json: bool,
 }
 
 #[tokio::main]
@@ -299,6 +308,30 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::JournalArchive(a)) => {
             let path = shellexpand_home(&a.journal.to_string_lossy());
             let journal = Journal::open(&path)?;
+            if a.dry_run {
+                let plan = journal.archive_plan(a.keep)?;
+                println!("journal archive dry-run: {} planned move(s)", plan.len());
+                for item in plan {
+                    println!(
+                        "{} seg{}-{} / {} byte(s) / {}{}",
+                        if item.destination_exists {
+                            "blocked"
+                        } else {
+                            "move"
+                        },
+                        item.from,
+                        item.to,
+                        item.bytes,
+                        item.source.display(),
+                        if item.destination_exists {
+                            format!(" -> existing {}", item.destination.display())
+                        } else {
+                            format!(" -> {}", item.destination.display())
+                        }
+                    );
+                }
+                return Ok(());
+            }
             let moved = journal.archive_segments(a.keep)?;
             match journal.segment_archive_dir() {
                 Some(dir) => println!(
@@ -313,6 +346,10 @@ async fn main() -> anyhow::Result<()> {
             let path = shellexpand_home(&s.journal.to_string_lossy());
             let journal = Journal::open(&path)?;
             let status = journal.status();
+            if s.json {
+                println!("{}", serde_json::to_string_pretty(&status)?);
+                return Ok(());
+            }
             println!(
                 "journal: {} live record(s) / {} byte(s)",
                 status.live_records, status.live_bytes

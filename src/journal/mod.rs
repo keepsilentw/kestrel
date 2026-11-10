@@ -21,6 +21,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
+use serde::Serialize;
 
 pub struct Journal {
     file: Mutex<File>,
@@ -41,7 +42,7 @@ pub struct Rotation {
     pub covered: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SegmentStatus {
     pub from: u64,
     pub to: u64,
@@ -50,7 +51,7 @@ pub struct SegmentStatus {
     pub path: PathBuf,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct JournalStatus {
     pub live_records: usize,
     pub live_bytes: u64,
@@ -59,6 +60,16 @@ pub struct JournalStatus {
     pub total_segment_bytes: u64,
     pub staged_files: usize,
     pub segments: Vec<SegmentStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ArchiveMove {
+    pub from: u64,
+    pub to: u64,
+    pub bytes: u64,
+    pub source: PathBuf,
+    pub destination: PathBuf,
+    pub destination_exists: bool,
 }
 
 use std::sync::Mutex;
@@ -257,12 +268,14 @@ impl Journal {
         Some(dir.join(format!("{stem}.segments")))
     }
 
-    /// Move sealed segments out of the journal directory without deleting them.
-    /// The newest `keep_latest` segments stay in place, so a caller can retain a
-    /// small hot window. `replay_all` reads both locations; a destination
-    /// collision is refused before any file moves.
-    pub fn archive_segments(&self, keep_latest: usize) -> anyhow::Result<usize> {
+    /// Preview exactly what `archive_segments` would move. The append lock keeps
+    /// a concurrent rotation from changing the answer halfway through planning.
+    pub fn archive_plan(&self, keep_latest: usize) -> anyhow::Result<Vec<ArchiveMove>> {
         let _file = self.file.lock().unwrap();
+        self.archive_plan_locked(keep_latest)
+    }
+
+    fn archive_plan_locked(&self, keep_latest: usize) -> anyhow::Result<Vec<ArchiveMove>> {
         let Some(dir) = self.path.parent() else {
             anyhow::bail!("journal path has no parent directory");
         };
@@ -273,38 +286,61 @@ impl Journal {
         let mut segments = segment_files(dir, &prefix);
         let move_count = segments.len().saturating_sub(keep_latest);
         segments.truncate(move_count);
-        if segments.is_empty() {
+        let archive = self
+            .segment_archive_dir()
+            .context("journal path has no archive directory")?;
+        Ok(segments
+            .into_iter()
+            .map(|(from, to, source)| {
+                let destination = archive.join(
+                    source
+                        .file_name()
+                        .expect("segment_files only returns named files"),
+                );
+                let destination_exists = destination.exists();
+                ArchiveMove {
+                    from,
+                    to,
+                    bytes: file_bytes(&source),
+                    source,
+                    destination,
+                    destination_exists,
+                }
+            })
+            .collect())
+    }
+
+    /// Move sealed segments out of the journal directory without deleting them.
+    /// The newest `keep_latest` segments stay in place, so a caller can retain a
+    /// small hot window. `replay_all` reads both locations; a destination
+    /// collision is refused before any file moves.
+    pub fn archive_segments(&self, keep_latest: usize) -> anyhow::Result<usize> {
+        let _file = self.file.lock().unwrap();
+        let moves = self.archive_plan_locked(keep_latest)?;
+        if moves.is_empty() {
             return Ok(0);
+        }
+        if let Some(conflict) = moves.iter().find(|plan| plan.destination_exists) {
+            anyhow::bail!(
+                "refusing to overwrite archived segment {} while moving {}",
+                conflict.destination.display(),
+                conflict.source.display()
+            );
         }
         let archive = self
             .segment_archive_dir()
             .context("journal path has no archive directory")?;
+        let dir = self
+            .path
+            .parent()
+            .context("journal path has no parent directory")?;
         std::fs::create_dir_all(&archive)
             .with_context(|| format!("create segment archive {}", archive.display()))?;
-        for (_, _, source) in &segments {
-            let destination = archive.join(
-                source
-                    .file_name()
-                    .context("journal segment has no file name")?,
-            );
-            if destination.exists() {
-                anyhow::bail!(
-                    "refusing to overwrite archived segment {} while moving {}",
-                    destination.display(),
-                    source.display()
-                );
-            }
-        }
-        for (_, _, source) in &segments {
-            let destination = archive.join(
-                source
-                    .file_name()
-                    .context("journal segment has no file name")?,
-            );
-            std::fs::rename(source, &destination).with_context(|| {
+        for plan in &moves {
+            std::fs::rename(&plan.source, &plan.destination).with_context(|| {
                 format!(
                     "move segment {} into {}",
-                    source.display(),
+                    plan.source.display(),
                     archive.display()
                 )
             })?;
@@ -315,7 +351,7 @@ impl Journal {
         if let Ok(d) = File::open(&archive) {
             let _ = d.sync_all();
         }
-        Ok(segments.len())
+        Ok(moves.len())
     }
 
     /// Fold everything older than the newest `keep` records into a checkpoint
@@ -816,6 +852,15 @@ mod tests {
         assert_eq!(root.staged_files, 0);
         assert_eq!(root.segments.len(), 1);
         assert!(!root.segments[0].archived);
+        let as_json = serde_json::to_value(&root).unwrap();
+        assert_eq!(as_json["root_segments"], 1);
+        assert_eq!(as_json["segments"][0]["archived"], false);
+
+        let plan = journal.archive_plan(0).unwrap();
+        assert_eq!(plan.len(), 1);
+        assert!(!plan[0].destination_exists);
+        assert!(plan[0].source.exists(), "planning must not move a file");
+        assert_eq!(plan[0].bytes, root.total_segment_bytes);
 
         journal.archive_segments(0).unwrap();
         std::fs::write(dir.join("journal.seg0-0.jsonl.new"), "").unwrap();
