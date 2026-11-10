@@ -7,7 +7,7 @@
 
 ## 1. 自动化测试基线（cargo test）
 
-**Metrics** — src 51 files / 17910 lines · tests 9 files / 3577 lines · 254 tests (lib 199 + bin 4 + integration 51)
+**Metrics** — src 51 files / 18058 lines · tests 9 files / 3577 lines · 255 tests (lib 200 + bin 4 + integration 51)
 **Integration** — core_loop 5 / discipline 2 / m1_tools 11 / m2_session 6 / m4_bus 15 / m5_pool 6 / sandbox_e2e 4 / wire_anthropic 2
 
 | 组 | 覆盖 |
@@ -1004,3 +1004,15 @@ execute 阶段，不改变逐条 prepare、审批顺序、`RwLock` 的串行工�
 
 **验证边界**：当前是投影、检查点与单测级验证；没有用真实端点生成同时含两个 peer 和两种
 名义原因的 pipeline 样本。
+
+## 39. 2026-11-10 三期第五格：判定 issue 自带归因
+
+`Verdict.issues` 从 `Vec<String>` 改为 `Vec<JudgmentIssue>`。每条 issue 同时带 `message`
+和 `Artifact | Turn` 归因，`Verdict::new()` 从列表推导原有的全局 `attribution`。没有显式
+`artifact()` / `turn()` 构造，新增问题类别无法再进入判定。
+
+旧 journal 的字符串 issue 仍能解析，并默认落 `Artifact`；旧行的全局 `attribution: turn`
+继续保留。新 issue 序列化为带 `message` / `attribution` 的对象。
+
+测试 `judgment_issues_are_typed_and_legacy_strings_still_parse` 覆盖旧字符串、新对象、
+混合归因与字节往返。真实端点未重跑。

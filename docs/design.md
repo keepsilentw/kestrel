@@ -20,7 +20,7 @@
 > 质量闸门保持人工执行（本仓库不挂 CI，见 §9.19⑥）。
 > 二期十一项已于 2026-11-04 在真端点联跑中走完（`pipeline complete`，四阶段全 pass，
 > 审批请求/判定/回执各 5 条成对）；那一次联跑抓出并修掉两个「测试全绿但跑不起来」的缺陷，见 §9.32。
-> **Metrics** — src 51 files / 17910 lines · tests 9 files / 3577 lines · 254 tests (lib 199 + bin 4 + integration 51)
+> **Metrics** — src 51 files / 18058 lines · tests 9 files / 3577 lines · 255 tests (lib 200 + bin 4 + integration 51)
 > **Integration** — core_loop 5 / discipline 2 / m1_tools 11 / m2_session 6 / m4_bus 15 / m5_pool 6 / sandbox_e2e 4 / wire_anthropic 2
 > 规模已过 plan 预算（10-13k）的上沿：多出来的部分几乎都花在「取消安全」与「对账」这两条纪律上。
 > 上面两行数字由 `tests/discipline.rs::metrics_lines_match_the_tree` 对照源码树重算校验——
@@ -391,6 +391,13 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
     ④ 报账的逐 peer 行现在输出 `(nominal: no rate 0.5000)` 或 `(nominal: under-reported 0.0320)`；总账行继续保留全局来源分类，两个粒度不互相替代。只有旧数据/异常路径缺少明细时，才退回原来的 `(nominal backend: no rate)` 文案。
     ⑤ 边界：这是**分类维度**的变化，不改变金额、结算、停损或 provider 定价。真实端点尚未生成一条同时包含两个 peer 和两种名义原因的样本，因此当前验证是投影/检查点/单测级，不是端到端实跑。
 
+50. **三期第五格：判定 issue 自带归因（2026-11-10）**：
+    ① §9.41 把全局 `Verdict.attribution` 提成字段，但 `issues` 仍是 `Vec<String>`；新增 issue 若是忘了让 `attribute()` 认出文案，就会静默落到更贵的 `Artifact` 一侧。现在 `issues` 是 `Vec<JudgmentIssue>`，每条 explicitly 携带 `message + attribution`，构造只有 `JudgmentIssue::artifact()` / `JudgmentIssue::turn()` 两个显式入口。
+    ② `Verdict::new()` 从 issue 列表推导全局归因：只要存在一条 `Turn` 就保持原来的保守路由；否则落 `Artifact`。全局字段继续落 journal，路由与返工铃不必改读法。
+    ③ 线形兼容：新 issue 序列化为 `{"message": "...", "attribution": "turn"}`；旧 journal 的字符串 issue 反序列化为 `Artifact`，旧行的全局 `attribution: turn` 原样保留。读侧 `JudgmentIssue` 实现 `Deref<str>`、`Borrow<str>` 和字符串比较，现有报账/返工文案不重复拼一遍。
+    ④ 判定产出的每个入口都已显式选边：空结果/abort/worker stop/工件缺失属于 `Turn`；FAIL 文案、缺证据、类型不符与 stage 要求缺失属于 `Artifact`。测试 `judgment_issues_are_typed_and_legacy_strings_still_parse` 钉住新旧线形与混合归因。
+    ⑤ 边界：这是编译期与线形约束，不改变当前路由策略；真正的 `JudgmentIssue` 变体是否要拆得更细仍可后议。当前验证是单测与完整源码闸门，真端点未重跑。
+
 ## 10 二期清单
 
 已落地（2026-10-28 起）：~~`ApproveMode::Bus`~~（授权表 + 超时 fail-closed + journal 审计，§9.20）、~~SA 判定升级到「工件 + 证据文件」~~（绝对路径存在性/非空核对，§9.20）、~~bus 重连重放~~（离线 session 停车补投 + 客户端自动重连；RPC 与「写入即死」的帧不重放，§9.21）、~~journal 快照/截断语义~~（检查点 + 归档段 + 崩溃安全轮转，§9.22）、~~多任务并行~~（task 命名空间三处同源 + 前缀寻址，§9.23）、~~openai-responses wire~~（第三条 v1 wire，金身 + fixture 验证，**真端点未实测**，§9.24）、~~journal 投影增量化与轮转触发~~（在线投影 = 全量重放 + 条数/字节双上限，§9.25）、~~一个引擎内真正并发地服务多个 task~~（改为「一 task 一引擎」的 worker 池，单活跃槽不动，§9.26）、~~`BudgetSpent` 的价格表~~（预留 → 结算两段式、按 token 换账单、无价退回名义值并报出来，§9.27；2026-11-03）、~~journal 轮转的**默认策略**~~（活文件 512 条 / 1 MiB 双上限、三态 CLI、生产与测试同一条 `rotate_at_boundary`，§9.28；2026-11-03）、~~证据的类型化~~（`file` / `test_log` / `diff` / `screenshot` 各自可在盘上反驳 + `--evidence-spec` 的 stage 要求，坏表硬失败，§9.29；2026-11-03）、~~审批批复的可靠投递~~（请求 at-least-once + 按 req 幂等 + 台账从 journal 播种，判定仍只一次，§9.30；2026-11-03）、~~批复到底有没有生效~~（回执 `approval_receipt` + `ApprovalAcked` 落账 + 到点撤摊，**没生效的批准不许记成生效**，§9.31；2026-11-03）。
@@ -399,4 +406,4 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
 
 2026-11-04 联跑新添的两格同日落地（§9.33）：验证类 stage 的 FAIL 回跳给写者返工（带额度 `max_reworks`、带原因 `ref.rework`、每关 iter 跨回跳不清零），bash 用 `output_path` 参数交出可核对的 `test_log`（内核把 stdout/stderr 连 `exit: ExitStatus{...}` 一起写进那个文件）。下一格因此有了明确的落点：SA 只要去读那行 `exit:`，「形状」就能升级成「结论」——现在它还只证明「这份文件是测试汇总」。
 
-新划出的边界：`nominal_usd` 的占比应当随 `providers.toml` 填写完整率下降，这条曲线本身值得盯（单价填全之后 `--max-usd` 才是真正的账单上限，名义值只作为「说不清价」的兜底存在）。2026-11-04 补一句并走完它：**只填价不够**——名义值有两个来源（没填价 / 读数不可信，§9.36），而这两个来源现在分开报了（§9.37），报账那一行直接指出下一步该做什么。证据强度这一格同日走完（§9.34），**结论也已经是状态**（§9.35）：`test_runs` 进投影、跨轮转存活，并被收尾报账与返工铃读走。形状校验也已挪到写侧（§9.39，`path_tokens` 认得全角括号 + `evidence_warnings` 跟着工件走），读侧的 `resolve_claim` 退成兜底；FAIL 归因也从「路由读措辞」提成了「判定自带字段」（§9.41）。分类账已细到 `peer × 来源`（§9.49）。清单上仍留相关的三件：**同一份日志被多个 stage 引用时不去重**（按 stage 归位是刻意的）、**没有任何闸门把结论当输入**（停损只看钱，要不要让「测试没绿」影响放行得先定它拦的是钱还是进度）、以及 §9.41 ⑤ 新露出的那层——`issues` 还是 `Vec<String>`，新加一类 issue 忘了判归因会**静默落在 `Artifact`**；把「忘了标」变成编译不过去的事，需要让 issue 自己带归因变体（`JudgmentIssue::Artifact | Turn`）。2026-11-05 这条曲线有了三个数据点：一次两端没价（`2.0000 usd, of which 2.0000 nominal (no rate 2.0000)`）、一次测试费率表（`0.3550 / nominal 0.3484 (under-reported)`，§9.42⑤）、一次**真实费率**（`0.0732 usd, of which 0.0667 nominal (under-reported 0.0667)`，§9.43）。「该补价」与「该修读数」在报账里分开之后，**「该补价」当天就办完了**：用户层 `providers.toml` 里两个 dispatched model 现在写着真实 `cost`（费率数字不住进本仓库，来源与换算见 §9.43）。剩下的那条名义来源不是这份仓库能修的——BigModel 的 anthropic 端点不回 input usage，要么换读数来源，要么换端点。
+新划出的边界：`nominal_usd` 的占比应当随 `providers.toml` 填写完整率下降，这条曲线本身值得盯（单价填全之后 `--max-usd` 才是真正的账单上限，名义值只作为「说不清价」的兜底存在）。2026-11-04 补一句并走完它：**只填价不够**——名义值有两个来源（没填价 / 读数不可信，§9.36），而这两个来源现在分开报了（§9.37），报账那一行直接指出下一步该做什么。证据强度这一格同日走完（§9.34），**结论也已经是状态**（§9.35）：`test_runs` 进投影、跨轮转存活，并被收尾报账与返工铃读走。形状校验也已挪到写侧（§9.39，`path_tokens` 认得全角括号 + `evidence_warnings` 跟着工件走），读侧的 `resolve_claim` 退成兜底；FAIL 归因也从「路由读措辞」提成了「判定自带字段」（§9.41），并进一步把 issue 本身收成带归因的类型（§9.50）。分类账已细到 `peer × 来源`（§9.49）。清单上仍留相关的两件：**同一份日志被多个 stage 引用时不去重**（按 stage 归位是刻意的）、**没有任何闸门把结论当输入**（停损只看钱，要不要让「测试没绿」影响放行得先定它拦的是钱还是进度）。2026-11-05 这条曲线有了三个数据点：一次两端没价（`2.0000 usd, of which 2.0000 nominal (no rate 2.0000)`）、一次测试费率表（`0.3550 / nominal 0.3484 (under-reported)`，§9.42⑤）、一次**真实费率**（`0.0732 usd, of which 0.0667 nominal (under-reported 0.0667)`，§9.43）。「该补价」与「该修读数」在报账里分开之后，**「该补价」当天就办完了**：用户层 `providers.toml` 里两个 dispatched model 现在写着真实 `cost`（费率数字不住进本仓库，来源与换算见 §9.43）。剩下的那条名义来源不是这份仓库能修的——BigModel 的 anthropic 端点不回 input usage，要么换读数来源，要么换端点。

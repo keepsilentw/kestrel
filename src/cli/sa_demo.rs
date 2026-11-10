@@ -19,7 +19,7 @@ use crate::cli::task::artifact_path;
 use crate::core::ops::ApprovalDecision;
 use crate::journal::Journal;
 use crate::journal::records::Attribution;
-use crate::journal::records::{JournalRecord, Stage, TestRun, ThinBell, Verdict};
+use crate::journal::records::{JournalRecord, JudgmentIssue, Stage, TestRun, ThinBell, Verdict};
 use crate::permissions::{Decision, PermissionEngine};
 use crate::provider::config::Registry;
 use crate::provider::wire::{CostPerMTok, Usage};
@@ -942,32 +942,6 @@ fn under_reports_input(usage: &Usage) -> bool {
     usage.input_tokens == 0 && usage.output_tokens > 0
 }
 
-/// FAIL 归因：这一关没过，说的是**被验证的产物**，还是**验证者自己那一回合**？
-///
-/// 2026-11-04 实测出来的这一格：`review iter1: fail (empty result, worker stop: round budget
-/// exhausted)` 被路由成「RD 返工」，RD 连着两轮都在替一个它改不动的东西辩护，白烧掉 dev 的
-/// iteration 预算，最后撞上限。验证者这一回合本身不可信时，**不能**拿它的结论去定罪产物。
-///
-/// 这件事只在**判定产出的那一刻**说得清，所以它写成 `Verdict.attribution` 落进 journal
-/// （§9.41）：路由读的是那个字段，不是这里拼出来的措辞。分类规则一旦住在路由里，
-/// 改一句 issue 文案就能悄悄改掉路由，而没有任何测试会为此变红。
-fn attribute(issues: &[String]) -> Attribution {
-    if issues.iter().any(|i| {
-        i == "empty result"
-            || i == "worker aborted"
-            || i.starts_with("worker stop:")
-            || i.starts_with("no result bell")
-            || i.starts_with("artifact missing:")
-            || i.starts_with("artifact is not valid JSON:")
-    }) {
-        Attribution::Turn
-    } else {
-        // 分不出来源就归给产物：那是更贵的一侧——宁可多问写者一次，
-        // 也不因为「读不懂」而把这一关放过去。
-        Attribution::Artifact
-    }
-}
-
 /// `unit` 是这一次运行的钱的单位（`PriceLedger::unit`），报账当场把它印出来：
 /// 一个不带单位的金额数字，在两种币种面前就是误导（§9.44）。
 fn report_ledger(journal: &Journal, ledger: &PriceLedger, unit: &str) {
@@ -1331,21 +1305,27 @@ pub fn decide_approval(authority: Option<&PermissionEngine>, command: &str) -> A
 /// 并且齐全到 `required` 要求的每一类）——「工件在盘上」从来不等于「stage 通过」。
 pub fn verdict_from_artifact(path: &Path, required: &[EvidenceKind]) -> Verdict {
     let Ok(text) = std::fs::read_to_string(path) else {
-        return Verdict {
-            pass: false,
-            issues: vec![format!("artifact missing: {}", path.display())],
-            // 工件没落地 = 这一关的产出本身没出来，不能拿去定罪被审的产物。
-            attribution: Attribution::Turn,
-            ..Default::default()
-        };
+        // 工件没落地 = 这一关的产出本身没出来，不能拿去定罪被审的产物。
+        return Verdict::new(
+            false,
+            vec![JudgmentIssue::turn(format!(
+                "artifact missing: {}",
+                path.display()
+            ))],
+            vec![],
+            vec![],
+        );
     };
     let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return Verdict {
-            pass: false,
-            issues: vec![format!("artifact is not valid JSON: {}", path.display())],
-            attribution: Attribution::Turn,
-            ..Default::default()
-        };
+        return Verdict::new(
+            false,
+            vec![JudgmentIssue::turn(format!(
+                "artifact is not valid JSON: {}",
+                path.display()
+            ))],
+            vec![],
+            vec![],
+        );
     };
     let mut issues = Vec::new();
     let result = json["result"]
@@ -1355,24 +1335,26 @@ pub fn verdict_from_artifact(path: &Path, required: &[EvidenceKind]) -> Verdict 
         .to_string();
     let mut converged = false;
     if result.is_empty() {
-        issues.push("empty result".to_string());
+        issues.push(JudgmentIssue::turn("empty result"));
     } else {
         match parse_verdict(&result) {
             WorkerVerdict::Converged => converged = true,
-            WorkerVerdict::Failed(line) => issues.push(format!("verdict: {line}")),
-            WorkerVerdict::Missing => {
-                issues.push("no PASS/DONE/FAIL verdict in the head of result".into())
+            WorkerVerdict::Failed(line) => {
+                issues.push(JudgmentIssue::artifact(format!("verdict: {line}")))
             }
+            WorkerVerdict::Missing => issues.push(JudgmentIssue::artifact(
+                "no PASS/DONE/FAIL verdict in the head of result",
+            )),
         }
     }
     if json["aborted"].as_bool().unwrap_or(false) {
-        issues.push("worker aborted".to_string());
+        issues.push(JudgmentIssue::turn("worker aborted"));
     }
     if json["stop"]["type"].as_str() == Some("error") {
-        issues.push(format!(
+        issues.push(JudgmentIssue::turn(format!(
             "worker stop: {}",
             json["stop"]["message"].as_str().unwrap_or("error")
-        ));
+        )));
     }
     // 第三层：先核「类型」再核「齐全」（design §10 从「工件 + 证据文件」再走一格）。
     // 「这里有个文件」只证明有东西；声称 `test_log`/`diff`/`screenshot` 就多了一个
@@ -1397,10 +1379,10 @@ pub fn verdict_from_artifact(path: &Path, required: &[EvidenceKind]) -> Verdict 
             evidence = evidence_from_answer(&result);
         }
         if evidence.is_empty() {
-            issues.push("no evidence paths to verify".to_string());
+            issues.push(JudgmentIssue::artifact("no evidence paths to verify"));
         } else {
             let report = check_evidence(&evidence);
-            issues.extend(report.issues);
+            issues.extend(report.issues.into_iter().map(JudgmentIssue::artifact));
             // 认账说明跟着判定落进真相源：重启后复现这次判定，要连「当初认了什么」一起复现。
             // `extend` 而不是赋值——上面已经并进了写侧的形状警告，覆盖就等于把它们丢掉
             // （这个测试第一次跑就抓到了这里）。
@@ -1409,20 +1391,14 @@ pub fn verdict_from_artifact(path: &Path, required: &[EvidenceKind]) -> Verdict 
             // 「那一次到底过了几条」，而不是只有一句 pass。
             test_runs = report.test_runs;
             for kind in missing_requirements(&report.verified_kinds, required) {
-                issues.push(format!(
+                issues.push(JudgmentIssue::artifact(format!(
                     "no verified {} evidence: this stage requires one",
                     kind.as_str()
-                ));
+                )));
             }
         }
     }
-    Verdict {
-        pass: issues.is_empty(),
-        attribution: attribute(&issues),
-        issues,
-        test_runs,
-        notes,
-    }
+    Verdict::new(issues.is_empty(), issues, test_runs, notes)
 }
 
 /// What the worker's own answer says about the stage.
@@ -1600,9 +1576,10 @@ mod tests {
         );
         assert_eq!(v.attribution, Attribution::Turn);
 
-        // 分不出来源时落在**更贵的一侧**：宁可多问写者一次，也不因为读不懂而放过。
+        // 新建 issue 必须显式选边；artifact 助手不会被文案悄悄改成 Turn。
         assert_eq!(
-            attribute(&["no verified test_log evidence: this stage requires one".to_string()]),
+            JudgmentIssue::artifact("no verified test_log evidence: this stage requires one")
+                .attribution,
             Attribution::Artifact
         );
     }
@@ -2136,7 +2113,7 @@ mod tests {
         let v = verdict_from_artifact(&p, &[]);
         assert!(!v.pass);
         assert!(
-            v.issues.contains(&"empty result".to_string())
+            v.issues.iter().any(|i| i == "empty result")
                 && v.issues.iter().any(|i| i.starts_with("worker stop:")),
             "{:?}",
             v.issues
@@ -2154,8 +2131,7 @@ mod tests {
         let v = verdict_from_artifact(&bare, &[]);
         assert!(!v.pass, "a claim with nothing to check is not a pass");
         assert!(
-            v.issues
-                .contains(&"no evidence paths to verify".to_string()),
+            v.issues.iter().any(|i| i == "no evidence paths to verify"),
             "{:?}",
             v.issues
         );

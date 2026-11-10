@@ -2,7 +2,11 @@
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
+use std::borrow::Borrow;
+use std::ops::Deref;
+
+use serde::ser::SerializeStruct;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
 pub type TaskId = String;
@@ -25,7 +29,7 @@ pub enum Stage {
 pub struct Verdict {
     pub pass: bool,
     #[serde(default)]
-    pub issues: Vec<String>,
+    pub issues: Vec<JudgmentIssue>,
     /// 本轮核对过的测试日志（每份一条）。空 = 这一关没有可数出来的测试证据。
     #[serde(default)]
     pub test_runs: Vec<TestRun>,
@@ -39,6 +43,140 @@ pub struct Verdict {
     /// 也绝不因为「读不懂」而放过去。
     #[serde(default)]
     pub attribution: Attribution,
+}
+
+impl Verdict {
+    /// Construct a verdict whose global attribution is derived from its typed
+    /// issues. A new issue cannot enter this struct without choosing a side.
+    pub fn new(
+        pass: bool,
+        issues: Vec<JudgmentIssue>,
+        test_runs: Vec<TestRun>,
+        notes: Vec<String>,
+    ) -> Self {
+        let attribution = if issues
+            .iter()
+            .any(|issue| issue.attribution == Attribution::Turn)
+        {
+            Attribution::Turn
+        } else {
+            Attribution::Artifact
+        };
+        Self {
+            pass,
+            issues,
+            test_runs,
+            notes,
+            attribution,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JudgmentIssue {
+    pub message: String,
+    pub attribution: Attribution,
+}
+
+impl JudgmentIssue {
+    pub fn artifact(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            attribution: Attribution::Artifact,
+        }
+    }
+
+    pub fn turn(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            attribution: Attribution::Turn,
+        }
+    }
+}
+
+impl Deref for JudgmentIssue {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.message
+    }
+}
+
+impl AsRef<str> for JudgmentIssue {
+    fn as_ref(&self) -> &str {
+        &self.message
+    }
+}
+
+impl Borrow<str> for JudgmentIssue {
+    fn borrow(&self) -> &str {
+        &self.message
+    }
+}
+
+impl std::fmt::Display for JudgmentIssue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl PartialEq<str> for JudgmentIssue {
+    fn eq(&self, other: &str) -> bool {
+        self.message == other
+    }
+}
+
+impl PartialEq<String> for JudgmentIssue {
+    fn eq(&self, other: &String) -> bool {
+        self.message == *other
+    }
+}
+
+impl PartialEq<&str> for JudgmentIssue {
+    fn eq(&self, other: &&str) -> bool {
+        self.message == *other
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum IssueWire {
+    Legacy(String),
+    Detailed {
+        message: String,
+        #[serde(default)]
+        attribution: Attribution,
+    },
+}
+
+impl Serialize for JudgmentIssue {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut issue = serializer.serialize_struct("JudgmentIssue", 2)?;
+        issue.serialize_field("message", &self.message)?;
+        issue.serialize_field("attribution", &self.attribution)?;
+        issue.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for JudgmentIssue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match IssueWire::deserialize(deserializer)? {
+            IssueWire::Legacy(message) => Ok(Self::artifact(message)),
+            IssueWire::Detailed {
+                message,
+                attribution,
+            } => Ok(Self {
+                message,
+                attribution,
+            }),
+        }
+    }
 }
 
 /// FAIL 的归属。`Turn` = 这次判定本身不可信（空结果、abort、worker 侧 stop=error、
@@ -1266,7 +1404,7 @@ mod tests {
         // 所以这里比的是「读回来的 verdict」与「序列化文本逐字节一致」。
         let verdict = Verdict {
             pass: false,
-            issues: vec!["did not pass".into()],
+            issues: vec![JudgmentIssue::artifact("did not pass")],
             notes: vec![],
             attribution: Attribution::Artifact,
             test_runs: vec![TestRun {
@@ -1293,6 +1431,40 @@ mod tests {
         };
         assert_eq!(read_back, &verdict, "读出来的结论要能原样落盘再读回");
         assert_eq!(serde_json::to_string(&back).unwrap(), text);
+    }
+
+    /// New issues carry their own attribution. Legacy string issues remain
+    /// readable and default to the cheaper-to-route artifact side, while a
+    /// legacy global `attribution: turn` is preserved.
+    #[test]
+    fn judgment_issues_are_typed_and_legacy_strings_still_parse() {
+        let legacy = json!({
+            "pass": false,
+            "issues": ["old issue"],
+            "attribution": "turn"
+        });
+        let parsed: Verdict = serde_json::from_value(legacy).unwrap();
+        assert_eq!(parsed.attribution, Attribution::Turn);
+        assert_eq!(parsed.issues, vec![JudgmentIssue::artifact("old issue")]);
+
+        let verdict = Verdict::new(
+            false,
+            vec![
+                JudgmentIssue::artifact("artifact problem"),
+                JudgmentIssue::turn("turn problem"),
+            ],
+            vec![],
+            vec![],
+        );
+        assert_eq!(
+            verdict.attribution,
+            Attribution::Turn,
+            "any turn-side issue keeps the existing conservative routing"
+        );
+        let line = serde_json::to_string(&verdict).unwrap();
+        assert!(line.contains("\"message\":\"turn problem\""), "{line}");
+        assert!(line.contains("\"attribution\":\"turn\""), "{line}");
+        assert_eq!(serde_json::from_str::<Verdict>(&line).unwrap(), verdict);
     }
 
     /// 「有价但读数不可信」的结算（§9.36）：钱必须留在账上、并且留在**名义那一份**里，
