@@ -259,6 +259,11 @@ struct JournalArchiveCmd {
     /// deleted; `replay_all` continues to read the archive directory.
     #[arg(long, default_value = "journal.jsonl")]
     journal: PathBuf,
+
+    /// Keep this many newest sealed segments in the journal directory. The
+    /// remaining segments move into the archive. 0 = move every sealed segment.
+    #[arg(long, default_value_t = 0)]
+    keep: usize,
 }
 
 #[tokio::main]
@@ -281,7 +286,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::JournalArchive(a)) => {
             let path = shellexpand_home(&a.journal.to_string_lossy());
             let journal = Journal::open(&path)?;
-            let moved = journal.archive_segments()?;
+            let moved = journal.archive_segments(a.keep)?;
             match journal.segment_archive_dir() {
                 Some(dir) => println!(
                     "journal archive: moved {moved} sealed segment(s) into {}",

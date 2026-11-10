@@ -188,10 +188,10 @@ impl Journal {
     }
 
     /// Move sealed segments out of the journal directory without deleting them.
-    /// `replay_all` reads both locations, so moving a segment changes no
-    /// projection. Re-running is idempotent; a destination collision is refused
-    /// before any file moves.
-    pub fn archive_segments(&self) -> anyhow::Result<usize> {
+    /// The newest `keep_latest` segments stay in place, so a caller can retain a
+    /// small hot window. `replay_all` reads both locations; a destination
+    /// collision is refused before any file moves.
+    pub fn archive_segments(&self, keep_latest: usize) -> anyhow::Result<usize> {
         let _file = self.file.lock().unwrap();
         let Some(dir) = self.path.parent() else {
             anyhow::bail!("journal path has no parent directory");
@@ -200,7 +200,9 @@ impl Journal {
             anyhow::bail!("journal path has no usable file stem");
         };
         let prefix = format!("{stem}.seg");
-        let segments = segment_files(dir, &prefix);
+        let mut segments = segment_files(dir, &prefix);
+        let move_count = segments.len().saturating_sub(keep_latest);
+        segments.truncate(move_count);
         if segments.is_empty() {
             return Ok(0);
         }
@@ -619,7 +621,7 @@ mod tests {
         let before = reconcile(&journal.replay());
 
         let rotated = journal.rotate(5).unwrap().expect("rotation");
-        assert_eq!(journal.archive_segments().unwrap(), 1);
+        assert_eq!(journal.archive_segments(0).unwrap(), 1);
         let archive = journal.segment_archive_dir().unwrap();
         let archived = archive.join(rotated.archived_to.file_name().unwrap());
         assert!(
@@ -632,7 +634,7 @@ mod tests {
         );
         assert_eq!(replay_path(&archived).len(), 10);
         assert_eq!(
-            journal.archive_segments().unwrap(),
+            journal.archive_segments(0).unwrap(),
             0,
             "archiving an empty root is idempotent"
         );
@@ -662,6 +664,51 @@ mod tests {
             before_second.state,
             "moving files changes location, not state"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn archive_keeps_the_requested_newest_segments_in_place() {
+        let dir = scratch("archive-keep");
+        let path = dir.join("journal.jsonl");
+        let journal = Journal::create(&path).unwrap();
+        seed(&journal, 2);
+        journal.rotate(0).unwrap().expect("first sealed segment");
+        for iteration in 3..=6 {
+            journal
+                .append(&JournalRecord::StageWritten {
+                    task: "demo".into(),
+                    stage: Stage::Dev,
+                    iteration,
+                })
+                .unwrap();
+        }
+        journal.rotate(0).unwrap().expect("second sealed segment");
+        for iteration in 7..=10 {
+            journal
+                .append(&JournalRecord::StageWritten {
+                    task: "demo".into(),
+                    stage: Stage::Dev,
+                    iteration,
+                })
+                .unwrap();
+        }
+        journal.rotate(0).unwrap().expect("third sealed segment");
+        let before = reconcile(&journal.replay_all());
+        assert_eq!(segment_files(&dir, "journal.seg").len(), 3);
+
+        assert_eq!(journal.archive_segments(1).unwrap(), 2);
+        let archive = journal.segment_archive_dir().unwrap();
+        assert_eq!(segment_files(&dir, "journal.seg").len(), 1);
+        assert_eq!(segment_files(&archive, "journal.seg").len(), 2);
+        assert_eq!(
+            journal.archive_segments(10).unwrap(),
+            0,
+            "keep larger than the hot window moves nothing"
+        );
+        let after = reconcile(&journal.replay_all());
+        assert_eq!(after.state, before.state);
+        assert_eq!(after.in_flight, before.in_flight);
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -7,7 +7,7 @@
 
 ## 1. 自动化测试基线（cargo test）
 
-**Metrics** — src 51 files / 17613 lines · tests 9 files / 3577 lines · 252 tests (lib 197 + bin 4 + integration 51)
+**Metrics** — src 51 files / 17665 lines · tests 9 files / 3577 lines · 253 tests (lib 198 + bin 4 + integration 51)
 **Integration** — core_loop 5 / discipline 2 / m1_tools 11 / m2_session 6 / m4_bus 15 / m5_pool 6 / sandbox_e2e 4 / wire_anthropic 2
 
 | 组 | 覆盖 |
@@ -955,15 +955,18 @@ execute 阶段，不改变逐条 prepare、审批顺序、`RwLock` 的串行工�
 
 ## 36. 2026-11-10 三期第二格：journal 归档段移动
 
-`kestrel journal-archive --journal journal.jsonl` 把根目录里的已封闭段移动到
+`kestrel journal-archive --journal journal.jsonl [--keep N]` 把根目录里的已封闭段移动到
 `journal.segments/`，不删除、不改写记录。`replay_all()` 同时扫描原目录和归档目录；
-同一区间两边都存在时原目录副本胜出。目标冲突会在任何文件移动前整体拒绝。
+同一区间两边都存在时原目录副本胜出。目标冲突会在任何文件移动前整体拒绝。`--keep N`
+把最新 N 个已封闭段留在根目录；缺省 0 表示全部移动。
 
 新增测试 `sealed_segments_move_to_an_archive_without_changing_history` 覆盖：
 
 - 移动前后的 `reconcile(replay_all())` 状态和未结算铃完全一致；
 - 第二次执行返回 0，不把空目录当失败；
 - 归档旧段后继续轮转产生的新段与旧段共存，区间顺序仍正确。
+- `archive_keeps_the_requested_newest_segments_in_place` 验证保留 1 个最新段时只移动更旧的
+  两个段，`keep > 段数` 为空操作，移动前后投影一致。
 
 **闸门**：新增并发护栏与归档实现已通过 `cargo fmt --check`、
 `cargo clippy --all-targets -- -D warnings`、`cargo test`；完整真端点联跑仍未执行。
