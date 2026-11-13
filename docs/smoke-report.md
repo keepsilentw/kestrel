@@ -7,7 +7,7 @@
 
 ## 1. 自动化测试基线（cargo test）
 
-**Metrics** — src 51 files / 19780 lines · tests 9 files / 3837 lines · 274 tests (lib 214 + bin 5 + integration 55)
+**Metrics** — src 51 files / 19867 lines · tests 9 files / 3837 lines · 274 tests (lib 214 + bin 5 + integration 55)
 **Integration** — core_loop 6 / discipline 2 / m1_tools 12 / m2_session 6 / m4_bus 15 / m5_pool 8 / sandbox_e2e 4 / wire_anthropic 2
 
 | 组 | 覆盖 |
@@ -1198,3 +1198,7 @@ QA 用测试日志和“导入即编译”解释后仍得到 PASS；这是假通
 `exit: ExitStatus { code: Some(0), signal: None }`；四关均报 `26 passed / 0 failed`，
 账本 `0.1593 cny, of which 0.0000 nominal`，最终 `pipeline complete`。journal 45 条记录，
 覆盖链完整，3 次审批请求 / 裁决 / 回执全部 applied。
+
+后续收口：确定性构建的非零退出不再直接 bail，而是以 `Artifact` issue 落
+`result_committed`，扣一次返工额度并把 build.log 路径写入 `ref.rework` 回派 Dev；
+返工额度耗尽才显式失败。单测同时覆盖成功 build_log 填满要求与非零构建日志产生 issue。

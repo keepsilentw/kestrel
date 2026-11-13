@@ -27,7 +27,7 @@
 > 归档链的断口与重复段的隔离出口（§9.56）、记录层的深度校验 `--verify`（§9.57）；
 > 代码部分都过了 fmt / clippy / test；
 > **真端点联跑未重跑**，demo 的接法只到语法与 flag 解析这一层。
-> **Metrics** — src 51 files / 19780 lines · tests 9 files / 3837 lines · 274 tests (lib 214 + bin 5 + integration 55)
+> **Metrics** — src 51 files / 19867 lines · tests 9 files / 3837 lines · 274 tests (lib 214 + bin 5 + integration 55)
 > **Integration** — core_loop 6 / discipline 2 / m1_tools 12 / m2_session 6 / m4_bus 15 / m5_pool 8 / sandbox_e2e 4 / wire_anthropic 2
 > 规模已过 plan 预算（10-13k）的上沿：多出来的部分几乎都花在「取消安全」与「对账」这两条纪律上。
 > 上面两行数字由 `tests/discipline.rs::metrics_lines_match_the_tree` 对照源码树重算校验——
@@ -575,7 +575,10 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
        工件中的证据合并后再判定，不再依赖 verifier 模型主动运行构建。
     ⑪ 真实端点验证：确定性 build 日志为 `python3 -m py_compile ...`、exit 0；四关均为
        `26 passed / 0 failed`，账本 `0.1593 cny, of which 0.0000 nominal`，最终
-       `pipeline complete`。确定性构建失败仍是显式 pipeline 错误；自动回派 Dev 尚未加入。
+       `pipeline complete`。
+    ⑫ 确定性构建失败不再直接中止 pipeline：日志核对出非零退出或非法命令时，SA 以
+       `Artifact` 归因落 `result_committed`，扣一次返工额度并把日志路径连同返工说明回派
+       Dev；额度耗尽才显式失败。预检成功时其 `BuildLog` 作为可信证据参与归档判定。
 
 ## 10 二期清单
 

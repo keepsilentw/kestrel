@@ -453,14 +453,49 @@ fn rework_target(stage: Stage) -> Option<Stage> {
     }
 }
 
+/// Build the rework note from typed issues. The writer receives the last Dev
+/// test conclusion as state (`null` means nothing was counted), not as a guess.
+fn rework_payload(
+    journal: &Journal,
+    task_id: &str,
+    stage: Stage,
+    iter: u64,
+    issues: &[JudgmentIssue],
+    verdict_artifact: &Path,
+) -> serde_json::Value {
+    let last_test = journal
+        .projection()
+        .state
+        .tests
+        .iter()
+        .find(|test| test.task == task_id && test.stage == Stage::Dev)
+        .map(|test| {
+            serde_json::json!({
+                "green": test.green(),
+                "runs": test.runs.iter().map(describe_run).collect::<Vec<String>>(),
+            })
+        });
+    serde_json::json!({
+        "from": format!("{} iter{iter}", format!("{stage:?}").to_lowercase()),
+        "issues": issues,
+        "verdict_artifact": verdict_artifact.display().to_string(),
+        "last_test": last_test,
+    })
+}
+
 /// Execute the operator-declared build once, with the same command/exit log
 /// shape as `bash.output_path`. This is trusted evidence: no verifier model is
 /// involved in producing it.
+struct BuildPreflight {
+    evidence: Evidence,
+    issues: Vec<String>,
+}
+
 async fn run_build_preflight(
     command: &str,
     worktree: Option<&Path>,
     artifacts: &Path,
-) -> anyhow::Result<Evidence> {
+) -> anyhow::Result<BuildPreflight> {
     let evidence_dir = artifacts.join("evidence");
     tokio::fs::create_dir_all(&evidence_dir)
         .await
@@ -495,14 +530,10 @@ async fn run_build_preflight(
         kind: EvidenceKind::BuildLog,
     };
     let report = check_evidence(std::slice::from_ref(&evidence));
-    if !report.issues.is_empty() {
-        anyhow::bail!(
-            "deterministic build failed: {} (log {})",
-            report.issues.join(", "),
-            path.display()
-        );
-    }
-    Ok(evidence)
+    Ok(BuildPreflight {
+        evidence,
+        issues: report.issues,
+    })
 }
 
 /// dispatch → wait bell → reconcile（读盘为准）→ 推进/回派，直至 release。
@@ -614,24 +645,76 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
         let rework_note = rework.clone();
         // A build is a mechanical fact. Run the operator-declared command once
         // when entering Build and pass its kernel-written log to the verdict.
-        let trusted_evidence = if stage == Stage::Build {
-            match args
+        // A failed build is an artifact issue and follows the normal Dev rework
+        // path; it never asks the verifier model to invent a substitute.
+        let mut trusted_evidence = Vec::new();
+        if stage == Stage::Build
+            && let Some(command) = args
                 .build_command
                 .as_deref()
                 .filter(|command| !command.trim().is_empty())
-            {
-                Some(command) => {
-                    let evidence =
-                        run_build_preflight(command, args.worktree.as_deref(), &args.artifacts)
-                            .await?;
-                    println!("[sa] build preflight: {}", evidence.path);
-                    vec![evidence]
+        {
+            let preflight =
+                run_build_preflight(command, args.worktree.as_deref(), &args.artifacts).await?;
+            if preflight.issues.is_empty() {
+                println!("[sa] build preflight: {}", preflight.evidence.path);
+                trusted_evidence.push(preflight.evidence);
+            } else {
+                let issues: Vec<JudgmentIssue> = preflight
+                    .issues
+                    .iter()
+                    .cloned()
+                    .map(JudgmentIssue::artifact)
+                    .collect();
+                let verdict = Verdict::new(false, issues.clone(), vec![], vec![]);
+                journal.append(&JournalRecord::StageWritten {
+                    task: args.task_id.clone(),
+                    stage,
+                    iteration: iter,
+                })?;
+                journal.append(&JournalRecord::ResultCommitted {
+                    task: args.task_id.clone(),
+                    stage,
+                    verdict,
+                })?;
+                println!(
+                    "[sa] build iter{iter}: deterministic preflight failed ({})",
+                    issues
+                        .iter()
+                        .map(|issue| issue.message.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                if reworks_left == 0 {
+                    anyhow::bail!(
+                        "[sa] build iter{iter}: deterministic build failed ({}) and the \
+                             rework budget is spent",
+                        issues
+                            .iter()
+                            .map(|issue| issue.message.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
                 }
-                None => Vec::new(),
+                reworks_left -= 1;
+                rework = Some(rework_payload(
+                    &journal,
+                    &args.task_id,
+                    stage,
+                    iter,
+                    &issues,
+                    Path::new(&preflight.evidence.path),
+                ));
+                iters[writer_idx] += 1;
+                idx = writer_idx;
+                println!(
+                    "[sa] build iter{iter}: -> rework by {} ({} credit(s) left)",
+                    args.peer_for(Stage::Dev),
+                    reworks_left
+                );
+                continue;
             }
-        } else {
-            Vec::new()
-        };
+        }
 
         // 值循环：Pass = stage 收敛；Fail/重试走 continue（iter 已自增）。
         let outcome: StageOutcome = loop {
@@ -923,28 +1006,14 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
                 // 返工铃除了「上一关为什么没过」，还带上写者那一关**账上**的测试结论
                 // （§9.35：结论成为状态之后，这里就是它的读者之一）。省掉一轮「我到底
                 // 哪儿没过」的试探；`null` 说的是「你上关什么都没数出来」，不是「没问题」。
-                let proj = journal.projection();
-                let last_test = proj
-                    .state
-                    .tests
-                    .iter()
-                    .find(|t| t.task == args.task_id && t.stage == Stage::Dev)
-                    .map(|t| {
-                        serde_json::json!({
-                            "green": t.green(),
-                            "runs": t
-                                .runs
-                                .iter()
-                                .map(describe_run)
-                                .collect::<Vec<String>>(),
-                        })
-                    });
-                rework = Some(serde_json::json!({
-                    "from": format!("{stage_name} iter{iter}"),
-                    "issues": verdict.issues.clone(),
-                    "verdict_artifact": artifact.display().to_string(),
-                    "last_test": last_test,
-                }));
+                rework = Some(rework_payload(
+                    &journal,
+                    &args.task_id,
+                    stage,
+                    iter,
+                    &verdict.issues,
+                    &artifact,
+                ));
                 println!(
                     "[sa] {stage_name} iter{iter}: fail ({}) -> rework by {} ({} credit(s) left)",
                     verdict.issues.join(", "),
@@ -1726,9 +1795,11 @@ mod tests {
         let source = worktree.join("lru.py");
         std::fs::write(&source, "class LRU:\n    pass\n").unwrap();
         let command = format!("python3 -m py_compile {}", source.display());
-        let evidence = run_build_preflight(&command, Some(&worktree), &artifacts)
+        let preflight = run_build_preflight(&command, Some(&worktree), &artifacts)
             .await
             .expect("deterministic build");
+        assert!(preflight.issues.is_empty(), "{:?}", preflight.issues);
+        let evidence = preflight.evidence;
         assert_eq!(evidence.kind, EvidenceKind::BuildLog);
 
         let artifact = write_artifact(
@@ -1745,6 +1816,22 @@ mod tests {
             std::slice::from_ref(&evidence),
         );
         assert!(verdict.pass, "{:?}", verdict.issues);
+
+        let bad = run_build_preflight(
+            &format!(
+                "python3 -m py_compile {}",
+                worktree.join("missing.py").display()
+            ),
+            Some(&worktree),
+            &artifacts,
+        )
+        .await
+        .expect("the command ran and produced a failing log");
+        assert!(
+            bad.issues.iter().any(|issue| issue.contains("status 1")),
+            "{:?}",
+            bad.issues
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
