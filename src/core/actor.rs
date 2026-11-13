@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 
@@ -201,6 +201,25 @@ impl AgentHandle {
         self.submit(Op::Interrupt);
     }
 
+    /// Deliver an approval decision and report whether the engine accepted it.
+    /// A request that expired first has no waiter, so this returns `false`.
+    pub async fn respond_to_approval(
+        &self,
+        req: String,
+        decision: super::ops::ApprovalDecision,
+    ) -> bool {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        let op = Op::Approval {
+            req,
+            decision,
+            ack: Some(ack_tx),
+        };
+        if self.tx.send(Submission::new(op)).is_err() {
+            return false;
+        }
+        ack_rx.await.unwrap_or(false)
+    }
+
     /// Take the event stream (once). Consumer owns it afterwards.
     pub fn take_event_rx(&self) -> Option<mpsc::UnboundedReceiver<Event>> {
         self.event_rx.lock().unwrap().take()
@@ -281,8 +300,11 @@ async fn op_loop(mut rx: mpsc::UnboundedReceiver<Submission>, shared: Arc<Shared
                     });
                 }
             }
-            Op::Approval { req, decision } => {
-                shared.approvals.complete(&req, decision);
+            Op::Approval { req, decision, ack } => {
+                let applied = shared.approvals.complete(&req, decision);
+                if let Some(ack) = ack {
+                    let _ = ack.send(applied);
+                }
             }
             Op::SwitchModel { spec } => {
                 *shared.pending_switch.lock().unwrap() = Some(*spec);

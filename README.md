@@ -2,7 +2,7 @@
 
 为星型多 Agent harness 写的 Rust harness kernel：引擎 + wire 层 + 工具/权限/沙箱 + 会话 + 总线/journal + CLI/配置。设计文档（中文）见本仓库 `docs/design.md`。
 
-**Metrics** — src 51 files / 19338 lines · tests 9 files / 3704 lines · 269 tests (lib 211 + bin 5 + integration 53)
+**Metrics** — src 51 files / 19418 lines · tests 9 files / 3807 lines · 271 tests (lib 212 + bin 5 + integration 54)
 
 Status: M0-M4 complete + 二期主体落地。三期于 2026-11-10 开工：worker 池的并发执行护栏同时提供每 task 的 `--max-parallel-tools`（缺省 4）和 worker 全局的 `--max-worker-tools`（缺省 8），任一为 `0` 时显式关闭对应上限；两级限制都不改变源序回写、串行工具写锁和取消语义（design §9.46 / §9.48）。journal 的已封闭段可移入 `<journal>.segments/`，`replay_all()` 同时读取两处，移动而非删除历史（§9.47）；`journal-archive --keep/--dry-run` 与 `journal-status --json/--check/--list/--approvals` 把归档的预览、执行、库存与审批链都变成可查项。`serve --status-file` 原子发布活动 task、未决审批与各级上限（§9.52），`serve --max-rss-mb` 给整个 worker 一条内存**软**上限：peak RSS 越线后进入 drain，新 task 被显式拒绝、在跑的跑完（§9.53）；`serve --task-idle-timeout-secs` 让空闲 task 退休引擎、释放 `--max-tasks` 的 slot，同一 task 再响时重开同一棵会话树（§9.55）。名义成本分类已细到 `peer × reason`（§9.49），判定 issue 已改为自带 `Artifact | Turn` 归因的类型（§9.50）。剩下的未完成边界：正在跑的引擎的内存回收（现在只有准入闸门）、强制 kill 式硬上限、归档段压缩、跨回合审批槽位、三期真端点联跑。二期已落地 `ApproveMode::Bus`、SA 判定含证据核对、bus 停车补投与自动重连、journal 快照/截断与在线投影、多任务 task 命名空间、openai-responses wire、worker 池、预算按 token 结算的价格表、journal 轮转的默认策略、按类型核对的证据与 stage 要求表、审批请求的 at-least-once 投递与按 req 幂等、验证 FAIL 回跳写者、bash `output_path` 交出可核对的 test_log。2026-11-05 最后一次真实联跑四关一次通过，QA 切到 GLM 的 OpenAI 兼容表面后报账为 `0.1806 cny, of which 0.0000 nominal`（§9.45、smoke-report §33）。2026-11-10 的三期改动都过了 fmt / clippy `-D warnings` / test 三道人工闸门，尚未做真端点联跑。上面那行数字由 `tests/discipline.rs` 与源码树对照校验。
 

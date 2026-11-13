@@ -48,26 +48,19 @@ async fn prepare_one(
                 }
                 ApproveMode::HeadlessAllow => ApprovalDecision::AllowOnce,
                 ApproveMode::Bus { timeout } => {
-                    let req = idgen.next_id();
-                    emit(EventMsg::ApprovalRequest {
-                        req: req.clone(),
-                        prompt: prompt.clone(),
-                        detail: approval_detail(&call.name, &call.args, detail),
-                    });
-                    // 等待者按 req 登记，所以要自己拿着这个名字：到点时既要说
-                    // 「这一格撤摊了」，也要把它从台账上摘掉（design §9.31）。
-                    let rx = approvals.open_with(req.clone());
-                    match wait_decision(rx, token, timeout).await {
+                    match request_bus_approval(
+                        prompt.clone(),
+                        approval_detail(&call.name, &call.args, detail),
+                        timeout,
+                        emit,
+                        approvals,
+                        idgen,
+                        token,
+                    )
+                    .await
+                    {
                         Waited::Decision(d) => d,
                         Waited::TimedOut => {
-                            // 撤摊 + 说出去：留着等待者，后来的批复就会「发送成功」，
-                            // CLI 层于是把一次没有生效的批准记成生效了——比不记更糟。
-                            if approvals.abandon(&req) {
-                                emit(EventMsg::ApprovalExpired {
-                                    req: req.clone(),
-                                    reason: format!("timed out after {timeout:?}"),
-                                });
-                            }
                             return Err(ToolOutcome::error(format!(
                                 "approval timed out after {}s, denied (the approver never \
                                  answered): {prompt}",
@@ -75,14 +68,6 @@ async fn prepare_one(
                             )));
                         }
                         Waited::Cancelled => {
-                            // 只有真的还挂着等待者才说得出「过期」：回合结束撤摊时
-                            // `abandon` 返回 false，那边本来就没人等了。
-                            if approvals.abandon(&req) {
-                                emit(EventMsg::ApprovalExpired {
-                                    req: req.clone(),
-                                    reason: "the wait was cancelled".into(),
-                                });
-                            }
                             return Err(ToolOutcome::error("aborted while waiting for approval"));
                         }
                     }
@@ -115,6 +100,53 @@ async fn wait_decision(
         _ = token.cancelled() => Waited::Cancelled,
         _ = tokio::time::sleep(timeout) => Waited::TimedOut,
         d = rx => d.map_or(Waited::Cancelled, Waited::Decision),
+    }
+}
+
+/// Open one bus approval and retire its waiter on timeout or cancellation.
+///
+/// Every caller must use this path: leaving a waiter behind lets a later
+/// `complete` report success even though the tool has already stopped waiting,
+/// and the CLI would then book an approval that never applied.
+async fn request_bus_approval(
+    prompt: String,
+    detail: Value,
+    timeout: Duration,
+    emit: &EmitFn,
+    approvals: &ApprovalBoard,
+    idgen: &Arc<dyn IdGen>,
+    token: &CancellationToken,
+) -> Waited {
+    let req = idgen.next_id();
+    emit(EventMsg::ApprovalRequest {
+        req: req.clone(),
+        prompt,
+        detail,
+    });
+    let rx = approvals.open_with(req.clone());
+    let waited = wait_decision(rx, token, timeout).await;
+    match waited {
+        Waited::Decision(d) => Waited::Decision(d),
+        Waited::TimedOut => {
+            // A concurrent reply may already have removed the waiter even
+            // though the tool timed out before consuming it. The expired event
+            // is still required so the worker can close the request and emit a
+            // truthful `applied: false` receipt.
+            let _ = approvals.abandon(&req);
+            emit(EventMsg::ApprovalExpired {
+                req,
+                reason: format!("timed out after {timeout:?}"),
+            });
+            Waited::TimedOut
+        }
+        Waited::Cancelled => {
+            let _ = approvals.abandon(&req);
+            emit(EventMsg::ApprovalExpired {
+                req,
+                reason: "the wait was cancelled".into(),
+            });
+            Waited::Cancelled
+        }
     }
 }
 
@@ -223,20 +255,23 @@ async fn run_one(
                 }
                 ApproveMode::HeadlessAllow => ApprovalDecision::AllowOnce,
                 ApproveMode::Bus { timeout } => {
-                    let req = idgen.next_id();
-                    emit(EventMsg::ApprovalRequest {
-                        req: req.clone(),
-                        prompt: "sandboxed command failed (suspected sandbox denial); \
-                                 rerun outside the sandbox?"
+                    match request_bus_approval(
+                        "sandboxed command failed (suspected sandbox denial); \
+                         rerun outside the sandbox?"
                             .into(),
-                        detail: approval_detail(
+                        approval_detail(
                             &call.name,
                             &call.args,
                             serde_json::json!({ "stderr": stderr, "call_id": call.call_id }),
                         ),
-                    });
-                    let rx = approvals.open_with(req);
-                    match wait_decision(rx, token, timeout).await {
+                        timeout,
+                        emit,
+                        approvals,
+                        idgen,
+                        token,
+                    )
+                    .await
+                    {
                         Waited::Decision(d) => d,
                         Waited::TimedOut => {
                             return ToolOutcome::error(format!(

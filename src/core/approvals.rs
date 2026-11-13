@@ -30,12 +30,10 @@ impl ApprovalBoard {
     }
 
     pub fn complete(&self, req: &str, decision: ApprovalDecision) -> bool {
-        self.waiters
-            .lock()
-            .unwrap()
-            .remove(req)
-            .map(|tx| tx.send(decision))
-            .is_some()
+        let Some(tx) = self.waiters.lock().unwrap().remove(req) else {
+            return false;
+        };
+        tx.send(decision).is_ok()
     }
 
     /// Drop a waiter WITHOUT sending: the approval window elapsed, so nobody is
@@ -74,6 +72,17 @@ mod tests {
     async fn complete_unknown_is_false() {
         let board = ApprovalBoard::default();
         assert!(!board.complete("nope", ApprovalDecision::Deny));
+    }
+
+    #[tokio::test]
+    async fn complete_reports_a_dropped_waiter() {
+        let board = ApprovalBoard::default();
+        let (req, rx) = board.open();
+        drop(rx);
+        assert!(
+            !board.complete(&req, ApprovalDecision::AllowOnce),
+            "removing a sender is not enough: nobody received the decision"
+        );
     }
 
     /// 到点之后没人听：`abandon` 必须让后来的批复变成「没有生效」，而不是

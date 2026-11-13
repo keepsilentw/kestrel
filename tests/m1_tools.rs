@@ -102,6 +102,39 @@ struct CountingSleepTool {
     ms: u64,
 }
 
+struct SandboxDeniedTool;
+
+#[async_trait::async_trait]
+impl kestrel::tools::Tool for SandboxDeniedTool {
+    fn name(&self) -> &str {
+        "sandbox-denied"
+    }
+
+    fn schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object"})
+    }
+
+    async fn prepare(
+        &self,
+        _call: &ToolCall,
+        _ctx: &ToolCtx,
+    ) -> Result<kestrel::tools::Prepared, kestrel::tools::Reject> {
+        Ok(kestrel::tools::Prepared(serde_json::json!({})))
+    }
+
+    async fn execute(
+        &self,
+        _prep: kestrel::tools::Prepared,
+        _ctx: &ToolCtx,
+        _cancel: tokio_util::sync::CancellationToken,
+        _update: tokio::sync::mpsc::UnboundedSender<kestrel::tools::ToolUpdate>,
+    ) -> Result<kestrel::tools::ToolOutcome, kestrel::tools::ToolError> {
+        Err(kestrel::tools::ToolError::SandboxDenied(
+            "test sandbox denial".into(),
+        ))
+    }
+}
+
 #[async_trait::async_trait]
 impl kestrel::tools::Tool for CountingSleepTool {
     fn name(&self) -> &str {
@@ -617,6 +650,76 @@ async fn bus_approval_without_answer_denies_on_deadline() {
     assert!(
         !board.complete(&req, kestrel::core::ops::ApprovalDecision::AllowOnce),
         "撤摊之后来的批复不能算生效"
+    );
+}
+
+/// A timed-out sandbox escalation must retire its approval waiter just like a
+/// policy Ask does. Otherwise a late allow is still accepted by the board and
+/// the CLI books it as applied even though the tool already stayed sandboxed.
+#[tokio::test]
+async fn sandbox_escalation_timeout_retires_the_approval_waiter() {
+    let registry = ToolRegistry::new(vec![Arc::new(SandboxDeniedTool)]);
+    let ctx = ctx_for(
+        std::env::temp_dir(),
+        kestrel::tools::ApproveMode::Bus {
+            timeout: Duration::from_millis(120),
+        },
+    );
+    let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel();
+    let emit: kestrel::tools::orchestrator::EmitFn = Arc::new(move |m| {
+        let _ = seen_tx.send(m);
+    });
+    let board = kestrel::core::approvals::ApprovalBoard::default();
+    let outcome = dispatch_batch(
+        &registry,
+        &[tool_call(
+            "a",
+            "sandbox-denied",
+            serde_json::json!({"command": "touch outside"}),
+        )],
+        &ctx,
+        &tokio_util::sync::CancellationToken::new(),
+        &emit,
+        &board,
+        &(Arc::new(kestrel::core::id::SeqGen::new()) as Arc<dyn kestrel::core::id::IdGen>),
+    )
+    .await
+    .into_iter()
+    .next()
+    .expect("one outcome")
+    .1;
+
+    assert!(outcome.is_error);
+    assert!(
+        outcome
+            .content_text()
+            .contains("sandbox escalation timed out"),
+        "{}",
+        outcome.content_text()
+    );
+
+    let mut approved = false;
+    let mut expired = None;
+    while let Ok(msg) = seen_rx.try_recv() {
+        match msg {
+            EventMsg::ApprovalRequest { detail, .. } => {
+                assert_eq!(detail["tool"], "sandbox-denied");
+                assert_eq!(detail["args"]["command"], "touch outside");
+                approved = true;
+            }
+            EventMsg::ApprovalExpired { req, reason } => {
+                expired = Some((req, reason));
+            }
+            _ => {}
+        }
+    }
+    assert!(approved, "the escalation must request approval");
+    let (req, reason) = expired.expect("the timeout must retire the request");
+    assert!(reason.contains("timed out"), "{reason}");
+    assert!(!board.has_waiter(&req), "the waiter must be gone");
+    assert!(
+        !board.complete(&req, kestrel::core::ops::ApprovalDecision::AllowOnce),
+        "a late allow must not report that it woke the tool"
     );
 }
 

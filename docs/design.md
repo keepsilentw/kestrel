@@ -27,8 +27,8 @@
 > 归档链的断口与重复段的隔离出口（§9.56）、记录层的深度校验 `--verify`（§9.57）；
 > 代码部分都过了 fmt / clippy / test；
 > **真端点联跑未重跑**，demo 的接法只到语法与 flag 解析这一层。
-> **Metrics** — src 51 files / 19338 lines · tests 9 files / 3704 lines · 269 tests (lib 211 + bin 5 + integration 53)
-> **Integration** — core_loop 5 / discipline 2 / m1_tools 11 / m2_session 6 / m4_bus 15 / m5_pool 8 / sandbox_e2e 4 / wire_anthropic 2
+> **Metrics** — src 51 files / 19418 lines · tests 9 files / 3807 lines · 271 tests (lib 212 + bin 5 + integration 54)
+> **Integration** — core_loop 5 / discipline 2 / m1_tools 12 / m2_session 6 / m4_bus 15 / m5_pool 8 / sandbox_e2e 4 / wire_anthropic 2
 > 规模已过 plan 预算（10-13k）的上沿：多出来的部分几乎都花在「取消安全」与「对账」这两条纪律上。
 > 上面两行数字由 `tests/discipline.rs::metrics_lines_match_the_tree` 对照源码树重算校验——
 > 这些计数此前在三处文档里手抄过三次、漂移过三次（§9.19），现在它是闸门不是仪式。

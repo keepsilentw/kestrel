@@ -35,6 +35,9 @@ pub enum Op {
     Approval {
         req: ReqId,
         decision: ApprovalDecision,
+        /// Optional acknowledgement used by the worker to learn whether a live
+        /// tool waiter actually received the decision.
+        ack: Option<tokio::sync::oneshot::Sender<bool>>,
     },
     /// Inter-turn model/provider swap, applied at the next `prepare_next_turn`.
     /// M0 carries the resolved spec; M3 resolves ids through the registry.

@@ -29,7 +29,7 @@ use crate::cli::serve::{
 use crate::cli::task::{artifact_name, task_of};
 use crate::core::actor::AgentHandle;
 use crate::core::events::{Event, EventMsg, MessageItem};
-use crate::core::ops::{ApprovalDecision, Op};
+use crate::core::ops::ApprovalDecision;
 use crate::provider::wire::{StopReason, Usage};
 use crate::tools::ApproveMode;
 
@@ -727,26 +727,37 @@ fn spawn_worker(
                         match msg {
                             Some(TaskMsg::Approval { req, decision, by }) => {
                                 if open.remove(&req).is_some() {
-                                    handle.submit(Op::Approval { req: req.clone(), decision });
-                                    approvals.push(serde_json::json!({
-                                        "req": req,
-                                        "decision": decision_name(decision),
-                                        "by": by,
-                                        "applied": true,
-                                    }));
+                                    let applied =
+                                        handle.respond_to_approval(req.clone(), decision).await;
                                     let _ = out_tx.send(Outbound::ApprovalClosed { req: req.clone() });
-                                    // 生效了也要回执：审批者那条「谁放宽了沙箱」的记录
-                                    // 只有拿到这句话才算闭环
-                                    let _ = out_tx.send(Outbound::Notify {
-                                        session: by,
-                                        payload: approval_receipt_frame(
-                                            &cfg.session,
-                                            &req,
-                                            decision,
-                                            true,
-                                            "the waiting tool was woken",
-                                        ),
-                                    });
+                                    if applied {
+                                        approvals.push(serde_json::json!({
+                                            "req": req,
+                                            "decision": decision_name(decision),
+                                            "by": by,
+                                            "applied": true,
+                                        }));
+                                        // 生效了也要回执：审批者那条「谁放宽了沙箱」的记录
+                                        // 只有拿到这句话才算闭环
+                                        let _ = out_tx.send(Outbound::Notify {
+                                            session: by,
+                                            payload: approval_receipt_frame(
+                                                &cfg.session,
+                                                &req,
+                                                decision,
+                                                true,
+                                                "the waiting tool was woken",
+                                            ),
+                                        });
+                                    } else {
+                                        // 本地 open 表与引擎的等待者之间存在事件竞态。
+                                        // 引擎拒绝接收就是事实来源；随后到达的
+                                        // ApprovalExpired 会落 expired 记录并回执 false。
+                                        tracing::warn!(
+                                            "task {task}: approval {req} arrived after its \
+                                             waiter expired; not booking it as applied"
+                                        );
+                                    }
                                 } else {
                                     // 已经答过，或回合结束时就关掉了：同一个 req 的
                                     // 第二份 allow 绝不能再把工具跑一遍

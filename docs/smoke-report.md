@@ -7,8 +7,8 @@
 
 ## 1. 自动化测试基线（cargo test）
 
-**Metrics** — src 51 files / 19338 lines · tests 9 files / 3704 lines · 269 tests (lib 211 + bin 5 + integration 53)
-**Integration** — core_loop 5 / discipline 2 / m1_tools 11 / m2_session 6 / m4_bus 15 / m5_pool 8 / sandbox_e2e 4 / wire_anthropic 2
+**Metrics** — src 51 files / 19418 lines · tests 9 files / 3807 lines · 271 tests (lib 212 + bin 5 + integration 54)
+**Integration** — core_loop 5 / discipline 2 / m1_tools 12 / m2_session 6 / m4_bus 15 / m5_pool 8 / sandbox_e2e 4 / wire_anthropic 2
 
 | 组 | 覆盖 |
 |---|---|
