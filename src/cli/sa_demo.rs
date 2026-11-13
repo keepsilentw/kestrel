@@ -49,6 +49,9 @@ pub struct DemoSaArgs {
     /// verifies the same tree instead of guessing — without it the reviewer has
     /// nothing on disk to look at and stages fail for the wrong reason.
     pub worktree: Option<PathBuf>,
+    /// Operator-configured build command run by the SA before the build stage.
+    /// Its kernel-written log is trusted evidence.
+    pub build_command: Option<String>,
     /// Approval authority for workers running `approve = "bus"`: a three-state
     /// prefix table (same format as a role policy). Absent means the SA denies
     /// every reverse request — fail closed, no default yes.
@@ -450,6 +453,58 @@ fn rework_target(stage: Stage) -> Option<Stage> {
     }
 }
 
+/// Execute the operator-declared build once, with the same command/exit log
+/// shape as `bash.output_path`. This is trusted evidence: no verifier model is
+/// involved in producing it.
+async fn run_build_preflight(
+    command: &str,
+    worktree: Option<&Path>,
+    artifacts: &Path,
+) -> anyhow::Result<Evidence> {
+    let evidence_dir = artifacts.join("evidence");
+    tokio::fs::create_dir_all(&evidence_dir)
+        .await
+        .with_context(|| format!("create evidence dir {}", evidence_dir.display()))?;
+    let cwd = worktree.unwrap_or_else(|| Path::new("."));
+    let output = tokio::time::timeout(
+        Duration::from_secs(120),
+        tokio::process::Command::new("/bin/bash")
+            .arg("-lc")
+            .arg(command)
+            .current_dir(cwd)
+            .env("PYTHONPYCACHEPREFIX", evidence_dir.join("pycache"))
+            .output(),
+    )
+    .await
+    .with_context(|| format!("build preflight timed out after 120s: {command}"))??;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let exit = crate::sandbox::denial::ExitStatus {
+        code: output.status.code(),
+        signal: std::os::unix::process::ExitStatusExt::signal(&output.status),
+    };
+    let path = evidence_dir.join("build.log");
+    let log = format!(
+        "command: {command}\nexit: {exit:?}\n--- stdout ---\n{stdout}--- stderr ---\n{stderr}"
+    );
+    tokio::fs::write(&path, log)
+        .await
+        .with_context(|| format!("write build preflight log {}", path.display()))?;
+    let evidence = Evidence {
+        path: path.display().to_string(),
+        kind: EvidenceKind::BuildLog,
+    };
+    let report = check_evidence(std::slice::from_ref(&evidence));
+    if !report.issues.is_empty() {
+        anyhow::bail!(
+            "deterministic build failed: {} (log {})",
+            report.issues.join(", "),
+            path.display()
+        );
+    }
+    Ok(evidence)
+}
+
 /// dispatch → wait bell → reconcile（读盘为准）→ 推进/回派，直至 release。
 pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
     let journal = Journal::create(&args.journal)?;
@@ -557,6 +612,26 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
         let mut iter = iters[idx];
         // 返工说明随这一关的每颗铃带出去（原地重派也带着，别让它中途丢掉）。
         let rework_note = rework.clone();
+        // A build is a mechanical fact. Run the operator-declared command once
+        // when entering Build and pass its kernel-written log to the verdict.
+        let trusted_evidence = if stage == Stage::Build {
+            match args
+                .build_command
+                .as_deref()
+                .filter(|command| !command.trim().is_empty())
+            {
+                Some(command) => {
+                    let evidence =
+                        run_build_preflight(command, args.worktree.as_deref(), &args.artifacts)
+                            .await?;
+                    println!("[sa] build preflight: {}", evidence.path);
+                    vec![evidence]
+                }
+                None => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
 
         // 值循环：Pass = stage 收敛；Fail/重试走 continue（iter 已自增）。
         let outcome: StageOutcome = loop {
@@ -787,8 +862,12 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
             // 判定只读盘，不读铃（thin messages：铃正文只是指针）。工件存在
             // 不等于 stage 收敛——空结果、abort、worker 侧 stop=error 都是 fail，
             // 而「有文件」也不等于「有这一关要求的证据」。
-            let verdict =
-                verdict_from_artifact_for_stage(&artifact, stage, requirements.required_for(stage));
+            let verdict = verdict_from_artifact_with_evidence(
+                &artifact,
+                stage,
+                requirements.required_for(stage),
+                &trusted_evidence,
+            );
             // 把「这一次测试到底过了几条、failed 几条、退了几」打到 stdout：判定行只
             // 说 pass/fail，读日志的人要能看见结论是从哪份文件读出来的（§9.34）。
             for run in &verdict.test_runs {
@@ -1317,6 +1396,18 @@ pub fn verdict_from_artifact_for_stage(
     stage: Stage,
     required: &[EvidenceKind],
 ) -> Verdict {
+    verdict_from_artifact_with_evidence(path, stage, required, &[])
+}
+
+/// Stage-aware verdict with evidence produced by a trusted kernel-side
+/// executor. On build this lets a deterministic build log satisfy the contract
+/// without trusting the verifier model to run the command.
+pub fn verdict_from_artifact_with_evidence(
+    path: &Path,
+    stage: Stage,
+    required: &[EvidenceKind],
+    trusted_evidence: &[Evidence],
+) -> Verdict {
     let evidence_issue = |message: String| {
         if stage == Stage::Dev {
             JudgmentIssue::artifact(message)
@@ -1398,6 +1489,7 @@ pub fn verdict_from_artifact_for_stage(
             // 兼容没有 evidence 字段的旧工件：从正文里提（裸路径按 `file` 档）。
             evidence = evidence_from_answer(&result);
         }
+        evidence.extend_from_slice(trusted_evidence);
         if evidence.is_empty() {
             issues.push(evidence_issue("no evidence paths to verify".into()));
         } else {
@@ -1624,6 +1716,38 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn deterministic_build_log_fills_the_build_requirement() {
+        let root =
+            std::env::temp_dir().join(format!("kestrel-build-preflight-{}", std::process::id()));
+        let worktree = root.join("worktree");
+        let artifacts = root.join("artifacts");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let source = worktree.join("lru.py");
+        std::fs::write(&source, "class LRU:\n    pass\n").unwrap();
+        let command = format!("python3 -m py_compile {}", source.display());
+        let evidence = run_build_preflight(&command, Some(&worktree), &artifacts)
+            .await
+            .expect("deterministic build");
+        assert_eq!(evidence.kind, EvidenceKind::BuildLog);
+
+        let artifact = write_artifact(
+            "trusted-build.json",
+            &format!(
+                r#"{{"result":"PASS: verified","evidence":[{{"kind":"file","path":"{}"}}],"aborted":false,"stop":{{"type":"stop"}}}}"#,
+                source.display()
+            ),
+        );
+        let verdict = verdict_from_artifact_with_evidence(
+            &artifact,
+            Stage::Build,
+            &[EvidenceKind::BuildLog],
+            std::slice::from_ref(&evidence),
+        );
+        assert!(verdict.pass, "{:?}", verdict.issues);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// 有价 ≠ 能算账。BigModel 实测在 `message_start` 不回 input usage（§9.7），
     /// 于是按 token 结算会算出一张少掉整个输入侧的账单。这里只判「这份读数顶不顶得起
     /// 账单」，不判「这次多少钱」——钱的来源必须是读数，不是字符估算。
@@ -1666,6 +1790,7 @@ mod tests {
             max_reworks: 2,
             bell_timeout: Duration::from_secs(300),
             worktree: None,
+            build_command: None,
             approvals: None,
             rotate_after: 0,
             rotate_max_bytes: 0,

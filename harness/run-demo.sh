@@ -155,10 +155,13 @@ fi
 PRICE_ARGS=()
 [ -z "${KESTREL_DEMO_PRICES+set}" ] || PRICE_ARGS+=(--prices "$KESTREL_DEMO_PRICES")
 
+BUILD_COMMAND="${KESTREL_DEMO_BUILD_COMMAND:-python3 -m py_compile '$WORKTREE/lru_cache.py' '$WORKTREE/test_lru_cache.py'}"
+
 KESTREL_TEST_KILL_AFTER="${KESTREL_TEST_KILL_AFTER:-}" \
   "$BIN" demo-sa --bus-socket "$SOCKET" --task "${KESTREL_DEMO_TASK:-demo: 实现一个 LRU cache}" \
   --journal "$HERE/journal.jsonl" --artifacts-dir "$ARTIFACTS" \
   --worktree "$WORKTREE" \
+  --build-command "$BUILD_COMMAND" \
   --approvals "$HERE/roles/sa.approvals.json" \
   ${EVIDENCE_ARGS[@]+"${EVIDENCE_ARGS[@]}"} \
   --roles-dir "$HERE/roles" \

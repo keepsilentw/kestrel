@@ -2,11 +2,11 @@
 
 为星型多 Agent harness 写的 Rust harness kernel：引擎 + wire 层 + 工具/权限/沙箱 + 会话 + 总线/journal + CLI/配置。设计文档（中文）见本仓库 `docs/design.md`。
 
-**Metrics** — src 51 files / 19648 lines · tests 9 files / 3837 lines · 273 tests (lib 213 + bin 5 + integration 55)
+**Metrics** — src 51 files / 19780 lines · tests 9 files / 3837 lines · 274 tests (lib 214 + bin 5 + integration 55)
 
 Status: M0-M4 complete + 二期主体落地。三期于 2026-11-10 开工：worker 池的并发执行护栏同时提供每 task 的 `--max-parallel-tools`（缺省 4）和 worker 全局的 `--max-worker-tools`（缺省 8），任一为 `0` 时显式关闭对应上限；两级限制都不改变源序回写、串行工具写锁和取消语义（design §9.46 / §9.48）。journal 的已封闭段可移入 `<journal>.segments/`，`replay_all()` 同时读取两处，移动而非删除历史（§9.47）；`journal-archive --keep/--dry-run` 与 `journal-status --json/--check/--list/--approvals` 把归档的预览、执行、库存与审批链都变成可查项。`serve --status-file` 原子发布活动 task、未决审批与各级上限（§9.52），`serve --max-rss-mb` 给整个 worker 一条内存**软**上限：peak RSS 越线后进入 drain，新 task 被显式拒绝、在跑的跑完（§9.53）；`serve --task-idle-timeout-secs` 让空闲 task 退休引擎、释放 `--max-tasks` 的 slot，同一 task 再响时重开同一棵会话树（§9.55）。名义成本分类已细到 `peer × reason`（§9.49），判定 issue 已改为自带 `Artifact | Turn` 归因的类型（§9.50）。2026-11-13 的三期 RD/QA 真实端点联跑已 `pipeline complete`，四个 stage 的测试证据均为 `21 passed / 0 failed`，账本 `0.2099 cny, of which 0.0000 nominal`；同一轮把 `build` 从任意文件证据收紧为真实 `build_log`（§9.58）。剩下的未完成边界：正在跑的引擎的内存回收（现在只有准入闸门）、强制 kill 式硬上限、归档段压缩、跨回合审批槽位、Linux 沙箱、SA/Responses 真端点验证。2026-11-10 的三期改动均通过了 fmt / clippy `-D warnings` / test 三道人工闸门。上面那行数字由 `tests/discipline.rs` 与源码树对照校验。
 
-Verification note: the `pipeline complete` above refers to the run made before `build` was tightened. After `build_log` was enabled, subsequent real-endpoint runs passed `dev` / `review` / `test` but repeatedly failed `build` because the QA model submitted test evidence instead of a kernel-generated build log. SA correctly refused the false pass and stopped at the iteration cap. This is a model-compliance gap, not an accepted result; see design §9.58.
+Verification note: the latest real-endpoint run used the deterministic SA build preflight. It generated a kernel-written `build.log` with command and exit 0, then completed `dev` / `review` / `test` / `build`; all four stages reported `26 passed / 0 failed`, ledger `0.1593 cny, of which 0.0000 nominal`, and `pipeline complete`. Earlier model-only build attempts correctly failed at the iteration cap; see design §9.58.
 
 ## Quick start
 
@@ -58,6 +58,8 @@ demo 传 `cny`）、`--roles-dir`/`--prices`（预算价格表，见下）、
 `KESTREL_DEMO_MAX_WORKER_TOOLS` / `KESTREL_DEMO_MAX_RSS_MB` /
 `KESTREL_DEMO_STATUS_INTERVAL`；`KESTREL_DEMO_STATUS_DIR` 设了才写状态文件，并按 session
 分成 `harness-rd.json` / `harness-qa.json`。
+`KESTREL_DEMO_BUILD_COMMAND` 覆盖 SA 在 build stage 执行的确定性构建命令；缺省对 demo 的
+`lru_cache.py` / `test_lru_cache.py` 运行 `python3 -m py_compile`。
 
 ### 预算：账单还是名义值
 

@@ -7,7 +7,7 @@
 
 ## 1. 自动化测试基线（cargo test）
 
-**Metrics** — src 51 files / 19648 lines · tests 9 files / 3837 lines · 273 tests (lib 213 + bin 5 + integration 55)
+**Metrics** — src 51 files / 19780 lines · tests 9 files / 3837 lines · 274 tests (lib 214 + bin 5 + integration 55)
 **Integration** — core_loop 6 / discipline 2 / m1_tools 12 / m2_session 6 / m4_bus 15 / m5_pool 8 / sandbox_e2e 4 / wire_anthropic 2
 
 | 组 | 覆盖 |
@@ -1190,4 +1190,11 @@ QA 用测试日志和“导入即编译”解释后仍得到 PASS；这是假通
 启用后多次真实端点复跑的结果一致：`dev` / `review` / `test` 可以通过，但 `build` 连续
 三次提交 test log，SA 均报 `no verified build_log evidence` 并在 iteration cap 失败。
 这证明严格的 build 闸门已经阻止假通过，同时说明当前 QA 模型尚不稳定遵从 build 契约。
-后续若要收敛，优先级是确定性构建执行器，而不是再次放宽证据类型。
+随后新增 `demo-sa --build-command`：进入 Build 时由 SA 执行一次确定性构建，内核写
+`artifacts/evidence/build.log`，并把该日志作为可信附加证据参与判定。
+
+最终真实端点结果：build preflight 运行
+`python3 -m py_compile .../lru_cache.py .../test_lru_cache.py`，日志
+`exit: ExitStatus { code: Some(0), signal: None }`；四关均报 `26 passed / 0 failed`，
+账本 `0.1593 cny, of which 0.0000 nominal`，最终 `pipeline complete`。journal 45 条记录，
+覆盖链完整，3 次审批请求 / 裁决 / 回执全部 applied。

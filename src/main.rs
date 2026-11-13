@@ -232,6 +232,12 @@ struct DemoSaCmd {
     #[arg(long)]
     worktree: Option<PathBuf>,
 
+    /// Deterministic build command run by the SA at the build stage. Its
+    /// kernel-generated log fills the `build_log` evidence requirement without
+    /// asking the verifier model to execute the command.
+    #[arg(long)]
+    build_command: Option<String>,
+
     /// Approval authority table for workers running `approve = "bus"`: a
     /// three-state prefix policy JSON (same format as a role policy file).
     /// Without it the SA denies every reverse request — fail closed.
@@ -528,6 +534,7 @@ async fn main() -> anyhow::Result<()> {
                 max_reworks: 2,
                 bell_timeout: Duration::from_secs(d.bell_timeout_secs),
                 worktree: d.worktree,
+                build_command: d.build_command,
                 approvals: d.approvals,
                 rotate_after,
                 rotate_max_bytes,

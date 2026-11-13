@@ -27,7 +27,7 @@
 > 归档链的断口与重复段的隔离出口（§9.56）、记录层的深度校验 `--verify`（§9.57）；
 > 代码部分都过了 fmt / clippy / test；
 > **真端点联跑未重跑**，demo 的接法只到语法与 flag 解析这一层。
-> **Metrics** — src 51 files / 19648 lines · tests 9 files / 3837 lines · 273 tests (lib 213 + bin 5 + integration 55)
+> **Metrics** — src 51 files / 19780 lines · tests 9 files / 3837 lines · 274 tests (lib 214 + bin 5 + integration 55)
 > **Integration** — core_loop 6 / discipline 2 / m1_tools 12 / m2_session 6 / m4_bus 15 / m5_pool 8 / sandbox_e2e 4 / wire_anthropic 2
 > 规模已过 plan 预算（10-13k）的上沿：多出来的部分几乎都花在「取消安全」与「对账」这两条纪律上。
 > 上面两行数字由 `tests/discipline.rs::metrics_lines_match_the_tree` 对照源码树重算校验——
@@ -568,16 +568,19 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
        但模型请求只带当前门铃，不继承旧 stage 的对话。
     ⑧ 验证类 stage 缺证据归因为 `Turn`，路由重派 QA，不扣 RD 返工额度；写者阶段仍归
        `Artifact`。单元测试钉住“build 缺 build_log 时不回派写者”。
-    ⑨ 启用 `build_log` 后的真实端点复跑仍未收敛：`dev` / `review` / `test` 可过，
-       `build` 连续三次提交测试日志而非构建日志，SA 在 iteration cap 显式失败。这一结果
-       证明假通过被阻止，不证明 QA 模型会遵从新契约；要让严格 pipeline 收敛，需要确定性
-       构建执行器或更强的 verifier prompt/model。
+    ⑨ 启用 `build_log` 后的模型自跑复跑没有收敛：`build` 连续三次提交测试日志而非构建
+       日志，SA 在 iteration cap 显式失败。这证明假通过被阻止，不证明 QA 模型会遵从契约。
+    ⑩ 新增 SA 确定性 build 预检：`demo-sa --build-command` 在进入 Build 时由 SA 执行一次
+       命令，内核写 `artifacts/evidence/build.log`。该证据作为 `trusted_evidence` 与 QA
+       工件中的证据合并后再判定，不再依赖 verifier 模型主动运行构建。
+    ⑪ 真实端点验证：确定性 build 日志为 `python3 -m py_compile ...`、exit 0；四关均为
+       `26 passed / 0 failed`，账本 `0.1593 cny, of which 0.0000 nominal`，最终
+       `pipeline complete`。确定性构建失败仍是显式 pipeline 错误；自动回派 Dev 尚未加入。
 
 ## 10 二期清单
 
-> 2026-11-13 更新：三期 RD/QA 在收紧 `build_log` 之前有一次真实端点通过；收紧后
-> `build` 能正确拒绝测试日志冒充构建证据，但 QA 模型尚未稳定生成 `build_log`，严格
-> pipeline 在 build 的 iteration cap 失败，见 §9.58。剩余验证空洞是脚本化 SA 未调用
+> 2026-11-13 更新：三期 RD/QA 在严格 `build_log` 下完成了真实端点联跑；构建日志由 SA
+> 确定性预检生成，不依赖 QA 模型主动运行命令，见 §9.58。剩余验证空洞是脚本化 SA 未调用
 > MiMo，以及 `openai-responses` 尚无真端点实测。下文的“三期真端点联跑”仍保留为当时记录。
 
 已落地（2026-10-28 起）：~~`ApproveMode::Bus`~~（授权表 + 超时 fail-closed + journal 审计，§9.20）、~~SA 判定升级到「工件 + 证据文件」~~（绝对路径存在性/非空核对，§9.20）、~~bus 重连重放~~（离线 session 停车补投 + 客户端自动重连；RPC 与「写入即死」的帧不重放，§9.21）、~~journal 快照/截断语义~~（检查点 + 归档段 + 崩溃安全轮转，§9.22）、~~多任务并行~~（task 命名空间三处同源 + 前缀寻址，§9.23）、~~openai-responses wire~~（第三条 v1 wire，金身 + fixture 验证，**真端点未实测**，§9.24）、~~journal 投影增量化与轮转触发~~（在线投影 = 全量重放 + 条数/字节双上限，§9.25）、~~一个引擎内真正并发地服务多个 task~~（改为「一 task 一引擎」的 worker 池，单活跃槽不动，§9.26）、~~`BudgetSpent` 的价格表~~（预留 → 结算两段式、按 token 换账单、无价退回名义值并报出来，§9.27；2026-11-03）、~~journal 轮转的**默认策略**~~（活文件 512 条 / 1 MiB 双上限、三态 CLI、生产与测试同一条 `rotate_at_boundary`，§9.28；2026-11-03）、~~证据的类型化~~（`file` / `test_log` / `diff` / `screenshot` 各自可在盘上反驳 + `--evidence-spec` 的 stage 要求，坏表硬失败，§9.29；2026-11-03）、~~审批批复的可靠投递~~（请求 at-least-once + 按 req 幂等 + 台账从 journal 播种，判定仍只一次，§9.30；2026-11-03）、~~批复到底有没有生效~~（回执 `approval_receipt` + `ApprovalAcked` 落账 + 到点撤摊，**没生效的批准不许记成生效**，§9.31；2026-11-03）。
