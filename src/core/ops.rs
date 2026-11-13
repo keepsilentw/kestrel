@@ -24,6 +24,12 @@ pub enum Op {
     Turn {
         input: Vec<MessageItem>,
     },
+    /// Start a turn with only this input as conversational context. Session
+    /// history is still appended, but earlier turns are not sent to the model;
+    /// used by verifier stages whose old verdicts must not leak into the next.
+    TurnIsolated {
+        input: Vec<MessageItem>,
+    },
     /// Inject a message into the steering queue; drained at the next round
     /// boundary without interrupting in-flight work (pi Agent.steer()).
     Steer {

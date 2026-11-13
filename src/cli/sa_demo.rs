@@ -296,7 +296,7 @@ impl EvidenceSpec {
                     // 说清楚，让人去修表，而不是让 pipeline 空转。
                     anyhow::bail!(
                         "evidence spec: stage {stage} requires unknown evidence kind {kind} \
-                         (file | test_log | diff | screenshot)"
+                         (file | test_log | build_log | diff | screenshot)"
                     );
                 }
                 parsed.push(k);
@@ -616,6 +616,7 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
                     let mut bell_ref = serde_json::json!({
                         "task": args.task,
                         "artifacts": args.artifacts,
+                        "evidence": args.artifacts.join("evidence"),
                         "worktree": args.worktree,
                     });
                     // 「上一关为什么没过」进铃的 ref：写者拿到的是可核对的失败原因
@@ -786,7 +787,8 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
             // 判定只读盘，不读铃（thin messages：铃正文只是指针）。工件存在
             // 不等于 stage 收敛——空结果、abort、worker 侧 stop=error 都是 fail，
             // 而「有文件」也不等于「有这一关要求的证据」。
-            let verdict = verdict_from_artifact(&artifact, requirements.required_for(stage));
+            let verdict =
+                verdict_from_artifact_for_stage(&artifact, stage, requirements.required_for(stage));
             // 把「这一次测试到底过了几条、failed 几条、退了几」打到 stdout：判定行只
             // 说 pass/fail，读日志的人要能看见结论是从哪份文件读出来的（§9.34）。
             for run in &verdict.test_runs {
@@ -1304,6 +1306,24 @@ pub fn decide_approval(authority: Option<&PermissionEngine>, command: &str) -> A
 /// （worker 自己声明的结论）、证据层（它点名的文件在盘上成立为**它声称的那种东西**，
 /// 并且齐全到 `required` 要求的每一类）——「工件在盘上」从来不等于「stage 通过」。
 pub fn verdict_from_artifact(path: &Path, required: &[EvidenceKind]) -> Verdict {
+    verdict_from_artifact_for_stage(path, Stage::Dev, required)
+}
+
+/// Stage-aware verdict. Evidence that the verifier failed to hand in belongs
+/// to that verifier turn: retrying QA is the only way to obtain a new proof.
+/// For the writer stage the same omission remains an artifact issue.
+pub fn verdict_from_artifact_for_stage(
+    path: &Path,
+    stage: Stage,
+    required: &[EvidenceKind],
+) -> Verdict {
+    let evidence_issue = |message: String| {
+        if stage == Stage::Dev {
+            JudgmentIssue::artifact(message)
+        } else {
+            JudgmentIssue::turn(message)
+        }
+    };
     let Ok(text) = std::fs::read_to_string(path) else {
         // 工件没落地 = 这一关的产出本身没出来，不能拿去定罪被审的产物。
         return Verdict::new(
@@ -1379,10 +1399,10 @@ pub fn verdict_from_artifact(path: &Path, required: &[EvidenceKind]) -> Verdict 
             evidence = evidence_from_answer(&result);
         }
         if evidence.is_empty() {
-            issues.push(JudgmentIssue::artifact("no evidence paths to verify"));
+            issues.push(evidence_issue("no evidence paths to verify".into()));
         } else {
             let report = check_evidence(&evidence);
-            issues.extend(report.issues.into_iter().map(JudgmentIssue::artifact));
+            issues.extend(report.issues.into_iter().map(evidence_issue));
             // 认账说明跟着判定落进真相源：重启后复现这次判定，要连「当初认了什么」一起复现。
             // `extend` 而不是赋值——上面已经并进了写侧的形状警告，覆盖就等于把它们丢掉
             // （这个测试第一次跑就抓到了这里）。
@@ -1391,7 +1411,7 @@ pub fn verdict_from_artifact(path: &Path, required: &[EvidenceKind]) -> Verdict 
             // 「那一次到底过了几条」，而不是只有一句 pass。
             test_runs = report.test_runs;
             for kind in missing_requirements(&report.verified_kinds, required) {
-                issues.push(JudgmentIssue::artifact(format!(
+                issues.push(evidence_issue(format!(
                     "no verified {} evidence: this stage requires one",
                     kind.as_str()
                 )));
@@ -1581,6 +1601,26 @@ mod tests {
             JudgmentIssue::artifact("no verified test_log evidence: this stage requires one")
                 .attribution,
             Attribution::Artifact
+        );
+
+        // 验证者没交要求的证据，是这一回合没完成取证：重派验证者，不扣写者返工额度。
+        let ev = evidence_file("build-claim.txt");
+        let art = write_artifact(
+            "missing-build-log.json",
+            &format!(
+                r#"{{"result":"PASS: tested","evidence":[{{"kind":"file","path":"{}"}}],"aborted":false,"stop":{{"type":"stop"}}}}"#,
+                ev.display()
+            ),
+        );
+        let v = verdict_from_artifact_for_stage(&art, Stage::Build, &[EvidenceKind::BuildLog]);
+        assert!(!v.pass);
+        assert_eq!(v.attribution, Attribution::Turn, "{:?}", v.issues);
+        assert!(
+            v.issues
+                .iter()
+                .any(|issue| issue.message.contains("no verified build_log evidence")),
+            "{:?}",
+            v.issues
         );
     }
 
@@ -2414,7 +2454,7 @@ mod tests {
         let good = dir.join("spec.json");
         std::fs::write(
             &good,
-            r#"{"dev": ["file", "diff"], "test": ["test_log"], "whatever": ["file"]}"#,
+            r#"{"dev": ["file", "diff"], "test": ["test_log"], "build": ["build_log"], "whatever": ["file"]}"#,
         )
         .unwrap();
         let spec = EvidenceSpec::from_json_file(&good).unwrap();
@@ -2423,8 +2463,9 @@ mod tests {
             &[EvidenceKind::File, EvidenceKind::Diff]
         );
         assert_eq!(spec.required_for(Stage::Test), &[EvidenceKind::TestLog]);
+        assert_eq!(spec.required_for(Stage::Build), &[EvidenceKind::BuildLog]);
         // 表里没写的 stage = 不要求（只核存在性）
-        assert!(spec.required_for(Stage::Build).is_empty());
+        assert!(spec.required_for(Stage::Review).is_empty());
         assert!(!spec.is_empty());
         let described = spec.describe();
         assert!(described.contains("test:test_log"), "{described}");

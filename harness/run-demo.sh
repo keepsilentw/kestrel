@@ -46,6 +46,8 @@ ARTIFACTS="${KESTREL_ARTIFACTS:-$HERE/artifacts}"
 # 否则「SA 广播的 ref」与「RD 能写的目录」会各自解析成不同路径。
 WORKTREE="${KESTREL_WORKTREE:-/tmp/kestrel-worktree}"
 export KESTREL_WORKTREE="$WORKTREE"
+EVIDENCE_DIR="$ARTIFACTS/evidence"
+export KESTREL_EVIDENCE_DIR="$EVIDENCE_DIR"
 
 BIN="${KESTREL_BIN:-$ROOT/target/debug/kestrel}"
 if [ ! -x "$BIN" ]; then
@@ -65,8 +67,10 @@ if [ "${KESTREL_DEMO_KEEP_JOURNAL:-0}" != "1" ]; then
   rm -f "$HERE/journal.jsonl"
   mkdir -p "$ARTIFACTS"
   rm -f "$ARTIFACTS"/*.json
+  rm -f "$EVIDENCE_DIR/build.log"
 fi
 mkdir -p "$ARTIFACTS"
+mkdir -p "$EVIDENCE_DIR"
 # RD 的沙箱写范围（rd.toml:[permissions].write_roots，也是它的 cwd）——demo 前置。
 mkdir -p "$WORKTREE"
 rm -f "$SOCKET"
@@ -109,7 +113,8 @@ fi
   --role "$HERE/roles/rd.toml" --artifacts-dir "$ARTIFACTS" \
   ${RESOURCE_ARGS[@]+"${RESOURCE_ARGS[@]}"} ${STATUS_RD[@]+"${STATUS_RD[@]}"} &
 PIDS+=($!)
-"$BIN" serve --session harness-qa --bus-socket "$SOCKET" \
+PYTHONPYCACHEPREFIX="$EVIDENCE_DIR/pycache" \
+  "$BIN" serve --session harness-qa --bus-socket "$SOCKET" \
   --role "$HERE/roles/qa.toml" --artifacts-dir "$ARTIFACTS" \
   ${RESOURCE_ARGS[@]+"${RESOURCE_ARGS[@]}"} ${STATUS_QA[@]+"${STATUS_QA[@]}"} &
 PIDS+=($!)

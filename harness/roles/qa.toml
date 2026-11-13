@@ -15,10 +15,11 @@ prompt_file = "../systems/qa.md"   # 相对 role 文件所在目录（harness/ro
 
 [permissions]
 policy_file = "verifier.policy.json"
-write_roots = []                            # QA 只读：写范围为零
+# QA 不改源码；唯一写根由 demo 指向 artifacts/evidence，用来落内核生成的构建日志。
+write_roots = ["$KESTREL_EVIDENCE_DIR:-/tmp/kestrel-evidence"]
 read_only_islands = []
 
 [permissions.sandbox]
 network = "none"
 # 预算由 SA 的 journal 账本统一停损（`--max-usd`）；role 里的 max_usd 没人读。
-# QA 保持 approve 缺省 = 拒绝：写范围为零的纪律不因「能请求审批」而放宽。
+# QA 保持 approve 缺省 = 拒绝；源码仍只读，证据日志目录也不因审批而扩大。

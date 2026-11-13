@@ -2,5 +2,5 @@
   "dev": ["file", "test_log"],
   "review": ["file"],
   "test": ["file"],
-  "build": ["file"]
+  "build": ["build_log"]
 }

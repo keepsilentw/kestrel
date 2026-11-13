@@ -572,10 +572,17 @@ fn spawn_worker(
             let stage = payload["stage"].as_str().unwrap_or("unknown").to_string();
             let iteration = payload["iteration"].as_u64().unwrap_or(0);
             let approver = cfg.approver.clone().unwrap_or_else(|| sender.clone());
-            handle.turn(vec![MessageItem::BusBell {
+            let input = vec![MessageItem::BusBell {
                 sender: sender.clone(),
                 text: bell_prompt(&payload),
-            }]);
+            }];
+            if cfg.role == "qa" {
+                // Verifier stages must be independent: a review verdict or a
+                // previous build refusal is not evidence for the next stage.
+                handle.turn_isolated(input);
+            } else {
+                handle.turn(input);
+            }
 
             let mut result_text = String::new();
             let mut aborted = false;

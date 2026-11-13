@@ -2,9 +2,11 @@
 
 为星型多 Agent harness 写的 Rust harness kernel：引擎 + wire 层 + 工具/权限/沙箱 + 会话 + 总线/journal + CLI/配置。设计文档（中文）见本仓库 `docs/design.md`。
 
-**Metrics** — src 51 files / 19418 lines · tests 9 files / 3807 lines · 271 tests (lib 212 + bin 5 + integration 54)
+**Metrics** — src 51 files / 19648 lines · tests 9 files / 3837 lines · 273 tests (lib 213 + bin 5 + integration 55)
 
-Status: M0-M4 complete + 二期主体落地。三期于 2026-11-10 开工：worker 池的并发执行护栏同时提供每 task 的 `--max-parallel-tools`（缺省 4）和 worker 全局的 `--max-worker-tools`（缺省 8），任一为 `0` 时显式关闭对应上限；两级限制都不改变源序回写、串行工具写锁和取消语义（design §9.46 / §9.48）。journal 的已封闭段可移入 `<journal>.segments/`，`replay_all()` 同时读取两处，移动而非删除历史（§9.47）；`journal-archive --keep/--dry-run` 与 `journal-status --json/--check/--list/--approvals` 把归档的预览、执行、库存与审批链都变成可查项。`serve --status-file` 原子发布活动 task、未决审批与各级上限（§9.52），`serve --max-rss-mb` 给整个 worker 一条内存**软**上限：peak RSS 越线后进入 drain，新 task 被显式拒绝、在跑的跑完（§9.53）；`serve --task-idle-timeout-secs` 让空闲 task 退休引擎、释放 `--max-tasks` 的 slot，同一 task 再响时重开同一棵会话树（§9.55）。名义成本分类已细到 `peer × reason`（§9.49），判定 issue 已改为自带 `Artifact | Turn` 归因的类型（§9.50）。剩下的未完成边界：正在跑的引擎的内存回收（现在只有准入闸门）、强制 kill 式硬上限、归档段压缩、跨回合审批槽位、三期真端点联跑。二期已落地 `ApproveMode::Bus`、SA 判定含证据核对、bus 停车补投与自动重连、journal 快照/截断与在线投影、多任务 task 命名空间、openai-responses wire、worker 池、预算按 token 结算的价格表、journal 轮转的默认策略、按类型核对的证据与 stage 要求表、审批请求的 at-least-once 投递与按 req 幂等、验证 FAIL 回跳写者、bash `output_path` 交出可核对的 test_log。2026-11-05 最后一次真实联跑四关一次通过，QA 切到 GLM 的 OpenAI 兼容表面后报账为 `0.1806 cny, of which 0.0000 nominal`（§9.45、smoke-report §33）。2026-11-10 的三期改动都过了 fmt / clippy `-D warnings` / test 三道人工闸门，尚未做真端点联跑。上面那行数字由 `tests/discipline.rs` 与源码树对照校验。
+Status: M0-M4 complete + 二期主体落地。三期于 2026-11-10 开工：worker 池的并发执行护栏同时提供每 task 的 `--max-parallel-tools`（缺省 4）和 worker 全局的 `--max-worker-tools`（缺省 8），任一为 `0` 时显式关闭对应上限；两级限制都不改变源序回写、串行工具写锁和取消语义（design §9.46 / §9.48）。journal 的已封闭段可移入 `<journal>.segments/`，`replay_all()` 同时读取两处，移动而非删除历史（§9.47）；`journal-archive --keep/--dry-run` 与 `journal-status --json/--check/--list/--approvals` 把归档的预览、执行、库存与审批链都变成可查项。`serve --status-file` 原子发布活动 task、未决审批与各级上限（§9.52），`serve --max-rss-mb` 给整个 worker 一条内存**软**上限：peak RSS 越线后进入 drain，新 task 被显式拒绝、在跑的跑完（§9.53）；`serve --task-idle-timeout-secs` 让空闲 task 退休引擎、释放 `--max-tasks` 的 slot，同一 task 再响时重开同一棵会话树（§9.55）。名义成本分类已细到 `peer × reason`（§9.49），判定 issue 已改为自带 `Artifact | Turn` 归因的类型（§9.50）。2026-11-13 的三期 RD/QA 真实端点联跑已 `pipeline complete`，四个 stage 的测试证据均为 `21 passed / 0 failed`，账本 `0.2099 cny, of which 0.0000 nominal`；同一轮把 `build` 从任意文件证据收紧为真实 `build_log`（§9.58）。剩下的未完成边界：正在跑的引擎的内存回收（现在只有准入闸门）、强制 kill 式硬上限、归档段压缩、跨回合审批槽位、Linux 沙箱、SA/Responses 真端点验证。2026-11-10 的三期改动均通过了 fmt / clippy `-D warnings` / test 三道人工闸门。上面那行数字由 `tests/discipline.rs` 与源码树对照校验。
+
+Verification note: the `pipeline complete` above refers to the run made before `build` was tightened. After `build_log` was enabled, subsequent real-endpoint runs passed `dev` / `review` / `test` but repeatedly failed `build` because the QA model submitted test evidence instead of a kernel-generated build log. SA correctly refused the false pass and stopped at the iteration cap. This is a model-compliance gap, not an accepted result; see design §9.58.
 
 ## Quick start
 
@@ -101,18 +103,19 @@ SA 的判定只读盘，且分三层：通路（有答案、未 abort、worker �
 ### 证据的类型化
 
 「有个文件」只证明有东西。worker 可以按类型声明证据：`EVIDENCE test_log /abs/path/pytest.log`
-（可用类型 `file` / `test_log` / `diff` / `screenshot`，缺省 `file`），而类型是 **SA 能在盘上
+（可用类型 `file` / `test_log` / `build_log` / `diff` / `screenshot`，缺省 `file`），而类型是 **SA 能在盘上
 反驳的那句话**：`test_log` 里要能找到测试汇总行（`test result:` / `passed` / `Tests:` …），
+`build_log` 必须由内核 `output_path` 生成，包含实际构建命令和 0 退出状态，
 `diff` 要有 `diff --git` 或 `--- / +++ / @@`，`screenshot` 的文件头要真是 PNG/JPEG/GIF/WebP
 且不小于 1 KiB。认不出的类型名不猜——它连 `file` 档都不算。
 
 `--evidence-spec` 指向的表把「这一关要哪类证据」变成数据：`{"test": ["test_log"], "dev": ["file"]}`。
 要求看的是**核对通过**的类型，所以一份普通文件顶不出 `test_log` 那一格。表读不出来或要求了
 认不出的类型 => **启动即失败**（坏表当成「没有要求」就是 fail-open；永远满足不了的要求会让
-pipeline 无限回派）。`harness/roles/sa.evidence.json` 把 `dev` 提到 `["file", "test_log"]`：
-写者必须自己交出「真跑过测试」的盘上形状，验证者才有东西可反驳；其余三关仍只要 `file`——
-收紧哪一格是定标准的人的决定。QA 写范围为零这条纪律没动：它指认盘上已有的那份，不需要为了
-「声明过」而先造一个文件。
+pipeline 无限回派）。`harness/roles/sa.evidence.json` 把 `dev` 提到 `["file", "test_log"]`，
+`build` 提到 `["build_log"]`：写者必须交出真跑过测试的形状，构建关必须交出真实命令和退出状态。
+QA 的源码写范围仍为零；demo 另给它一个 `artifacts/evidence` 写根，只能落内核生成的证据日志，
+不能修改 worktree、源码或 artifacts 下的判定文件。
 
 那份形状从哪来——bash 工具的 `output_path` 参数（绝对路径，内核按 write 的规则核它落在写根内、
 不在只读岛，把 stdout/stderr 连 `exit:` 状态一起写进去；跑挂的那次**也**落盘，因为最想看日志的

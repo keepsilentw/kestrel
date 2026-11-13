@@ -27,8 +27,8 @@
 > 归档链的断口与重复段的隔离出口（§9.56）、记录层的深度校验 `--verify`（§9.57）；
 > 代码部分都过了 fmt / clippy / test；
 > **真端点联跑未重跑**，demo 的接法只到语法与 flag 解析这一层。
-> **Metrics** — src 51 files / 19418 lines · tests 9 files / 3807 lines · 271 tests (lib 212 + bin 5 + integration 54)
-> **Integration** — core_loop 5 / discipline 2 / m1_tools 12 / m2_session 6 / m4_bus 15 / m5_pool 8 / sandbox_e2e 4 / wire_anthropic 2
+> **Metrics** — src 51 files / 19648 lines · tests 9 files / 3837 lines · 273 tests (lib 213 + bin 5 + integration 55)
+> **Integration** — core_loop 6 / discipline 2 / m1_tools 12 / m2_session 6 / m4_bus 15 / m5_pool 8 / sandbox_e2e 4 / wire_anthropic 2
 > 规模已过 plan 预算（10-13k）的上沿：多出来的部分几乎都花在「取消安全」与「对账」这两条纪律上。
 > 上面两行数字由 `tests/discipline.rs::metrics_lines_match_the_tree` 对照源码树重算校验——
 > 这些计数此前在三处文档里手抄过三次、漂移过三次（§9.19），现在它是闸门不是仪式。
@@ -91,7 +91,7 @@ flowchart TD
 实现强制的不变式（都有测试背书）：
 
 1. **取消三件套**：每个 await 过 `or_cancel`；`tokio::spawn` 必须包 `AbortOnDropHandle`（`tests/discipline.rs` 静态闸门，fire-and-forget/managed 两类豁免标记）；`ResponseStream` drop 通知上游。由它延伸出第四条纪律：**被 `tokio::select!` 取消的 future 不许留下坏状态**——落败分支会在半路被 drop，任何「取出共享资源、用完再放回」的写法都必须用 RAII 归还（`bus::rpc::Taken`），否则那条连接会被永久破坏；而「一帧都不能丢」的读取要放进取消不了的专职 reader 任务（`cli::pool` 的泵）。
-2. **fail-closed**：tokenizer 解析不了 → Ask；未设角色/无策略 → Ask 或 Deny；QA 写范围为零；审批者沉默、回复不可解析、或 SA 没有授权表 → Deny（`approve_timeout_secs`，默认 120s）。
+2. **fail-closed**：tokenizer 解析不了 → Ask；未设角色/无策略 → Ask 或 Deny；QA 源码写范围为零（只允许独立证据日志根）；审批者沉默、回复不可解析、或 SA 没有授权表 → Deny（`approve_timeout_secs`，默认 120s）。
 3. **只追加**：session 永不截断；journal 的**活文件**可以变短，但只允许在旧前缀已被折成 `snapshot` 检查点并归档成段之后——历史不消失，只是搬出活文件（§9.22）。回滚/恢复 = 重放；半写容忍（残行 skip）。
 4. **sender identity**：Hello 声明 + 帧内 sender 强一致；伪装者断连；bus 来源 item 渲染带 `<bell from>` 标注。
 5. **journal 是真相**：StageWritten → BellSent → notify 的调用序强制 write-ahead；state 投影从 journal 重生成。投影可以**增量维护**（`Folder` 每追加一条走一步，避免每次派发都重放整个文件），但增量与全量必须是同一次折叠——`projection_equals_a_full_replay_after_every_append` 断言两者逐次相等，否则「预算停损读的是缓存、巡检读的是重放」会分成两份真相。
@@ -240,7 +240,7 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
     ② 要求表是数据不是代码：`--evidence-spec` 指一份 `{"test": ["test_log"], "dev": ["file"]}`。`EvidenceSpec::from_json_file` 读不出来就**硬失败**——坏表若被当成「没有要求」，验收标准会在无人察觉时被静默放宽，那是 fail-open，而这张表存在的理由正是防它；表里出现认不出的类型名同样硬失败（那是一条永远满足不了的要求，会让 pipeline 无限回派，报错比空转好查）。
     ③ stage 要求看的是**核对通过**的类型集合（`EvidenceReport.verified_kinds`），不是「声明过的类型」：一份普通文件顶不出 `test_log` 那一格，否则要求又退化成措辞比赛。反过来 `file` 是**下界**而不是并列的一档：任何通过更强类型核对的证据都已经过了「在盘上、有内容」那关（那段检查在类型分派之前就跑完了），所以它必须能满足 `file` 要求。这一条不是理论洁癖——demo 的表写 `file`、提示词教 worker 写 `EVIDENCE test_log`，把 `file` 当并列档的话这两件好事凑一起就足以把 pipeline 打进无限回派。钉住它的测试：`a_verified_stronger_kind_also_fills_the_file_floor`。
     ④ 兼容不做成两份真相：工件的 `evidence` 数组既收对象（`{"path","kind"}`）也收老的裸路径字符串（按 `file`）；正文里没有契约行时仍从答案里提绝对路径。类型线名只有一份定义（`EvidenceKind::as_str` / `parse`），所以写侧手写 `Serialize` 而不是 derive——derive 会造出第二组线名，而 `serialized_kind_parses_back` 钉住写读同源。
-    ⑤ 声明通道：worker 用 `EVIDENCE <kind> <path...>` 行声明（`harness/systems/{rd,qa}.md` 已写进契约），worker **只报它看到的东西**，判定仍然只读盘（不变式：铃正文与声明都是主张）。QA 写范围为零这一条没动：它不需要为了能声明类型而获得写权限，指认盘上已有的那份即可。
+    ⑤ 声明通道：worker 用 `EVIDENCE <kind> <path...>` 行声明（`harness/systems/{rd,qa}.md` 已写进契约），worker **只报它看到的东西**，判定仍然只读盘（不变式：铃正文与声明都是主张）。当时 QA 写范围为零；2026-11-13 为真实构建日志增加了独立证据写根，源码仍只读，见 §9.58。
     ⑥ demo 缺省表要**行为不变**：`harness/roles/sa.evidence.json` 四个 stage 都只要求 `file`，等于类型化之前的语义；把某一格改成 `test_log` 是运营者的决定，不改默认、不静默改沙箱。这也是这份文档里唯一一处「能力落地但策略保守」的取舍： stricter 要求的价值要靠真端点联跑来验，不能拿 demo 默认为它背书。
 
 30. **审批批复的可靠投递（2026-11-03）**：§9.21 划的那条线仍然成立——总线不猜「大概没送到」，RPC 与「已经写进随后死掉的 socket」的帧都不重放。这一项不是把总线改成可靠投递，而是在**应用层**把代价不对称这件事做完：重发一份帧的代价，远小于一件工具被静默 deny 之后整次回派的代价。
@@ -545,7 +545,40 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
        `coverage chain: complete` 且退出码 0，带上之后报出 3 条问题、退出码 1——这一对
        正好说明为什么这一格值得单独存在，也说明 §9.56 的链检查只覆盖了它能覆盖的那一半。
 
+58. **真实联跑抓出的 build 假通过，以及 `build_log`（2026-11-13）**：
+    ① 2026-11-13 的 RD/QA 真实端点联跑已完成：`dev` iter1 回合预算耗尽后 iter2 通过，
+       `review` / `test` / `build` 各 iter1 通过，最终 `pipeline complete`；账本
+       `0.2099 cny, of which 0.0000 nominal`。
+    ② 同一轮暴露 `build: ["file"]` 太弱：QA 的 `python3 -m py_compile` 被只读沙箱拒绝，
+       但它用“unittest 成功导入”和已有测试日志解释后，`PASS` 仍被接受。文件存在不能证明
+       构建执行过。
+    ③ 新增 `build_log`：必须由 bash `output_path` 生成，文件头同时有内核写的真实
+       `command:` 与 `exit:`；退出码必须是 0，命令必须匹配已知构建前缀（cargo build/check、
+       py_compile/compileall、npm/pnpm/yarn build、go build、maven/gradle、make/cmake）。
+       测试日志、任意成功命令或非零退出的构建日志都不能填这一格。
+    ④ QA 的**源码**写范围仍为零。demo 单独导出 `artifacts/evidence` 给它，只用于内核日志和
+       Python 缓存；`qa.toml` 的 write root 指向该目录，artifacts 下的判定 JSON 仍不可写。
+    ⑤ `harness/roles/sa.evidence.json` 的 `build` 改为 `["build_log"]`，QA 提示词要求构建命令
+       显式传 `output_path`，被拒时直接 `FAIL: build evidence unavailable`，不得拿测试替代。
+    ⑥ 边界：这是命令级证据，不是跨语言包产物的完整语义证明；未知构建系统需要先把命令前缀
+       加入白名单，否则会被 fail-closed。
+    ⑦ 真实联跑又暴露了 stage 串扰：QA 在同一 task 的 history 中保留上一关结论，build
+       会复用 review/test 的回答并声称“没有 check 字段”。为此 QA 门铃首行改为
+       `[QA STAGE: …]`，并在 worker 侧使用 `TurnIsolated`：会话文件仍 append-only，
+       但模型请求只带当前门铃，不继承旧 stage 的对话。
+    ⑧ 验证类 stage 缺证据归因为 `Turn`，路由重派 QA，不扣 RD 返工额度；写者阶段仍归
+       `Artifact`。单元测试钉住“build 缺 build_log 时不回派写者”。
+    ⑨ 启用 `build_log` 后的真实端点复跑仍未收敛：`dev` / `review` / `test` 可过，
+       `build` 连续三次提交测试日志而非构建日志，SA 在 iteration cap 显式失败。这一结果
+       证明假通过被阻止，不证明 QA 模型会遵从新契约；要让严格 pipeline 收敛，需要确定性
+       构建执行器或更强的 verifier prompt/model。
+
 ## 10 二期清单
+
+> 2026-11-13 更新：三期 RD/QA 在收紧 `build_log` 之前有一次真实端点通过；收紧后
+> `build` 能正确拒绝测试日志冒充构建证据，但 QA 模型尚未稳定生成 `build_log`，严格
+> pipeline 在 build 的 iteration cap 失败，见 §9.58。剩余验证空洞是脚本化 SA 未调用
+> MiMo，以及 `openai-responses` 尚无真端点实测。下文的“三期真端点联跑”仍保留为当时记录。
 
 已落地（2026-10-28 起）：~~`ApproveMode::Bus`~~（授权表 + 超时 fail-closed + journal 审计，§9.20）、~~SA 判定升级到「工件 + 证据文件」~~（绝对路径存在性/非空核对，§9.20）、~~bus 重连重放~~（离线 session 停车补投 + 客户端自动重连；RPC 与「写入即死」的帧不重放，§9.21）、~~journal 快照/截断语义~~（检查点 + 归档段 + 崩溃安全轮转，§9.22）、~~多任务并行~~（task 命名空间三处同源 + 前缀寻址，§9.23）、~~openai-responses wire~~（第三条 v1 wire，金身 + fixture 验证，**真端点未实测**，§9.24）、~~journal 投影增量化与轮转触发~~（在线投影 = 全量重放 + 条数/字节双上限，§9.25）、~~一个引擎内真正并发地服务多个 task~~（改为「一 task 一引擎」的 worker 池，单活跃槽不动，§9.26）、~~`BudgetSpent` 的价格表~~（预留 → 结算两段式、按 token 换账单、无价退回名义值并报出来，§9.27；2026-11-03）、~~journal 轮转的**默认策略**~~（活文件 512 条 / 1 MiB 双上限、三态 CLI、生产与测试同一条 `rotate_at_boundary`，§9.28；2026-11-03）、~~证据的类型化~~（`file` / `test_log` / `diff` / `screenshot` 各自可在盘上反驳 + `--evidence-spec` 的 stage 要求，坏表硬失败，§9.29；2026-11-03）、~~审批批复的可靠投递~~（请求 at-least-once + 按 req 幂等 + 台账从 journal 播种，判定仍只一次，§9.30；2026-11-03）、~~批复到底有没有生效~~（回执 `approval_receipt` + `ApprovalAcked` 落账 + 到点撤摊，**没生效的批准不许记成生效**，§9.31；2026-11-03）。
 

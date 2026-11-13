@@ -117,6 +117,36 @@ async fn tooluse_drives_follow_up_then_converges() {
     handle.shutdown().await;
 }
 
+/// Verifier stages share one task engine, but their model context must not.
+/// A build turn must not inherit the previous review transcript merely because
+/// the task id is the same.
+#[tokio::test]
+async fn isolated_turn_does_not_replay_previous_context() {
+    let wire = Arc::new(FauxWire::new());
+    wire.push_turn_script(kestrel::provider::faux::stop_script("review done"));
+    wire.push_turn_script(kestrel::provider::faux::stop_script("build done"));
+    let (handle, mut rx) = spawn_engine(Arc::clone(&wire), 8);
+
+    handle.turn(vec![MessageItem::user_text("review the code")]);
+    let (_events, stop) = collect_until_complete(&mut rx).await;
+    assert!(matches!(stop, StopReason::Stop));
+
+    handle.turn_isolated(vec![MessageItem::user_text("build the code")]);
+    let (_events, stop) = collect_until_complete(&mut rx).await;
+    assert!(matches!(stop, StopReason::Stop));
+
+    let recorded = wire.recorded_requests();
+    let second = recorded[1]["items"].as_array().unwrap();
+    assert_eq!(second.len(), 1, "{second:?}");
+    let second = serde_json::to_string(second).unwrap();
+    assert!(second.contains("build the code"), "{second}");
+    assert!(
+        !second.contains("review the code"),
+        "previous stage leaked into isolated context: {second}"
+    );
+    handle.shutdown().await;
+}
+
 /// Acceptance 3: length truncation fails the whole batch, nothing executes, no follow-up.
 #[tokio::test]
 async fn length_truncation_fails_batch_without_executing() {

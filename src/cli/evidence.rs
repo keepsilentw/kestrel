@@ -20,8 +20,10 @@ use crate::journal::records::TestRun;
 pub enum EvidenceKind {
     /// 存在 + 非空（裸路径的缺省类型）。
     File,
-    /// 测试/构建日志：UTF-8 文本，且含可识别的汇总行（cargo / pytest / jest / go test）。
+    /// 测试日志：UTF-8 文本，且含可识别的汇总行（cargo / pytest / jest / go test）。
     TestLog,
+    /// 内核 `output_path` 生成的真实构建日志：带构建命令、退出状态，且成功退出。
+    BuildLog,
     /// 统一 diffs：`diff --git` 或 `--- / +++ / @@` 的组合。
     Diff,
     /// 截图：文件头是真的图片魔数，且大小不像占位。
@@ -36,6 +38,7 @@ impl EvidenceKind {
         match self {
             EvidenceKind::File => "file",
             EvidenceKind::TestLog => "test_log",
+            EvidenceKind::BuildLog => "build_log",
             EvidenceKind::Diff => "diff",
             EvidenceKind::Screenshot => "screenshot",
             EvidenceKind::Unknown => "unknown",
@@ -46,6 +49,7 @@ impl EvidenceKind {
         match raw.trim().to_ascii_lowercase().as_str() {
             "file" | "path" | "artifact" => EvidenceKind::File,
             "test_log" | "testlog" | "log" => EvidenceKind::TestLog,
+            "build_log" | "buildlog" | "build-log" => EvidenceKind::BuildLog,
             "diff" | "patch" => EvidenceKind::Diff,
             "screenshot" | "shot" | "image" | "png" => EvidenceKind::Screenshot,
             _ => EvidenceKind::Unknown,
@@ -237,6 +241,7 @@ pub fn check_evidence(items: &[Evidence]) -> EvidenceReport {
                 }
                 Err(e) => Some(format!("evidence {} unreadable: {e}", item.path)),
             },
+            EvidenceKind::BuildLog => check_build_log(path),
             EvidenceKind::Diff => match read_head(path, SPAN_BYTES) {
                 Ok(bytes) => {
                     let text = String::from_utf8_lossy(&bytes);
@@ -327,7 +332,7 @@ const TEST_SUMMARY_MARKERS: &[&str] = &[
     "failures=",    // unittest 的失败汇总行 `FAILED (failures=1, errors=2)`
 ];
 
-const KNOWN_KINDS: &str = "file | test_log | diff | screenshot";
+const KNOWN_KINDS: &str = "file | test_log | build_log | diff | screenshot";
 
 fn find_marker<'a>(text: &str, markers: &[&'a str]) -> Option<&'a str> {
     markers.iter().find(|m| text.contains(**m)).copied()
@@ -451,6 +456,85 @@ fn parse_exit_line(head: &str) -> (Option<i64>, Option<i64>) {
         return (None, None);
     };
     (key_number_i64(line, "code"), key_number_i64(line, "signal"))
+}
+
+/// A build log must come from `bash.output_path`: that is the only writer that
+/// records both the exact command and the kernel-observed exit status. Exit 0
+/// alone is not enough, and neither is a recognizable build word without the
+/// status line.
+fn check_build_log(path: &Path) -> Option<String> {
+    let head = match read_head(path, SPAN_BYTES) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(error) => return Some(format!("evidence {} unreadable: {error}", path.display())),
+    };
+    let Some(command) = head
+        .lines()
+        .find_map(|line| line.strip_prefix("command: "))
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+    else {
+        return Some(format!(
+            "evidence {} is not a build log (missing kernel `command:` line)",
+            path.display()
+        ));
+    };
+    let (exit_code, exit_signal) = parse_exit_line(&head);
+    match (exit_code, exit_signal) {
+        (_, Some(signal)) => {
+            return Some(format!(
+                "evidence {} is a build log killed by signal {signal}",
+                path.display()
+            ));
+        }
+        (Some(0), None) => {}
+        (Some(code), None) => {
+            return Some(format!(
+                "evidence {} is a build log that exited with status {code}",
+                path.display()
+            ));
+        }
+        (None, None) => {
+            return Some(format!(
+                "evidence {} has no kernel-recorded build exit status",
+                path.display()
+            ));
+        }
+    }
+    if !looks_like_build_command(command) {
+        return Some(format!(
+            "evidence {} does not contain a recognized build command: {command}",
+            path.display()
+        ));
+    }
+    None
+}
+
+fn looks_like_build_command(command: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "cargo build",
+        "cargo check",
+        "python -m compileall",
+        "python -m py_compile",
+        "python3 -m compileall",
+        "python3 -m py_compile",
+        "npm run build",
+        "pnpm build",
+        "pnpm run build",
+        "yarn build",
+        "go build",
+        "mvn compile",
+        "mvn package",
+        "gradle build",
+        "./gradlew build",
+        "make",
+        "cmake --build",
+    ];
+    let command = command.trim();
+    PREFIXES.iter().any(|prefix| {
+        command.strip_prefix(prefix).is_some_and(|rest| {
+            rest.is_empty() || rest.chars().next().is_some_and(|c| c.is_whitespace())
+        })
+    })
 }
 
 /// `<数字> <词>`：取**最后**一次出现——汇总行总在文件末尾，前面的同名数字是过程输出。
@@ -641,13 +725,15 @@ mod tests {
     fn typed_evidence_lines_carry_their_kind() {
         let answer = "EVIDENCE test_log /tmp/wt/pytest.log /tmp/wt/cargo.log\n\
                       evidence diff /tmp/wt/change.diff\n\
+                      EVIDENCE build_log /tmp/wt/build.log\n\
                       EVIDENCE screenshot /tmp/wt/shot.png\n";
         let got = evidence_from_answer(answer);
-        assert_eq!(got.len(), 4, "{got:?}");
+        assert_eq!(got.len(), 5, "{got:?}");
         assert_eq!(got[0].kind, EvidenceKind::TestLog);
         assert_eq!(got[1].path, "/tmp/wt/cargo.log");
         assert_eq!(got[2].kind, EvidenceKind::Diff);
-        assert_eq!(got[3].kind, EvidenceKind::Screenshot);
+        assert_eq!(got[3].kind, EvidenceKind::BuildLog);
+        assert_eq!(got[4].kind, EvidenceKind::Screenshot);
     }
 
     /// 模型会把类型名包在 markdown 里（`` `test_log` ``）：剥掉装饰之后仍然按类型走。
@@ -800,6 +886,49 @@ mod tests {
         assert!(rep.issues[0].contains("signal 9"), "{:?}", rep.issues);
         assert_eq!(rep.test_runs[0].exit_code, None);
         assert_eq!(rep.test_runs[0].exit_signal, Some(9));
+    }
+
+    /// A build claim needs more than a filename: the kernel-written log carries
+    /// the exact command and status, so a test run or an arbitrary successful
+    /// command cannot stand in for an actual build.
+    #[test]
+    fn build_log_must_come_from_a_successful_build_command() {
+        let good = scratch(
+            "build",
+            "build.log",
+            b"command: python3 -m py_compile /tmp/wt/lru_cache.py\nexit: ExitStatus { code: Some(0), signal: None }\n--- stdout ---\n",
+        );
+        let mut claim = good.clone();
+        claim.kind = EvidenceKind::BuildLog;
+        let rep = check_evidence(&[claim]);
+        assert!(rep.issues.is_empty(), "{:?}", rep.issues);
+        assert_eq!(rep.verified_kinds, vec![EvidenceKind::BuildLog]);
+
+        let failed = scratch(
+            "build",
+            "failed.log",
+            b"command: cargo build --target-dir /tmp/wt/target\nexit: ExitStatus { code: Some(101), signal: None }\n--- stderr ---\nerror: could not compile\n",
+        );
+        let mut claim = failed.clone();
+        claim.kind = EvidenceKind::BuildLog;
+        let rep = check_evidence(&[claim]);
+        assert_eq!(rep.issues.len(), 1, "{:?}", rep.issues);
+        assert!(rep.issues[0].contains("status 101"), "{:?}", rep.issues);
+
+        let test_command = scratch(
+            "build",
+            "tests.log",
+            b"command: python3 -m unittest test_lru_cache\nexit: ExitStatus { code: Some(0), signal: None }\n--- stdout ---\nRan 21 tests\nOK\n",
+        );
+        let mut claim = test_command.clone();
+        claim.kind = EvidenceKind::BuildLog;
+        let rep = check_evidence(&[claim]);
+        assert_eq!(rep.issues.len(), 1, "{:?}", rep.issues);
+        assert!(
+            rep.issues[0].contains("recognized build command"),
+            "{:?}",
+            rep.issues
+        );
     }
 
     /// 现场抓到的假 FAIL（2026-11-04 那轮强制轮转的联跑）：模型把括注粘在路径后面，
@@ -1089,6 +1218,7 @@ mod tests {
         for kind in [
             EvidenceKind::File,
             EvidenceKind::TestLog,
+            EvidenceKind::BuildLog,
             EvidenceKind::Diff,
             EvidenceKind::Screenshot,
         ] {

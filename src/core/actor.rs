@@ -193,6 +193,10 @@ impl AgentHandle {
         self.submit(Op::Turn { input });
     }
 
+    pub fn turn_isolated(&self, input: Vec<MessageItem>) {
+        self.submit(Op::TurnIsolated { input });
+    }
+
     pub fn steer(&self, item: MessageItem) {
         self.submit(Op::Steer { item });
     }
@@ -269,23 +273,10 @@ async fn op_loop(mut rx: mpsc::UnboundedReceiver<Submission>, shared: Arc<Shared
     while let Some(sub) = rx.recv().await {
         match sub.op {
             Op::Turn { input } => {
-                // Single active slot: abort the previous turn first (codex tasks/mod.rs:277).
-                if let Some(t) = active.take() {
-                    t.token.cancel();
-                    // Fire-and-forget: grace abort backstop (100ms, codex tasks/mod.rs:70).
-                    tokio::spawn(async move {
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                        t.handle.abort();
-                    });
-                }
-                shared.commit(input);
-                let token = shared.root.child_token();
-                let sh = Arc::clone(&shared);
-                let task_token = token.clone();
-                let handle = AbortOnDropHandle::new(tokio::spawn(async move {
-                    super::turn::run_turn(&sh, &task_token).await;
-                }));
-                active = Some(ActiveTask { token, handle });
+                start_turn(&shared, &mut active, input, false);
+            }
+            Op::TurnIsolated { input } => {
+                start_turn(&shared, &mut active, input, true);
             }
             Op::Steer { item } => {
                 shared.steering.push(item);
@@ -317,6 +308,35 @@ async fn op_loop(mut rx: mpsc::UnboundedReceiver<Submission>, shared: Arc<Shared
         t.token.cancel();
     }
     shared.approvals.drop_pending();
+}
+
+fn start_turn(
+    shared: &Arc<Shared>,
+    active: &mut Option<ActiveTask>,
+    input: Vec<MessageItem>,
+    isolated: bool,
+) {
+    // Single active slot: abort the previous turn first (codex tasks/mod.rs:277).
+    if let Some(t) = active.take() {
+        t.token.cancel();
+        // Fire-and-forget: grace abort backstop (100ms, codex tasks/mod.rs:70).
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            t.handle.abort();
+        });
+    }
+    if isolated {
+        shared.history.lock().unwrap().clear();
+        shared.history_ids.lock().unwrap().clear();
+    }
+    shared.commit(input);
+    let token = shared.root.child_token();
+    let sh = Arc::clone(shared);
+    let task_token = token.clone();
+    let handle = AbortOnDropHandle::new(tokio::spawn(async move {
+        super::turn::run_turn(&sh, &task_token).await;
+    }));
+    *active = Some(ActiveTask { token, handle });
 }
 
 /// Convenience for callers that keep a map of named switch specs (M0 CLI/tests).

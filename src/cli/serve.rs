@@ -333,18 +333,36 @@ pub fn bell_prompt(payload: &serde_json::Value) -> String {
         .as_str()
         .or_else(|| payload["ref"]["task"].as_str())
         .unwrap_or("(no task text in bell; see ref on disk)");
-    let mut out = String::from(task);
+    let check = payload["check"].as_str();
+    let mut out = String::new();
+    if payload["role"].as_str() == Some("qa")
+        && let Some(stage) = check
+    {
+        out.push_str(&format!(
+            "[QA STAGE: {}] This dispatch must perform only this stage.\n",
+            stage.to_ascii_uppercase()
+        ));
+    }
+    out.push_str(task);
     // 谁在派这活：一个 worker 服务多条 pipeline 时，task id 是唯一的区分线索
     if let Some(id) = payload["task_id"].as_str().filter(|t| !t.trim().is_empty()) {
         out.push_str("\ntask id: ");
         out.push_str(id);
     }
-    if let Some(check) = payload["check"].as_str() {
+    if let Some(check) = check {
         out.push_str("\ncheck: ");
         out.push_str(check);
     }
     if let Some(iter) = payload["iteration"].as_u64() {
         out.push_str(&format!("\niteration: {iter}"));
+    }
+    if payload["role"].as_str() == Some("qa")
+        && let Some(stage) = payload["check"].as_str()
+    {
+        out.push_str(&format!(
+            "\nstage contract: this dispatch is only `{stage}`. Produce only the evidence required \
+             by this stage; do not substitute or repeat another stage's evidence or failure."
+        ));
     }
     let reference = &payload["ref"];
     if !reference.is_null() {
@@ -423,10 +441,18 @@ mod tests {
             "task_id": "t2",
             "ref": { "artifacts": "/tmp/art", "worktree": "/tmp/kestrel-worktree" },
         }));
-        assert!(text.starts_with("demo: 实现一个 LRU cache"), "{text}");
+        assert!(
+            text.starts_with("[QA STAGE: REVIEW]"),
+            "stage must be the first thing QA sees: {text}"
+        );
+        assert!(text.contains("demo: 实现一个 LRU cache"), "{text}");
         assert!(text.contains("task id: t2"), "{text}");
         assert!(text.contains("check: review"), "{text}");
         assert!(text.contains("iteration: 2"), "{text}");
+        assert!(
+            text.contains("stage contract: this dispatch is only `review`"),
+            "QA must be told to keep stages separate: {text}"
+        );
         assert!(text.contains("/tmp/kestrel-worktree"), "{text}");
         assert!(text.contains("/tmp/art"), "{text}");
     }

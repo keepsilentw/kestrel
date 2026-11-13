@@ -7,8 +7,8 @@
 
 ## 1. 自动化测试基线（cargo test）
 
-**Metrics** — src 51 files / 19418 lines · tests 9 files / 3807 lines · 271 tests (lib 212 + bin 5 + integration 54)
-**Integration** — core_loop 5 / discipline 2 / m1_tools 12 / m2_session 6 / m4_bus 15 / m5_pool 8 / sandbox_e2e 4 / wire_anthropic 2
+**Metrics** — src 51 files / 19648 lines · tests 9 files / 3837 lines · 273 tests (lib 213 + bin 5 + integration 55)
+**Integration** — core_loop 6 / discipline 2 / m1_tools 12 / m2_session 6 / m4_bus 15 / m5_pool 8 / sandbox_e2e 4 / wire_anthropic 2
 
 | 组 | 覆盖 |
 |---|---|
@@ -1172,3 +1172,22 @@ task；手写出来的空段会被报成「比名字少」，这是刻意的。�
 `cargo test` 沙箱外全绿 269 tests（lib 211 + bin 5 + integration 53）；沙箱内仍是那 9 个
 `m4_bus` 的 UDS `bind` EPERM（§1 的环境限制，与本格无关）。`**Metrics**` 行被拦红一次
 （src 19097→19338）并回写三处文档。**未跑**：三期真端点 demo。
+
+## 47. 2026-11-13 三期真实端点复跑与 build 证据收紧
+
+第一次三期真实端点联跑在 `build: ["file"]` 下完成四关，账本
+`0.2099 cny, of which 0.0000 nominal`。但 `build` 的 `py_compile` 实际被沙箱拒绝，
+QA 用测试日志和“导入即编译”解释后仍得到 PASS；这是假通过。
+
+随后落地：
+
+- `build_log` 必须由 bash `output_path` 生成，带真实 `command:` 和 `exit:`，退出码为 0，
+  且命令属于已知构建前缀；测试日志不能顶替。
+- QA 获得独立 `artifacts/evidence` 写根，源码仍只读；`ref.evidence` 直接广播绝对路径。
+- 验证类 stage 缺指定证据归因为 `Turn`，重派 QA，不扣写者返工额度。
+- QA 使用隔离回合和门铃首行 `[QA STAGE: …]`，避免 review/test/build 的历史互相污染。
+
+启用后多次真实端点复跑的结果一致：`dev` / `review` / `test` 可以通过，但 `build` 连续
+三次提交 test log，SA 均报 `no verified build_log evidence` 并在 iteration cap 失败。
+这证明严格的 build 闸门已经阻止假通过，同时说明当前 QA 模型尚不稳定遵从 build 契约。
+后续若要收敛，优先级是确定性构建执行器，而不是再次放宽证据类型。
