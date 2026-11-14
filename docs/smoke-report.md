@@ -7,7 +7,7 @@
 
 ## 1. 自动化测试基线（cargo test）
 
-**Metrics** — src 51 files / 20158 lines · tests 9 files / 3837 lines · 278 tests (lib 218 + bin 5 + integration 55)
+**Metrics** — src 51 files / 20257 lines · tests 9 files / 3837 lines · 279 tests (lib 218 + bin 6 + integration 55)
 **Integration** — core_loop 6 / discipline 2 / m1_tools 12 / m2_session 6 / m4_bus 15 / m5_pool 8 / sandbox_e2e 4 / wire_anthropic 2
 
 | 组 | 覆盖 |
@@ -1229,3 +1229,14 @@ Linux 读取 `/proc/self/status` 的 `VmRSS`，其他平台读取 `ps -o rss= -p
 新增测试 `resident_rss_reports_a_plausible_current_value` 和
 `rss_parsers_convert_both_platform_units_to_bytes`，并扩展 drain 测试断言恢复后可重新
 创建 task。本轮未执行 build、clippy 或测试；当前验证仅到静态审阅与格式化。
+
+## 50. 2026-11-14 可扩展的受信构建前缀
+
+`demo-sa` 新增可重复参数 `--trusted-build-prefix <prefix>`，用于 cargo/Python/npm/Go
+等内置列表之外的构建系统，例如 `--trusted-build-prefix "zig build"`。匹配要求完整命令
+词边界，配置同时用于 SA 确定性 build preflight 与最终 `build_log` 判定。
+
+demo 入口通过换行分隔的 `KESTREL_DEMO_TRUSTED_BUILD_PREFIXES` 传入多个前缀。测试覆盖
+自定义前缀通过、相邻单词不得误匹配，以及 CLI 对空值和控制字符的拒绝。
+
+本轮未执行 build、clippy 或测试；当前验证仅到静态审阅与格式化。

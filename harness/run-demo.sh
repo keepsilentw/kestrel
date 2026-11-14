@@ -34,6 +34,7 @@
 #   KESTREL_DEMO_STATUS_DIR   设了才给每个 worker 传 --status-file（该目录下
 #                             harness-rd.json / harness-qa.json）；不设 = 不写状态文件。
 #   KESTREL_DEMO_STATUS_INTERVAL  状态刷新秒数（不设 = serve 的默认 5）。
+#   KESTREL_DEMO_TRUSTED_BUILD_PREFIXES  额外受信构建命令前缀，每行一个。
 #
 # 用法：./run-demo.sh
 set -euo pipefail
@@ -156,12 +157,17 @@ PRICE_ARGS=()
 [ -z "${KESTREL_DEMO_PRICES+set}" ] || PRICE_ARGS+=(--prices "$KESTREL_DEMO_PRICES")
 
 BUILD_COMMAND="${KESTREL_DEMO_BUILD_COMMAND:-python3 -m py_compile '$WORKTREE/lru_cache.py' '$WORKTREE/test_lru_cache.py'}"
+TRUSTED_BUILD_ARGS=()
+while IFS= read -r prefix; do
+  [ -z "$prefix" ] || TRUSTED_BUILD_ARGS+=(--trusted-build-prefix "$prefix")
+done <<< "${KESTREL_DEMO_TRUSTED_BUILD_PREFIXES:-}"
 
 KESTREL_TEST_KILL_AFTER="${KESTREL_TEST_KILL_AFTER:-}" \
   "$BIN" demo-sa --bus-socket "$SOCKET" --task "${KESTREL_DEMO_TASK:-demo: 实现一个 LRU cache}" \
   --journal "$HERE/journal.jsonl" --artifacts-dir "$ARTIFACTS" \
   --worktree "$WORKTREE" \
   --build-command "$BUILD_COMMAND" \
+  ${TRUSTED_BUILD_ARGS[@]+"${TRUSTED_BUILD_ARGS[@]}"} \
   --approvals "$HERE/roles/sa.approvals.json" \
   ${EVIDENCE_ARGS[@]+"${EVIDENCE_ARGS[@]}"} \
   --roles-dir "$HERE/roles" \

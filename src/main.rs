@@ -238,6 +238,12 @@ struct DemoSaCmd {
     #[arg(long)]
     build_command: Option<String>,
 
+    /// Additional trusted build command prefix, e.g. `zig build`. Repeat for
+    /// multiple project-specific build systems. Built-in cargo/python/npm/go
+    /// and related prefixes remain enabled.
+    #[arg(long = "trusted-build-prefix", action = ArgAction::Append, value_parser = parse_trusted_build_prefix)]
+    trusted_build_prefixes: Vec<String>,
+
     /// Approval authority table for workers running `approve = "bus"`: a
     /// three-state prefix policy JSON (same format as a role policy file).
     /// Without it the SA denies every reverse request — fail closed.
@@ -535,6 +541,7 @@ async fn main() -> anyhow::Result<()> {
                 bell_timeout: Duration::from_secs(d.bell_timeout_secs),
                 worktree: d.worktree,
                 build_command: d.build_command,
+                trusted_build_prefixes: d.trusted_build_prefixes,
                 approvals: d.approvals,
                 rotate_after,
                 rotate_max_bytes,
@@ -621,6 +628,19 @@ fn parse_approve(value: &str) -> anyhow::Result<kestrel::tools::ApproveMode> {
         }),
         other => anyhow::bail!("--approve must be none|all|bus, got {other:?}"),
     }
+}
+
+fn parse_trusted_build_prefix(value: &str) -> Result<String, String> {
+    let prefix = value.trim();
+    if prefix.is_empty() {
+        return Err("--trusted-build-prefix must not be empty".to_string());
+    }
+    if prefix.chars().any(char::is_control) {
+        return Err(
+            "--trusted-build-prefix must be one command prefix, not a control sequence".to_string(),
+        );
+    }
+    Ok(prefix.to_string())
 }
 
 /// The runtime flag chooses the mode; the role file still owns the deadline it
@@ -720,7 +740,10 @@ fn resolve_key(spec: &str) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, JournalStatus, parse_approve, unhealthy_report, with_role_deadline};
+    use super::{
+        Cli, JournalStatus, parse_approve, parse_trusted_build_prefix, unhealthy_report,
+        with_role_deadline,
+    };
     use clap::Parser;
     use kestrel::config::RoleConfig;
     use kestrel::journal::CoverageGap;
@@ -804,6 +827,16 @@ mod tests {
                 timeout: ApproveMode::DEFAULT_BUS_TIMEOUT
             }
         );
+    }
+
+    #[test]
+    fn trusted_build_prefixes_are_trimmed_and_must_be_one_line() {
+        assert_eq!(
+            parse_trusted_build_prefix("  zig build  ").unwrap(),
+            "zig build"
+        );
+        assert!(parse_trusted_build_prefix("   ").is_err());
+        assert!(parse_trusted_build_prefix("zig build\nrm -rf /").is_err());
     }
 
     /// `--approve bus` overrides the mode, never the role's declared deadline.

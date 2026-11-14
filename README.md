@@ -2,7 +2,7 @@
 
 为星型多 Agent harness 写的 Rust harness kernel：引擎 + wire 层 + 工具/权限/沙箱 + 会话 + 总线/journal + CLI/配置。设计文档（中文）见本仓库 `docs/design.md`。
 
-**Metrics** — src 51 files / 20158 lines · tests 9 files / 3837 lines · 278 tests (lib 218 + bin 5 + integration 55)
+**Metrics** — src 51 files / 20257 lines · tests 9 files / 3837 lines · 279 tests (lib 218 + bin 6 + integration 55)
 
 Status: M0-M4 complete + 二期主体落地。三期于 2026-11-10 开工：worker 池的并发执行护栏同时提供每 task 的 `--max-parallel-tools`（缺省 4）和 worker 全局的 `--max-worker-tools`（缺省 8），任一为 `0` 时显式关闭对应上限；两级限制都不改变源序回写、串行工具写锁和取消语义（design §9.46 / §9.48）。journal 的已封闭段可移入 `<journal>.segments/`，`replay_all()` 同时读取两处，移动而非删除历史（§9.47）；`journal-archive --keep/--dry-run` 与 `journal-status --json/--check/--list/--approvals` 把归档的预览、执行、库存与审批链都变成可查项。`serve --status-file` 原子发布活动 task、空闲 task、未决审批、当前/峰值 RSS 与各级上限（§9.52），`serve --max-rss-mb` 给整个 worker 一条内存**软**上限：当前 RSS 越线后进入 drain，新 task 被显式拒绝、在跑的回合跑完；已经完成且持续空闲的 task 引擎会被回收，当前 RSS 降到阈值的 80% 以下后自动恢复接单（§9.53 / §9.59 / §9.60）。`serve --task-idle-timeout-secs` 让空闲 task 退休引擎、释放 `--max-tasks` 的 slot，同一 task 再响时重开同一棵会话树（§9.55）。名义成本分类已细到 `peer × reason`（§9.49），判定 issue 已改为自带 `Artifact | Turn` 归因的类型（§9.50）。2026-11-13 的三期 RD/QA 真实端点联跑已 `pipeline complete`，四个 stage 的测试证据均为 `26 passed / 0 failed`，账本 `0.1593 cny, of which 0.0000 nominal`；同一轮把 `build` 从任意文件证据收紧为真实 `build_log`（§9.58）。剩下的未完成边界：活动回合的被动内存回收与强制 kill 式硬上限、归档段压缩、跨回合审批槽位、Linux 沙箱、SA/Responses 真端点验证。上面那行数字由 `tests/discipline.rs` 与源码树对照校验。
 
@@ -109,6 +109,11 @@ SA 的判定只读盘，且分三层：通路（有答案、未 abort、worker �
 `build_log` 必须由内核 `output_path` 生成，包含实际构建命令和 0 退出状态，
 `diff` 要有 `diff --git` 或 `--- / +++ / @@`，`screenshot` 的文件头要真是 PNG/JPEG/GIF/WebP
 且不小于 1 KiB。认不出的类型名不猜——它连 `file` 档都不算。
+
+`build_log` 内置识别 cargo / Python / npm / pnpm / yarn / Go / Maven / Gradle /
+Make / CMake。其他构建系统用可重复的 `--trusted-build-prefix "zig build"` 显式追加；
+匹配仍要求完整词边界，`zig buildsystem` 不会被当成 `zig build`。demo 入口对应
+`KESTREL_DEMO_TRUSTED_BUILD_PREFIXES`，每行一个前缀。未知系统不会靠猜放行。
 
 `--evidence-spec` 指向的表把「这一关要哪类证据」变成数据：`{"test": ["test_log"], "dev": ["file"]}`。
 要求看的是**核对通过**的类型，所以一份普通文件顶不出 `test_log` 那一格。表读不出来或要求了

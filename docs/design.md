@@ -27,7 +27,7 @@
 > 归档链的断口与重复段的隔离出口（§9.56）、记录层的深度校验 `--verify`（§9.57）；
 > 代码部分都过了 fmt / clippy / test；
 > **真端点联跑未重跑**，demo 的接法只到语法与 flag 解析这一层。
-> **Metrics** — src 51 files / 20158 lines · tests 9 files / 3837 lines · 278 tests (lib 218 + bin 5 + integration 55)
+> **Metrics** — src 51 files / 20257 lines · tests 9 files / 3837 lines · 279 tests (lib 218 + bin 6 + integration 55)
 > **Integration** — core_loop 6 / discipline 2 / m1_tools 12 / m2_session 6 / m4_bus 15 / m5_pool 8 / sandbox_e2e 4 / wire_anthropic 2
 > 规模已过 plan 预算（10-13k）的上沿：多出来的部分几乎都花在「取消安全」与「对账」这两条纪律上。
 > 上面两行数字由 `tests/discipline.rs::metrics_lines_match_the_tree` 对照源码树重算校验——
@@ -560,8 +560,8 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
        Python 缓存；`qa.toml` 的 write root 指向该目录，artifacts 下的判定 JSON 仍不可写。
     ⑤ `harness/roles/sa.evidence.json` 的 `build` 改为 `["build_log"]`，QA 提示词要求构建命令
        显式传 `output_path`，被拒时直接 `FAIL: build evidence unavailable`，不得拿测试替代。
-    ⑥ 边界：这是命令级证据，不是跨语言包产物的完整语义证明；未知构建系统需要先把命令前缀
-       加入白名单，否则会被 fail-closed。
+    ⑥ 边界：这是命令级证据，不是跨语言包产物的完整语义证明；未知构建系统需要显式声明命令
+       前缀，否则会被 fail-closed。运行时可追加前缀，见 §9.61。
     ⑦ 真实联跑又暴露了 stage 串扰：QA 在同一 task 的 history 中保留上一关结论，build
        会复用 review/test 的回答并声称“没有 check 字段”。为此 QA 门铃首行改为
        `[QA STAGE: …]`，并在 worker 侧使用 `TurnIsolated`：会话文件仍 append-only，
@@ -618,6 +618,21 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
        可以重新创建。
     ⑥ 边界：这是 5 秒粒度的软护栏，不是活动分配拦截，也不是强制 kill 式硬上限；macOS 的
        当前值依赖系统 `ps` 命令，采样失败会保持 drain 而不是猜一个数。
+
+61. **可扩展的受信构建前缀（2026-11-14）**：
+    ① §9.58 的内置构建命令是封闭列表，未知系统只能改内核源码。现在 `demo-sa` 接受可重复的
+       `--trusted-build-prefix <prefix>`，在默认列表之外追加项目自己的构建入口，例如
+       `--trusted-build-prefix "zig build"`。
+    ② 前缀匹配仍要求完整词边界：`zig buildsystem` 不会被 `zig build` 接受。空前缀和含控制
+       字符的值在 CLI 解析阶段直接失败，不退化成“匹配所有命令”。
+    ③ 同一组前缀同时传给确定性 build preflight 和最终工件判定；否则预检可能生成一份 SA
+       自己随后拒绝的 `build_log`，两侧各有一份验收标准。
+    ④ `harness/run-demo.sh` 暴露 `KESTREL_DEMO_TRUSTED_BUILD_PREFIXES`，按行拆成多个
+       `--trusted-build-prefix`。没有额外系统时数组为空，不传 flag，默认行为不变。
+    ⑤ 测试 `build_log_must_come_from_a_successful_build_command` 覆盖自定义前缀与词边界，
+       `trusted_build_prefixes_are_trimmed_and_must_be_one_line` 覆盖 CLI 输入清洗。
+    ⑥ 边界：这是“运营者显式信任一个命令前缀”，不是自动识别构建系统，也不是命令语义证明；
+       前缀仍可能对应一个只 `exit 0` 的脚本，真实性边界与 §9.58 相同。
 
 ## 10 二期清单
 

@@ -161,6 +161,15 @@ pub struct EvidenceReport {
 
 /// 按类型核对证据。`issues` 为空意味着每一条都按它**声称的类型**在盘上成立。
 pub fn check_evidence(items: &[Evidence]) -> EvidenceReport {
+    check_evidence_with_build_prefixes(items, &[])
+}
+
+/// Check evidence with operator-declared build command prefixes. The built-in
+/// list remains the safe default; callers only add project-specific commands.
+pub fn check_evidence_with_build_prefixes(
+    items: &[Evidence],
+    extra_build_prefixes: &[String],
+) -> EvidenceReport {
     let mut report = EvidenceReport::default();
     for item in items.iter().take(MAX_EVIDENCE_PATHS) {
         // 现场抓到的形状（2026-11-04 那轮强制轮转的联跑）：`/tmp/wt/unittest.log（其内含汇总行）`。
@@ -241,7 +250,7 @@ pub fn check_evidence(items: &[Evidence]) -> EvidenceReport {
                 }
                 Err(e) => Some(format!("evidence {} unreadable: {e}", item.path)),
             },
-            EvidenceKind::BuildLog => check_build_log(path),
+            EvidenceKind::BuildLog => check_build_log(path, extra_build_prefixes),
             EvidenceKind::Diff => match read_head(path, SPAN_BYTES) {
                 Ok(bytes) => {
                     let text = String::from_utf8_lossy(&bytes);
@@ -462,7 +471,7 @@ fn parse_exit_line(head: &str) -> (Option<i64>, Option<i64>) {
 /// records both the exact command and the kernel-observed exit status. Exit 0
 /// alone is not enough, and neither is a recognizable build word without the
 /// status line.
-fn check_build_log(path: &Path) -> Option<String> {
+fn check_build_log(path: &Path, extra_build_prefixes: &[String]) -> Option<String> {
     let head = match read_head(path, SPAN_BYTES) {
         Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
         Err(error) => return Some(format!("evidence {} unreadable: {error}", path.display())),
@@ -500,7 +509,7 @@ fn check_build_log(path: &Path) -> Option<String> {
             ));
         }
     }
-    if !looks_like_build_command(command) {
+    if !looks_like_build_command(command, extra_build_prefixes) {
         return Some(format!(
             "evidence {} does not contain a recognized build command: {command}",
             path.display()
@@ -509,7 +518,7 @@ fn check_build_log(path: &Path) -> Option<String> {
     None
 }
 
-fn looks_like_build_command(command: &str) -> bool {
+fn looks_like_build_command(command: &str, extra_prefixes: &[String]) -> bool {
     const PREFIXES: &[&str] = &[
         "cargo build",
         "cargo check",
@@ -530,11 +539,19 @@ fn looks_like_build_command(command: &str) -> bool {
         "cmake --build",
     ];
     let command = command.trim();
-    PREFIXES.iter().any(|prefix| {
-        command.strip_prefix(prefix).is_some_and(|rest| {
+    PREFIXES
+        .iter()
+        .copied()
+        .chain(extra_prefixes.iter().map(String::as_str))
+        .any(|prefix| command_matches_prefix(command, prefix))
+}
+
+fn command_matches_prefix(command: &str, prefix: &str) -> bool {
+    let prefix = prefix.trim();
+    !prefix.is_empty()
+        && command.strip_prefix(prefix).is_some_and(|rest| {
             rest.is_empty() || rest.chars().next().is_some_and(|c| c.is_whitespace())
         })
-    })
 }
 
 /// `<数字> <词>`：取**最后**一次出现——汇总行总在文件末尾，前面的同名数字是过程输出。
@@ -928,6 +945,31 @@ mod tests {
             rep.issues[0].contains("recognized build command"),
             "{:?}",
             rep.issues
+        );
+
+        let custom = scratch(
+            "build",
+            "custom.log",
+            b"command: zig build -Doptimize=ReleaseSafe\nexit: ExitStatus { code: Some(0), signal: None }\n--- stdout ---\n",
+        );
+        let mut claim = custom.clone();
+        claim.kind = EvidenceKind::BuildLog;
+        assert_eq!(check_evidence(&[claim.clone()]).issues.len(), 1);
+        let rep = check_evidence_with_build_prefixes(&[claim], &["zig build".to_string()]);
+        assert!(rep.issues.is_empty(), "{:?}", rep.issues);
+
+        let too_wide = scratch(
+            "build",
+            "custom-adjacent.log",
+            b"command: zig buildsystem\nexit: ExitStatus { code: Some(0), signal: None }\n--- stdout ---\n",
+        );
+        let mut claim = too_wide.clone();
+        claim.kind = EvidenceKind::BuildLog;
+        let rep = check_evidence_with_build_prefixes(&[claim], &["zig build".to_string()]);
+        assert_eq!(
+            rep.issues.len(),
+            1,
+            "a custom prefix still needs a word boundary"
         );
     }
 

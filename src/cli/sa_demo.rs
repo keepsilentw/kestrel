@@ -11,7 +11,7 @@ use anyhow::Context;
 use crate::bus::frame::Envelope;
 use crate::bus::rpc::BusClient;
 use crate::cli::evidence::{
-    Evidence, EvidenceKind, check_evidence, describe_run, evidence_from_answer,
+    Evidence, EvidenceKind, check_evidence_with_build_prefixes, describe_run, evidence_from_answer,
     missing_requirements,
 };
 use crate::cli::serve::{approval_command, approval_receipt_from_frame, decision_name};
@@ -52,6 +52,8 @@ pub struct DemoSaArgs {
     /// Operator-configured build command run by the SA before the build stage.
     /// Its kernel-written log is trusted evidence.
     pub build_command: Option<String>,
+    /// Additional accepted build command prefixes beyond the built-in list.
+    pub trusted_build_prefixes: Vec<String>,
     /// Approval authority for workers running `approve = "bus"`: a three-state
     /// prefix table (same format as a role policy). Absent means the SA denies
     /// every reverse request — fail closed, no default yes.
@@ -495,6 +497,7 @@ async fn run_build_preflight(
     command: &str,
     worktree: Option<&Path>,
     artifacts: &Path,
+    trusted_build_prefixes: &[String],
 ) -> anyhow::Result<BuildPreflight> {
     let evidence_dir = artifacts.join("evidence");
     tokio::fs::create_dir_all(&evidence_dir)
@@ -529,7 +532,8 @@ async fn run_build_preflight(
         path: path.display().to_string(),
         kind: EvidenceKind::BuildLog,
     };
-    let report = check_evidence(std::slice::from_ref(&evidence));
+    let report =
+        check_evidence_with_build_prefixes(std::slice::from_ref(&evidence), trusted_build_prefixes);
     Ok(BuildPreflight {
         evidence,
         issues: report.issues,
@@ -654,8 +658,13 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
                 .as_deref()
                 .filter(|command| !command.trim().is_empty())
         {
-            let preflight =
-                run_build_preflight(command, args.worktree.as_deref(), &args.artifacts).await?;
+            let preflight = run_build_preflight(
+                command,
+                args.worktree.as_deref(),
+                &args.artifacts,
+                &args.trusted_build_prefixes,
+            )
+            .await?;
             if preflight.issues.is_empty() {
                 println!("[sa] build preflight: {}", preflight.evidence.path);
                 trusted_evidence.push(preflight.evidence);
@@ -945,11 +954,12 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
             // 判定只读盘，不读铃（thin messages：铃正文只是指针）。工件存在
             // 不等于 stage 收敛——空结果、abort、worker 侧 stop=error 都是 fail，
             // 而「有文件」也不等于「有这一关要求的证据」。
-            let verdict = verdict_from_artifact_with_evidence(
+            let verdict = verdict_from_artifact_with_policy(
                 &artifact,
                 stage,
                 requirements.required_for(stage),
                 &trusted_evidence,
+                &args.trusted_build_prefixes,
             );
             // 把「这一次测试到底过了几条、failed 几条、退了几」打到 stdout：判定行只
             // 说 pass/fail，读日志的人要能看见结论是从哪份文件读出来的（§9.34）。
@@ -1477,6 +1487,19 @@ pub fn verdict_from_artifact_with_evidence(
     required: &[EvidenceKind],
     trusted_evidence: &[Evidence],
 ) -> Verdict {
+    verdict_from_artifact_with_policy(path, stage, required, trusted_evidence, &[])
+}
+
+/// Stage-aware verdict with both trusted evidence and operator-declared build
+/// command prefixes. The worker and preflight verdicts must use the same
+/// acceptance policy or one side can produce evidence the other refuses.
+pub fn verdict_from_artifact_with_policy(
+    path: &Path,
+    stage: Stage,
+    required: &[EvidenceKind],
+    trusted_evidence: &[Evidence],
+    trusted_build_prefixes: &[String],
+) -> Verdict {
     let evidence_issue = |message: String| {
         if stage == Stage::Dev {
             JudgmentIssue::artifact(message)
@@ -1562,7 +1585,7 @@ pub fn verdict_from_artifact_with_evidence(
         if evidence.is_empty() {
             issues.push(evidence_issue("no evidence paths to verify".into()));
         } else {
-            let report = check_evidence(&evidence);
+            let report = check_evidence_with_build_prefixes(&evidence, trusted_build_prefixes);
             issues.extend(report.issues.into_iter().map(evidence_issue));
             // 认账说明跟着判定落进真相源：重启后复现这次判定，要连「当初认了什么」一起复现。
             // `extend` 而不是赋值——上面已经并进了写侧的形状警告，覆盖就等于把它们丢掉
@@ -1795,7 +1818,7 @@ mod tests {
         let source = worktree.join("lru.py");
         std::fs::write(&source, "class LRU:\n    pass\n").unwrap();
         let command = format!("python3 -m py_compile {}", source.display());
-        let preflight = run_build_preflight(&command, Some(&worktree), &artifacts)
+        let preflight = run_build_preflight(&command, Some(&worktree), &artifacts, &[])
             .await
             .expect("deterministic build");
         assert!(preflight.issues.is_empty(), "{:?}", preflight.issues);
@@ -1824,6 +1847,7 @@ mod tests {
             ),
             Some(&worktree),
             &artifacts,
+            &[],
         )
         .await
         .expect("the command ran and produced a failing log");
@@ -1878,6 +1902,7 @@ mod tests {
             bell_timeout: Duration::from_secs(300),
             worktree: None,
             build_command: None,
+            trusted_build_prefixes: Vec::new(),
             approvals: None,
             rotate_after: 0,
             rotate_max_bytes: 0,
