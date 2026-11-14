@@ -27,7 +27,7 @@
 > 归档链的断口与重复段的隔离出口（§9.56）、记录层的深度校验 `--verify`（§9.57）；
 > 代码部分都过了 fmt / clippy / test；
 > **真端点联跑未重跑**，demo 的接法只到语法与 flag 解析这一层。
-> **Metrics** — src 51 files / 19867 lines · tests 9 files / 3837 lines · 274 tests (lib 214 + bin 5 + integration 55)
+> **Metrics** — src 51 files / 20158 lines · tests 9 files / 3837 lines · 278 tests (lib 218 + bin 5 + integration 55)
 > **Integration** — core_loop 6 / discipline 2 / m1_tools 12 / m2_session 6 / m4_bus 15 / m5_pool 8 / sandbox_e2e 4 / wire_anthropic 2
 > 规模已过 plan 预算（10-13k）的上沿：多出来的部分几乎都花在「取消安全」与「对账」这两条纪律上。
 > 上面两行数字由 `tests/discipline.rs::metrics_lines_match_the_tree` 对照源码树重算校验——
@@ -580,6 +580,45 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
        `Artifact` 归因落 `result_committed`，扣一次返工额度并把日志路径连同返工说明回派
        Dev；额度耗尽才显式失败。预检成功时其 `BuildLog` 作为可信证据参与归档判定。
 
+59. **内存压力下回收空闲引擎（2026-11-14）**：
+    ① §9.53 的软上限此前只有准入闸门：越线后拒绝新 task，却不会释放任何已经完成的
+       task 引擎。现在一旦 worker 进入 drain，pump 每 5 秒检查一次；完成最新门铃且持续
+       空闲 5 秒的 task 会被回收，slot 与引擎内存归还，会话树仍保留，下一次同 task 门铃
+       继续走 §9.55 的重开路径。
+    ② 每个门铃带单调递增的 task 内 `generation`。worker 只在完成该代门铃后回报
+       `TurnFinished { task, generation }`；若 pump 已投递更新的门铃，旧完成事件不能把
+       task 标成空闲。这挡住“上一回合的完成消息晚到，下一颗铃还在 queue 里就被回收”的
+       竞态。
+    ③ 新门铃会立刻撤销空闲状态；回收尝试与真实位移之间另有 5 秒 grace。正在执行、
+       已排队新门铃、或 completion 尚未回报的 task 都不是候选。活动回合不会被中途杀死。
+    ④ 状态文件新增 `idle_tasks` 与 `pressure_retirements`；`retirements` 继续统计两种
+       退休来源的总数。软上限仍按历史 peak RSS 触发，回收不会把 peak 变小，也不会自动
+       撤销 drain；这是诚实边界，不是“内存已经回到上限以内”的假结论。
+    ⑤ 测试 `pressure_retirement_tracks_the_newest_completed_bell` 钉住旧 completion
+       不得覆盖新门铃，`pressure_retirement_releases_the_idle_engine_and_counts_it`
+       钉住回收计数与 slot 复用；状态文件测试同时断言空闲 task 可见。
+    ⑥ 边界：这解决的是完成回合后的引擎回收，不是活动回合的被动分配回收，也不是强制
+       kill 式硬上限。真·多进程编排仍留给 harness 上层。
+
+60. **当前 RSS 与压力恢复（2026-11-14）**：
+    ① §9.53 / §9.59 的 drain 曾以历史 peak RSS 为唯一判据，空闲引擎回收后 peak 仍不会
+       下降，于是 worker 即使已经释放内存也只能永久拒绝新 task。这里把职责拆开：历史
+       peak 继续用于审计，是否仍在超限由**当前 resident RSS** 决定。
+    ② 当前值每 5 秒采样，进入压力与退出压力之间留滞回：`current >= max_rss` 进入
+       drain，`current <= max_rss × 80%` 才恢复接单。80% 与 100% 之间的区间保持原状态，
+       避免在阈值附近来回抖动。
+    ③ Linux 从 `/proc/self/status` 的 `VmRSS` 读 KiB；其余平台调用 `ps -o rss= -p <pid>`
+       读同一列再换算为字节。采样失败只 warn，**不会清除 drain**——看不见内存时恢复接单
+       是 fail-open。
+    ④ 状态文件同时发布 `peak_rss_bytes` 与 `resident_rss_bytes`；peak 是“曾经越没越线”的
+       审计事实，resident 是“现在要不要拒绝”的决策输入，两者不互相覆盖。
+    ⑤ 测试 `resident_rss_reports_a_plausible_current_value` 做实际采样，
+       `rss_parsers_convert_both_platform_units_to_bytes` 钉住两种平台的 KiB→bytes，
+       `drain_mode_refuses_new_tasks_and_keeps_running_ones` 同时钉住显式恢复后新 task
+       可以重新创建。
+    ⑥ 边界：这是 5 秒粒度的软护栏，不是活动分配拦截，也不是强制 kill 式硬上限；macOS 的
+       当前值依赖系统 `ps` 命令，采样失败会保持 drain 而不是猜一个数。
+
 ## 10 二期清单
 
 > 2026-11-13 更新：三期 RD/QA 在严格 `build_log` 下完成了真实端点联跑；构建日志由 SA
@@ -588,7 +627,7 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
 
 已落地（2026-10-28 起）：~~`ApproveMode::Bus`~~（授权表 + 超时 fail-closed + journal 审计，§9.20）、~~SA 判定升级到「工件 + 证据文件」~~（绝对路径存在性/非空核对，§9.20）、~~bus 重连重放~~（离线 session 停车补投 + 客户端自动重连；RPC 与「写入即死」的帧不重放，§9.21）、~~journal 快照/截断语义~~（检查点 + 归档段 + 崩溃安全轮转，§9.22）、~~多任务并行~~（task 命名空间三处同源 + 前缀寻址，§9.23）、~~openai-responses wire~~（第三条 v1 wire，金身 + fixture 验证，**真端点未实测**，§9.24）、~~journal 投影增量化与轮转触发~~（在线投影 = 全量重放 + 条数/字节双上限，§9.25）、~~一个引擎内真正并发地服务多个 task~~（改为「一 task 一引擎」的 worker 池，单活跃槽不动，§9.26）、~~`BudgetSpent` 的价格表~~（预留 → 结算两段式、按 token 换账单、无价退回名义值并报出来，§9.27；2026-11-03）、~~journal 轮转的**默认策略**~~（活文件 512 条 / 1 MiB 双上限、三态 CLI、生产与测试同一条 `rotate_at_boundary`，§9.28；2026-11-03）、~~证据的类型化~~（`file` / `test_log` / `diff` / `screenshot` 各自可在盘上反驳 + `--evidence-spec` 的 stage 要求，坏表硬失败，§9.29；2026-11-03）、~~审批批复的可靠投递~~（请求 at-least-once + 按 req 幂等 + 台账从 journal 播种，判定仍只一次，§9.30；2026-11-03）、~~批复到底有没有生效~~（回执 `approval_receipt` + `ApprovalAcked` 落账 + 到点撤摊，**没生效的批准不许记成生效**，§9.31；2026-11-03）。
 
-仍在清单上（审批已闭环到「有没有生效」这一层：请求 at-least-once、批复有回执、未回执的批复重启后补投一次。剩下的是**跨回合挂起的审批槽位**——「SA 下班、明早再批」需要未决请求的第二份真相与新的取消语义，见 §9.31⑤）：tree-sitter-bash 命令解析、execpolicy DSL（Starlark）、landlock/bwrap（Linux 沙箱）、TUI（行级 diff 形制，pi-tui 蓝本）、MCP 客户端、model-in-the-loop evals（含 openai-responses 的真端点实测，§9.24）、worker 池资源护栏的剩余部分（工具并发数由 `--max-parallel-tools` / `--max-worker-tools` 封顶，见 §9.46 / §9.48；内存是 `--max-rss-mb` 的**软**准入闸门，见 §9.53；空闲 task 的引擎由 `--task-idle-timeout-secs` 回收、会话树重开续接，见 §9.55——**正在跑的引擎的内存**与真·多进程编排仍留给 harness 上层）、归档段的**压缩与保留策略**（离线移动 / 预览 / 库存 / 健康检查已由 `journal-archive` + `journal-status` 落地，见 §9.47；磁盘占用仍只增不减，自动删除会撞上「这不是删除」的语义边界）。
+仍在清单上（审批已闭环到「有没有生效」这一层：请求 at-least-once、批复有回执、未回执的批复重启后补投一次。剩下的是**跨回合挂起的审批槽位**——「SA 下班、明早再批」需要未决请求的第二份真相与新的取消语义，见 §9.31⑤）：tree-sitter-bash 命令解析、execpolicy DSL（Starlark）、landlock/bwrap（Linux 沙箱）、TUI（行级 diff 形制，pi-tui 蓝本）、MCP 客户端、model-in-the-loop evals（含 openai-responses 的真端点实测，§9.24）、worker 池资源护栏的剩余部分（工具并发数由 `--max-parallel-tools` / `--max-worker-tools` 封顶，见 §9.46 / §9.48；内存是 `--max-rss-mb` 的**软**准入门槛，超限后已会回收持续空闲的引擎，见 §9.53 / §9.59；**活动回合的内存回收**、强制 kill 式硬上限与真·多进程编排仍留给 harness 上层）、归档段的**压缩与保留策略**（离线移动 / 预览 / 库存 / 健康检查已由 `journal-archive` + `journal-status` 落地，见 §9.47；磁盘占用仍只增不减，自动删除会撞上「这不是删除」的语义边界）。
 
 2026-11-04 联跑新添的两格同日落地（§9.33）：验证类 stage 的 FAIL 回跳给写者返工（带额度 `max_reworks`、带原因 `ref.rework`、每关 iter 跨回跳不清零），bash 用 `output_path` 参数交出可核对的 `test_log`（内核把 stdout/stderr 连 `exit: ExitStatus{...}` 一起写进那个文件）。下一格因此有了明确的落点：SA 只要去读那行 `exit:`，「形状」就能升级成「结论」——现在它还只证明「这份文件是测试汇总」。
 

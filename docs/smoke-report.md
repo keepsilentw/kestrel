@@ -7,7 +7,7 @@
 
 ## 1. 自动化测试基线（cargo test）
 
-**Metrics** — src 51 files / 19867 lines · tests 9 files / 3837 lines · 274 tests (lib 214 + bin 5 + integration 55)
+**Metrics** — src 51 files / 20158 lines · tests 9 files / 3837 lines · 278 tests (lib 218 + bin 5 + integration 55)
 **Integration** — core_loop 6 / discipline 2 / m1_tools 12 / m2_session 6 / m4_bus 15 / m5_pool 8 / sandbox_e2e 4 / wire_anthropic 2
 
 | 组 | 覆盖 |
@@ -1202,3 +1202,30 @@ QA 用测试日志和“导入即编译”解释后仍得到 PASS；这是假通
 后续收口：确定性构建的非零退出不再直接 bail，而是以 `Artifact` issue 落
 `result_committed`，扣一次返工额度并把 build.log 路径写入 `ref.rework` 回派 Dev；
 返工额度耗尽才显式失败。单测同时覆盖成功 build_log 填满要求与非零构建日志产生 issue。
+
+## 48. 2026-11-14 内存压力下回收空闲引擎
+
+`--max-rss-mb` 进入 drain 后，pump 每 5 秒检查一次持续空闲的 task。最新门铃已经完成、
+且空闲超过 5 秒的引擎会被释放；会话树保留，同一 task 再响时重开原树。正在执行的回合、
+已有更新门铃排队的 task 都不是回收候选。
+
+每个门铃带 task 内递增的 `generation`。`TurnFinished` 只在它完成的仍是最新门铃时把 task
+标为空闲，旧 completion 不能覆盖新门铃。状态文件新增 `idle_tasks` 与
+`pressure_retirements`。
+
+新增测试 `pressure_retirement_tracks_the_newest_completed_bell` 与
+`pressure_retirement_releases_the_idle_engine_and_counts_it`。本轮未执行 build、clippy
+或测试；当前验证仅到静态审阅与格式化。
+
+## 49. 2026-11-14 当前 RSS 与自动恢复
+
+`--max-rss-mb` 现在按当前 resident RSS 判断是否进入 drain，历史 peak RSS 只用于审计。
+当前值达到上限后拒绝新 task 并回收空闲引擎；降到上限的 80% 以下后自动恢复接单。中间的
+20% 区间保持原状态，避免阈值附近抖动。
+
+Linux 读取 `/proc/self/status` 的 `VmRSS`，其他平台读取 `ps -o rss= -p <pid>`。采样失败
+不会清除 drain。状态文件同时输出 `peak_rss_bytes` 与 `resident_rss_bytes`。
+
+新增测试 `resident_rss_reports_a_plausible_current_value` 和
+`rss_parsers_convert_both_platform_units_to_bytes`，并扩展 drain 测试断言恢复后可重新
+创建 task。本轮未执行 build、clippy 或测试；当前验证仅到静态审阅与格式化。

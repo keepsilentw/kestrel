@@ -11,8 +11,9 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use serde_json::Value;
@@ -38,6 +39,9 @@ pub enum TaskMsg {
     Bell {
         sender: String,
         payload: Value,
+        /// Monotonic per-task delivery number. It prevents a stale completion
+        /// from marking a newer queued bell as idle.
+        generation: u64,
     },
     /// An approval reply the router says belongs to this task.
     Approval {
@@ -70,6 +74,12 @@ pub enum Outbound {
     RetireRequested {
         task: String,
     },
+    /// A task finished the turn identified by `generation`. The router only
+    /// marks it idle when no newer bell has already been delivered.
+    TurnFinished {
+        task: String,
+        generation: u64,
+    },
 }
 
 /// Routing decision. Kept as data so the policy is testable without a bus or
@@ -92,11 +102,14 @@ pub enum Action {
 pub struct Router {
     tasks: HashSet<String>,
     req_owner: HashMap<String, String>,
+    delivered: HashMap<String, u64>,
+    idle_since: HashMap<String, Instant>,
     max_tasks: usize,
     /// How many engines this worker has released. "task_count pinned at the cap"
     /// and "tasks churning through the cap" look identical from the outside
     /// unless something counts the releases.
     retired_total: usize,
+    pressure_retired_total: usize,
     /// A resource ceiling was crossed: new tasks are refused out loud, while
     /// tasks that already own an engine keep running. Refusing is the honest
     /// half of a soft ceiling — killing the process would take the in-flight
@@ -112,8 +125,11 @@ impl Router {
         Self {
             tasks: HashSet::new(),
             req_owner: HashMap::new(),
+            delivered: HashMap::new(),
+            idle_since: HashMap::new(),
             max_tasks,
             retired_total: 0,
+            pressure_retired_total: 0,
             draining: None,
         }
     }
@@ -129,8 +145,16 @@ impl Router {
         self.draining.as_deref()
     }
 
+    /// Pressure has fallen below the recovery watermark. The historical peak
+    /// remains available in status, so recovery does not erase that the worker
+    /// once crossed the ceiling.
+    pub fn clear_draining(&mut self) -> bool {
+        self.draining.take().is_some()
+    }
+
     pub fn on_bell(&mut self, task: &str) -> Action {
         if self.tasks.contains(task) {
+            self.idle_since.remove(task);
             return Action::Deliver(task.to_string());
         }
         if let Some(reason) = self.draining.clone() {
@@ -150,7 +174,43 @@ impl Router {
             };
         }
         self.tasks.insert(task.to_string());
+        self.idle_since.remove(task);
         Action::Spawn(task.to_string())
+    }
+
+    /// Stamp an accepted bell before it enters the task's queue. A completion
+    /// carrying an older stamp cannot mark a newer bell as idle.
+    pub fn begin_bell(&mut self, task: &str) -> u64 {
+        let generation = self.delivered.entry(task.to_string()).or_default();
+        *generation += 1;
+        self.idle_since.remove(task);
+        *generation
+    }
+
+    /// Record completion only when this is still the newest delivered bell.
+    /// Returns whether the task actually became idle.
+    pub fn on_turn_finished(&mut self, task: &str, generation: u64) -> bool {
+        if self.delivered.get(task) != Some(&generation) {
+            return false;
+        }
+        self.idle_since.insert(task.to_string(), Instant::now());
+        true
+    }
+
+    /// Idle engines safe to release under memory pressure. The grace period
+    /// covers the race between a completion leaving the worker and a new bell
+    /// reaching the pump.
+    pub fn pressure_retirement_candidates(&self, idle_for: Duration) -> Vec<String> {
+        let now = Instant::now();
+        let mut tasks: Vec<String> = self
+            .idle_since
+            .iter()
+            .filter(|(_, since)| now.saturating_duration_since(**since) >= idle_for)
+            .map(|(task, _)| task.clone())
+            .filter(|task| self.tasks.contains(task))
+            .collect();
+        tasks.sort();
+        tasks
     }
 
     pub fn on_approval_opened(&mut self, req: &str, task: &str) {
@@ -194,12 +254,33 @@ impl Router {
             return false;
         }
         self.req_owner.retain(|_, owner| owner != task);
+        self.delivered.remove(task);
+        self.idle_since.remove(task);
         self.retired_total += 1;
         true
     }
 
+    pub fn retire_under_pressure(&mut self, task: &str) -> bool {
+        if self.retire_task(task) {
+            self.pressure_retired_total += 1;
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn retired_total(&self) -> usize {
         self.retired_total
+    }
+
+    pub fn pressure_retired_total(&self) -> usize {
+        self.pressure_retired_total
+    }
+
+    fn idle_tasks(&self) -> Vec<String> {
+        let mut tasks: Vec<String> = self.idle_since.keys().cloned().collect();
+        tasks.sort();
+        tasks
     }
 
     fn active_tasks(&self) -> Vec<String> {
@@ -236,8 +317,9 @@ pub struct PoolConfig {
     /// Optional machine-readable worker status, atomically replaced on each tick.
     pub status_file: Option<PathBuf>,
     pub status_interval: Duration,
-    /// Soft memory ceiling in bytes: once the process' PEAK resident size
-    /// reaches it the worker drains (refuses new tasks). 0 = no ceiling.
+    /// Soft memory ceiling in bytes: while current resident size is at or above
+    /// it the worker drains (refuses new tasks) and reclaims engines that
+    /// completed their newest bell and stayed idle. 0 = no ceiling.
     pub max_rss_bytes: u64,
     /// Idle time after which a task's engine proposes retirement. 0 = never,
     /// which leaves the slot taken for the life of the process.
@@ -251,6 +333,16 @@ struct OpenApproval {
     to: String,
     sends: u32,
 }
+
+/// Memory pressure is sampled on its own clock even when a status file is not
+/// configured. The grace period gives a new bell time to turn a completed task
+/// busy again before its engine is released.
+const PRESSURE_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+const PRESSURE_IDLE_GRACE: Duration = Duration::from_secs(5);
+/// Resume below 80% of the ceiling. The gap between enter and resume is
+/// deliberate hysteresis: a worker hovering at the ceiling must not flap
+/// between accepting and rejecting tasks every sample.
+const PRESSURE_RECOVERY_DIVISOR: u64 = 5;
 
 // 投递上限不在这层定义：它属于审批窗口本身（`ApproveMode::MAX_APPROVAL_SENDS`），
 // 与重发节奏同一个来源，免得两处各写一个数然后对不上。
@@ -275,6 +367,8 @@ pub async fn run_pool(
     };
     let mut status_tick = tokio::time::interval(status_interval);
     status_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut pressure_tick = tokio::time::interval(PRESSURE_CHECK_INTERVAL);
+    pressure_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // A dedicated reader task, not a `select!` arm: when select! loses a race it
     // drops the losing future, and a frame that was already on its way would be
@@ -355,24 +449,7 @@ pub async fn run_pool(
                 // costs a new engine, and `getrusage` is one syscall. Checking
                 // here (instead of only at the status tick) means the first
                 // overshoot refuses the bell that crossed it, not the next one.
-                if cfg.max_rss_bytes > 0 && router.draining().is_none() {
-                    match peak_rss_bytes() {
-                        Ok(peak) if peak >= cfg.max_rss_bytes => {
-                            let reason = format!(
-                                "worker is draining: peak RSS {peak} bytes reached the \
-                                 ceiling {} — new tasks are refused out loud, running ones \
-                                 finish",
-                                cfg.max_rss_bytes
-                            );
-                            tracing::warn!("pump: {reason}");
-                            router.set_draining(reason);
-                        }
-                        Ok(_) => {}
-                        Err(error) => {
-                            tracing::warn!("pump: peak RSS is unavailable: {error}")
-                        }
-                    }
-                }
+                update_pressure_state(&cfg, &mut router);
                 match router.on_bell(&task) {
                     Action::Reject { task, reason } => {
                         tracing::warn!("pump: {reason}");
@@ -404,9 +481,11 @@ pub async fn run_pool(
                             joins.push(worker);
                         }
                         if let Some(tx) = workers.get(&task) {
+                            let generation = router.begin_bell(&task);
                             let _ = tx.send(TaskMsg::Bell {
                                 sender: frame.sender.clone(),
                                 payload: frame.payload.clone(),
+                                generation,
                             });
                         }
                     }
@@ -418,6 +497,9 @@ pub async fn run_pool(
                     Some(Outbound::Notify { session, payload }) => client.notify(&session, payload),
                     Some(Outbound::ApprovalOpened { req, task }) => router.on_approval_opened(&req, &task),
                     Some(Outbound::ApprovalClosed { req }) => router.close_request(&req),
+                    Some(Outbound::TurnFinished { task, generation }) => {
+                        let _ = router.on_turn_finished(&task, generation);
+                    }
                     Some(Outbound::RetireRequested { task }) => {
                         // Dropping the sender IS the retirement: the worker's
                         // pending `recv()` takes anything already queued first and
@@ -445,6 +527,25 @@ pub async fn run_pool(
                     }
                 }
             }
+            _ = pressure_tick.tick(), if cfg.max_rss_bytes > 0 => {
+                update_pressure_state(&cfg, &mut router);
+                if router.draining().is_some() {
+                    let candidates = router.pressure_retirement_candidates(PRESSURE_IDLE_GRACE);
+                    for task in candidates {
+                        let Some(tx) = workers.remove(&task) else {
+                            continue;
+                        };
+                        drop(tx);
+                        if router.retire_under_pressure(&task) {
+                            tracing::warn!(
+                                "pump: task {task} retired under memory pressure — the engine \
+                                 is gone, the session tree stays for the next bell"
+                            );
+                        }
+                    }
+                    joins.retain(|join| !join.is_finished());
+                }
+            }
             _ = status_tick.tick(), if cfg.status_file.is_some() => {
                 if let Some(path) = &cfg.status_file {
                     let document = status_document(&cfg, &router);
@@ -470,6 +571,7 @@ fn status_document(cfg: &PoolConfig, router: &Router) -> Value {
         "session": cfg.session,
         "role": cfg.role,
         "active_tasks": router.active_tasks(),
+        "idle_tasks": router.idle_tasks(),
         "task_count": router.task_count(),
         "open_approvals": router.open_requests(),
         "max_tasks": cfg.max_tasks,
@@ -477,8 +579,10 @@ fn status_document(cfg: &PoolConfig, router: &Router) -> Value {
         "max_worker_tools": cfg.max_worker_tools,
         "max_rss_bytes": cfg.max_rss_bytes,
         "peak_rss_bytes": peak_rss_bytes().ok(),
+        "resident_rss_bytes": resident_rss_bytes().ok(),
         "draining": router.draining(),
         "retirements": router.retired_total(),
+        "pressure_retirements": router.pressure_retired_total(),
         "updated_unix_secs": SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -496,10 +600,81 @@ fn write_status_file(path: &std::path::Path, document: &Value) -> anyhow::Result
     Ok(std::fs::rename(staged, path)?)
 }
 
-/// Peak resident size of this process, in bytes. `ru_maxrss` is the high water
-/// mark, which is what a stop-loss wants: an overshoot that already happened is
-/// not undone by the current reading being smaller. macOS reports bytes, Linux
-/// kilobytes — the unit is a property of the platform, not of the caller.
+/// Enter drain while current resident memory is over the ceiling and resume
+/// once it falls below the hysteresis watermark. A failed current reading never
+/// clears drain: loss of observation must not turn into an accidental resume.
+fn update_pressure_state(cfg: &PoolConfig, router: &mut Router) {
+    if cfg.max_rss_bytes == 0 {
+        return;
+    }
+    match resident_rss_bytes() {
+        Ok(current) if current >= cfg.max_rss_bytes => {
+            let peak = peak_rss_bytes().unwrap_or(current).max(current);
+            let reason = format!(
+                "worker is draining: resident RSS {current} bytes reached the ceiling {} \
+                 (peak {peak} bytes) — new tasks are refused, running turns finish and \
+                 idle engines are reclaimed",
+                cfg.max_rss_bytes,
+            );
+            if router.draining().is_none() {
+                tracing::warn!("pump: {reason}");
+                router.set_draining(reason);
+            }
+        }
+        Ok(current) => {
+            let recovery_ceiling = cfg.max_rss_bytes / PRESSURE_RECOVERY_DIVISOR * 4;
+            if current <= recovery_ceiling && router.clear_draining() {
+                tracing::warn!(
+                    "pump: resident RSS {current} bytes fell to or below the recovery \
+                     watermark {recovery_ceiling} bytes — accepting new tasks again"
+                );
+            }
+        }
+        Err(error) => tracing::warn!("pump: resident RSS is unavailable: {error}"),
+    }
+}
+
+/// Current resident size in bytes. Linux reads its own procfs status file;
+/// elsewhere `ps` supplies the same `rss` column in KiB. Peak remains separate
+/// and keeps the historical high-water mark for audit.
+fn resident_rss_bytes() -> anyhow::Result<u64> {
+    if cfg!(target_os = "linux") {
+        let status = std::fs::read_to_string("/proc/self/status")?;
+        return parse_proc_status_vm_rss_bytes(&status)
+            .context("parse VmRSS from /proc/self/status");
+    }
+    let pid = std::process::id().to_string();
+    let output = Command::new("ps")
+        .args(["-o", "rss=", "-p", &pid])
+        .output()
+        .context("run ps to read resident RSS")?;
+    anyhow::ensure!(output.status.success(), "ps exited with {}", output.status);
+    parse_ps_rss_kib(&output.stdout).context("parse resident RSS from ps")
+}
+
+fn parse_proc_status_vm_rss_bytes(status: &str) -> Option<u64> {
+    let kib = status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))?
+        .split_whitespace()
+        .next()?
+        .parse::<u64>()
+        .ok()?;
+    Some(kib.saturating_mul(1024))
+}
+
+fn parse_ps_rss_kib(output: &[u8]) -> anyhow::Result<u64> {
+    let text = std::str::from_utf8(output).context("ps RSS is not UTF-8")?;
+    let kib = text
+        .trim()
+        .parse::<u64>()
+        .context("ps returned no RSS value")?;
+    Ok(kib.saturating_mul(1024))
+}
+
+/// Peak resident size of this process, in bytes. `ru_maxrss` is the historical
+/// high-water mark used for audit; admissions use current resident RSS instead.
+/// macOS reports bytes, Linux kilobytes — the unit belongs to the platform.
 fn peak_rss_bytes() -> anyhow::Result<u64> {
     let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
     let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
@@ -526,13 +701,13 @@ fn spawn_worker(
     let PooledEngine { handle, mut events } = engine;
     // managed: joined when the pump stops (dropping the sender ends the loop)
     AbortOnDropHandle::new(tokio::spawn(async move {
-        let mut pending: VecDeque<(String, Value)> = VecDeque::new();
+        let mut pending: VecDeque<(String, Value, u64)> = VecDeque::new();
         // The retransmit clock lives outside the select: a timer future created
         // inside a `select!` arm is rebuilt on every iteration, and one that is
         // always rebuilt never elapses. This one is re-armed only when it fires.
         let mut retry = Box::pin(sleep(cfg.approval_retry));
         loop {
-            let (sender, payload) = match pending.pop_front() {
+            let (sender, payload, generation) = match pending.pop_front() {
                 Some(b) => b,
                 None => {
                     // Idle timing runs only when there is genuinely nothing to
@@ -555,7 +730,11 @@ fn spawn_worker(
                         }
                     };
                     match received {
-                        Some(TaskMsg::Bell { sender, payload }) => (sender, payload),
+                        Some(TaskMsg::Bell {
+                            sender,
+                            payload,
+                            generation,
+                        }) => (sender, payload, generation),
                         Some(TaskMsg::Approval { req, decision, by }) => {
                             // a reply with no turn running has nobody to wake
                             tracing::warn!(
@@ -773,8 +952,12 @@ fn spawn_worker(
                                     );
                                 }
                             }
-                            Some(TaskMsg::Bell { sender, payload }) => {
-                                pending.push_back((sender, payload));
+                            Some(TaskMsg::Bell {
+                                sender,
+                                payload,
+                                generation,
+                            }) => {
+                                pending.push_back((sender, payload, generation));
                             }
                             None => {
                                 // the pump is gone: nobody can deliver a result
@@ -844,6 +1027,14 @@ fn spawn_worker(
                     });
                 }
             }
+
+            // Completion carries the delivery stamp it served. If another bell
+            // was already queued, the router's newest stamp is higher and this
+            // event must not make the task a pressure-retirement candidate.
+            let _ = out_tx.send(Outbound::TurnFinished {
+                task: task.clone(),
+                generation,
+            });
         }
         handle.shutdown().await;
     }))
@@ -941,10 +1132,16 @@ mod tests {
         // the first reason wins: a repeated check must not rewrite the refusal
         r.set_draining("something else");
         assert_eq!(r.draining(), Some("peak RSS crossed the ceiling"));
+        // recovery is explicit: only a successful low current-RSS reading
+        // clears the state, and a fresh task may then spawn.
+        assert!(r.clear_draining());
+        assert!(!r.clear_draining());
+        assert_eq!(r.draining(), None);
+        assert!(matches!(r.on_bell("fresh"), Action::Spawn(_)));
     }
 
-    /// `ru_maxrss` is the only memory number both macOS and Linux agree on, and
-    /// the units differ — this pins that the conversion produced a sane size.
+    /// `ru_maxrss` is the historical high-water mark, and its units differ by
+    /// platform — this pins that the conversion produced a sane size.
     #[test]
     fn peak_rss_reports_a_plausible_high_water_mark() {
         let peak = peak_rss_bytes().expect("getrusage works in a test process");
@@ -953,6 +1150,30 @@ mod tests {
             peak < 1 << 40,
             "a unit mix-up would land far outside any plausible range: {peak}"
         );
+    }
+
+    #[test]
+    fn resident_rss_reports_a_plausible_current_value() {
+        let current = resident_rss_bytes().expect("current RSS is observable");
+        assert!(current > 0, "current RSS must be non-zero: {current}");
+        assert!(
+            current < 1 << 40,
+            "a unit mix-up would land far outside any plausible range: {current}"
+        );
+    }
+
+    #[test]
+    fn rss_parsers_convert_both_platform_units_to_bytes() {
+        assert_eq!(
+            parse_proc_status_vm_rss_bytes("Name:\tkestrel\nVmRSS:\t  2048 kB\n"),
+            Some(2 * 1024 * 1024)
+        );
+        assert_eq!(parse_proc_status_vm_rss_bytes("Name:\tkestrel\n"), None);
+        assert_eq!(
+            parse_ps_rss_kib(b"  3072\n").expect("ps RSS parses"),
+            3 * 1024 * 1024
+        );
+        assert!(parse_ps_rss_kib(b"\n").is_err());
     }
 
     /// 退休释放 slot，也释放它名下的审批归属：引擎都没了，一条给旧 req 的批复
@@ -979,11 +1200,74 @@ mod tests {
         ));
     }
 
+    /// Memory pressure may release only an engine whose newest delivered bell
+    /// has completed. A stale completion cannot make a queued newer bell look
+    /// idle, and a new bell makes an idle task busy again.
+    #[test]
+    fn pressure_retirement_tracks_the_newest_completed_bell() {
+        let mut r = Router::new(4);
+        assert!(matches!(r.on_bell("t1"), Action::Spawn(_)));
+        let first = r.begin_bell("t1");
+        assert!(
+            r.pressure_retirement_candidates(Duration::ZERO).is_empty(),
+            "a running turn is never a pressure-retirement candidate"
+        );
+
+        // A second bell is queued before the first turn reports completion.
+        assert_eq!(r.on_bell("t1"), Action::Deliver("t1".into()));
+        let second = r.begin_bell("t1");
+        assert!(
+            !r.on_turn_finished("t1", first),
+            "the stale completion must not mark the newer queued bell idle"
+        );
+        assert!(r.pressure_retirement_candidates(Duration::ZERO).is_empty());
+
+        assert!(r.on_turn_finished("t1", second));
+        assert_eq!(
+            r.pressure_retirement_candidates(Duration::ZERO),
+            vec!["t1".to_string()]
+        );
+        assert!(
+            r.pressure_retirement_candidates(Duration::from_secs(3600))
+                .is_empty(),
+            "an engine is not reclaimed before the grace period"
+        );
+
+        assert_eq!(r.on_bell("t1"), Action::Deliver("t1".into()));
+        assert!(
+            r.pressure_retirement_candidates(Duration::ZERO).is_empty(),
+            "a new bell wins over the old idle state"
+        );
+    }
+
+    #[test]
+    fn pressure_retirement_releases_the_idle_engine_and_counts_it() {
+        let mut r = Router::new(1);
+        assert!(matches!(r.on_bell("t1"), Action::Spawn(_)));
+        let generation = r.begin_bell("t1");
+        assert!(r.on_turn_finished("t1", generation));
+        assert_eq!(
+            r.pressure_retirement_candidates(Duration::ZERO),
+            vec!["t1".to_string()]
+        );
+
+        assert!(r.retire_under_pressure("t1"));
+        assert!(!r.retire_under_pressure("t1"));
+        assert_eq!(r.task_count(), 0);
+        assert_eq!(r.retired_total(), 1);
+        assert_eq!(r.pressure_retired_total(), 1);
+        assert!(matches!(r.on_bell("t2"), Action::Spawn(_)));
+    }
+
     #[test]
     fn worker_status_document_is_atomic_and_reports_router_state() {
         let mut router = Router::new(4);
         assert!(matches!(router.on_bell("t2"), Action::Spawn(_)));
         assert!(matches!(router.on_bell("t1"), Action::Spawn(_)));
+        let t2_generation = router.begin_bell("t2");
+        let t1_generation = router.begin_bell("t1");
+        assert!(router.on_turn_finished("t1", t1_generation));
+        assert!(!router.on_turn_finished("t2", t2_generation.saturating_sub(1)));
         router.on_approval_opened("req-1", "t2");
         let cfg = PoolConfig {
             session: "harness-rd".into(),
@@ -1001,9 +1285,15 @@ mod tests {
         };
         let document = status_document(&cfg, &router);
         assert_eq!(document["active_tasks"], serde_json::json!(["t1", "t2"]));
+        assert_eq!(document["idle_tasks"], serde_json::json!(["t1"]));
         assert_eq!(document["task_count"], 2);
         assert_eq!(document["open_approvals"], 1);
         assert_eq!(document["max_worker_tools"], 8);
+        assert_eq!(document["pressure_retirements"], 0);
+        assert!(
+            document["resident_rss_bytes"].is_u64(),
+            "current resident RSS is part of the status document"
+        );
 
         let path =
             std::env::temp_dir().join(format!("kestrel-worker-status-{}.json", std::process::id()));
