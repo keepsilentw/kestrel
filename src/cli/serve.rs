@@ -63,6 +63,9 @@ pub struct ServeArgs {
     /// Active-turn pressure threshold in megabytes. Reaching it interrupts
     /// running engines so their turns can end; 0 disables active aborts.
     pub rss_abort_mb: u64,
+    /// Process hard ceiling in megabytes. Requires a status file and exits
+    /// non-zero after publishing the reason; 0 disables the hard ceiling.
+    pub rss_exit_mb: u64,
     /// Optional machine-readable worker status path.
     pub status_file: Option<PathBuf>,
     pub status_interval: Duration,
@@ -97,6 +100,18 @@ impl TaskSessions {
 
 /// Resident worker: one long-lived process, one engine + session tree per task.
 pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
+    if args.rss_exit_mb > 0 && args.status_file.is_none() {
+        anyhow::bail!("--rss-exit-mb requires --status-file so the trip is observable");
+    }
+    if args.max_rss_mb > 0 && args.rss_abort_mb > 0 && args.rss_abort_mb <= args.max_rss_mb {
+        anyhow::bail!("--rss-abort-mb must be greater than --max-rss-mb");
+    }
+    if args.rss_exit_mb > 0 && args.max_rss_mb > 0 && args.rss_exit_mb <= args.max_rss_mb {
+        anyhow::bail!("--rss-exit-mb must be greater than --max-rss-mb");
+    }
+    if args.rss_exit_mb > 0 && args.rss_abort_mb > 0 && args.rss_exit_mb <= args.rss_abort_mb {
+        anyhow::bail!("--rss-exit-mb must be greater than --rss-abort-mb");
+    }
     let client = Arc::new(
         BusClient::connect(&args.bus_socket, &args.session, Some(&args.session))
             .await
@@ -148,6 +163,7 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         max_worker_tools: args.max_worker_tools,
         max_rss_bytes: args.max_rss_mb.saturating_mul(1024 * 1024),
         abort_rss_bytes: args.rss_abort_mb.saturating_mul(1024 * 1024),
+        exit_rss_bytes: args.rss_exit_mb.saturating_mul(1024 * 1024),
         task_idle_timeout: args.task_idle_timeout,
         // 审批请求的重发节奏跟着这个 worker 的审批窗口走（runtime > role，
         // 与 approve 模式同一份来源，不在这里再读一次 role）

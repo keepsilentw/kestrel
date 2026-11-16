@@ -141,6 +141,11 @@ struct ServeCmd {
     #[arg(long, default_value_t = 0)]
     rss_abort_mb: u64,
 
+    /// Process hard ceiling in megabytes. When current RSS reaches it, publish
+    /// the reason to the required status file and exit non-zero. 0 = disabled.
+    #[arg(long, default_value_t = 0)]
+    rss_exit_mb: u64,
+
     /// Idle time after which a task's engine is released so its slot frees up.
     /// The session tree survives and is reopened if the same task rings again,
     /// so this costs an engine restart, not the pipeline's history. 0 = never.
@@ -574,6 +579,7 @@ async fn main() -> anyhow::Result<()> {
                 max_worker_tools: s.max_worker_tools,
                 max_rss_mb: s.max_rss_mb,
                 rss_abort_mb: s.rss_abort_mb,
+                rss_exit_mb: s.rss_exit_mb,
                 task_idle_timeout: Duration::from_secs(s.task_idle_timeout_secs),
                 status_file: s.status_file,
                 status_interval: Duration::from_secs(s.status_interval_secs),

@@ -27,7 +27,7 @@
 > 归档链的断口与重复段的隔离出口（§9.56）、记录层的深度校验 `--verify`（§9.57）；
 > 代码部分都过了 fmt / clippy / test；
 > **真端点联跑未重跑**，demo 的接法只到语法与 flag 解析这一层。
-> **Metrics** — src 51 files / 21182 lines · tests 9 files / 3947 lines · 286 tests (lib 224 + bin 6 + integration 56)
+> **Metrics** — src 51 files / 21248 lines · tests 9 files / 3948 lines · 286 tests (lib 224 + bin 6 + integration 56)
 > **Integration** — core_loop 6 / discipline 2 / m1_tools 13 / m2_session 6 / m4_bus 15 / m5_pool 8 / sandbox_e2e 4 / wire_anthropic 2
 > 规模已过 plan 预算（10-13k）的上沿：多出来的部分几乎都花在「取消安全」与「对账」这两条纪律上。
 > 上面两行数字由 `tests/discipline.rs::metrics_lines_match_the_tree` 对照源码树重算校验——
@@ -688,6 +688,20 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
     ⑥ 边界：当前仍没有独立 watchdog 或强制 kill 整个 worker 的进程级上限；中断依赖引擎
        cancel 树和 100ms 硬 abort 路径。
 
+65. **进程级 RSS 硬上限（2026-11-16）**：
+    ① §9.64 解决活动回合的受控中止，但若引擎仍未释放内存，进程本身没有最后一道边界。
+       新增 `serve --rss-exit-mb N`：当前 RSS 达到阈值时写状态、记录原因并以退出码 70 结束
+       worker。它不是把超限变成工具里的随机分配失败，但也不再保证本轮能输出结果铃。
+    ② 硬上限必须可观测：配置 `--rss-exit-mb` 时缺省拒绝启动，除非同时给出 `--status-file`。
+       触发时先把 `hard_limit_tripped` 和当前/峰值 RSS 原子写入状态文件，再退出。
+    ③ 阈值顺序在启动时校验：启用的 soft / abort / exit 必须严格递增；`exit` 也不能与更低的
+       `max` / `abort` 相同。错误配置 fail-closed，不靠运行时猜优先级。
+    ④ 状态文件新增 `exit_rss_bytes`、`hard_limit_tripped`；demo 入口对应
+       `KESTREL_DEMO_RSS_EXIT_MB`，但必须同时配置 `KESTREL_DEMO_STATUS_DIR`。
+    ⑤ 测试钉住阈值状态文档、硬上限原因只写一次，并保持现有 RSS 采样与状态序列化。
+    ⑥ 边界：这是 worker 自检后主动退出，不是外部 supervisor 的独立 watchdog；父进程仍需用
+       进程退出码/状态文件做重启与告警。退出时不会伪造结果铃，也不把未完成回合记成成功。
+
 ## 10 二期清单
 
 > 2026-11-13 更新：三期 RD/QA 在严格 `build_log` 下完成了真实端点联跑；构建日志由 SA
@@ -696,7 +710,7 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
 
 已落地（2026-10-28 起）：~~`ApproveMode::Bus`~~（授权表 + 超时 fail-closed + journal 审计，§9.20）、~~SA 判定升级到「工件 + 证据文件」~~（绝对路径存在性/非空核对，§9.20）、~~bus 重连重放~~（离线 session 停车补投 + 客户端自动重连；RPC 与「写入即死」的帧不重放，§9.21）、~~journal 快照/截断语义~~（检查点 + 归档段 + 崩溃安全轮转，§9.22）、~~多任务并行~~（task 命名空间三处同源 + 前缀寻址，§9.23）、~~openai-responses wire~~（第三条 v1 wire，金身 + fixture 验证，**真端点未实测**，§9.24）、~~journal 投影增量化与轮转触发~~（在线投影 = 全量重放 + 条数/字节双上限，§9.25）、~~一个引擎内真正并发地服务多个 task~~（改为「一 task 一引擎」的 worker 池，单活跃槽不动，§9.26）、~~`BudgetSpent` 的价格表~~（预留 → 结算两段式、按 token 换账单、无价退回名义值并报出来，§9.27；2026-11-03）、~~journal 轮转的**默认策略**~~（活文件 512 条 / 1 MiB 双上限、三态 CLI、生产与测试同一条 `rotate_at_boundary`，§9.28；2026-11-03）、~~证据的类型化~~（`file` / `test_log` / `diff` / `screenshot` 各自可在盘上反驳 + `--evidence-spec` 的 stage 要求，坏表硬失败，§9.29；2026-11-03）、~~审批批复的可靠投递~~（请求 at-least-once + 按 req 幂等 + 台账从 journal 播种，判定仍只一次，§9.30；2026-11-03）、~~批复到底有没有生效~~（回执 `approval_receipt` + `ApprovalAcked` 落账 + 到点撤摊，**没生效的批准不许记成生效**，§9.31；2026-11-03）。
 
-仍在清单上（审批已落地 at-least-once 投递、回执、重启补投和 24 小时跨回合单次槽位，见 §9.30 / §9.31 / §9.63；仍未做跨 worker 进程重启的 deferred waiter 恢复）：tree-sitter-bash 命令解析、execpolicy DSL（Starlark）、landlock/bwrap（Linux 沙箱）、TUI（行级 diff 形制，pi-tui 蓝本）、MCP 客户端、model-in-the-loop evals（含 openai-responses 的真端点实测，§9.24）、worker 池资源护栏的剩余部分（工具并发数由 `--max-parallel-tools` / `--max-worker-tools` 封顶，见 §9.46 / §9.48；内存准入/空闲回收、压力恢复和活动回合中断已落地，见 §9.53 / §9.59 / §9.60 / §9.64；独立 watchdog、进程级强制 kill 与真·多进程编排仍留给 harness 上层）、归档段的**保留/自动清理策略**（移动、gzip 压缩、预览、库存、健康检查与记录级校验已落地，见 §9.47 / §9.62；自动删除仍会撞上「这不是删除」的语义边界）。
+仍在清单上（审批已落地 at-least-once 投递、回执、重启补投和 24 小时跨回合单次槽位，见 §9.30 / §9.31 / §9.63；仍未做跨 worker 进程重启的 deferred waiter 恢复）：tree-sitter-bash 命令解析、execpolicy DSL（Starlark）、landlock/bwrap（Linux 沙箱）、TUI（行级 diff 形制，pi-tui 蓝本）、MCP 客户端、model-in-the-loop evals（含 openai-responses 的真端点实测，§9.24）、worker 池资源护栏的剩余部分（工具并发数由 `--max-parallel-tools` / `--max-worker-tools` 封顶，见 §9.46 / §9.48；内存准入/空闲回收、压力恢复、活动回合中断与进程自检硬退出已落地，见 §9.53 / §9.59 / §9.60 / §9.64 / §9.65；外部 watchdog 与真·多进程编排仍留给 harness 上层）、归档段的**保留/自动清理策略**（移动、gzip 压缩、预览、库存、健康检查与记录级校验已落地，见 §9.47 / §9.62；自动删除仍会撞上「这不是删除」的语义边界）。
 
 2026-11-04 联跑新添的两格同日落地（§9.33）：验证类 stage 的 FAIL 回跳给写者返工（带额度 `max_reworks`、带原因 `ref.rework`、每关 iter 跨回跳不清零），bash 用 `output_path` 参数交出可核对的 `test_log`（内核把 stdout/stderr 连 `exit: ExitStatus{...}` 一起写进那个文件）。下一格因此有了明确的落点：SA 只要去读那行 `exit:`，「形状」就能升级成「结论」——现在它还只证明「这份文件是测试汇总」。
 

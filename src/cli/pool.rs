@@ -127,6 +127,7 @@ pub struct Router {
     /// turns with it, and `setrlimit`-style hard caps turn an overshoot into a
     /// random allocation failure inside somebody's tool call.
     draining: Option<String>,
+    hard_limit_tripped: Option<String>,
 }
 
 struct ApprovalRoute {
@@ -149,6 +150,7 @@ impl Router {
             pressure_retired_total: 0,
             pressure_abort_total: 0,
             draining: None,
+            hard_limit_tripped: None,
         }
     }
 
@@ -168,6 +170,14 @@ impl Router {
     /// once crossed the ceiling.
     pub fn clear_draining(&mut self) -> bool {
         self.draining.take().is_some()
+    }
+
+    pub fn set_hard_limit_tripped(&mut self, reason: impl Into<String>) {
+        self.hard_limit_tripped.get_or_insert_with(|| reason.into());
+    }
+
+    fn hard_limit_tripped(&self) -> Option<&str> {
+        self.hard_limit_tripped.as_deref()
     }
 
     pub fn on_bell(&mut self, task: &str) -> Action {
@@ -394,6 +404,9 @@ pub struct PoolConfig {
     /// reaches it. The work ends as an aborted turn, not a random allocation
     /// failure. 0 disables active aborts.
     pub abort_rss_bytes: u64,
+    /// Process hard ceiling. Requires a status file; reaching it publishes the
+    /// reason and exits non-zero. 0 disables the hard ceiling.
+    pub exit_rss_bytes: u64,
     /// Idle time after which a task's engine proposes retirement. 0 = never,
     /// which leaves the slot taken for the life of the process.
     pub task_idle_timeout: Duration,
@@ -605,7 +618,11 @@ pub async fn run_pool(
                     }
                 }
             }
-            _ = pressure_tick.tick(), if cfg.max_rss_bytes > 0 || cfg.abort_rss_bytes > 0 => {
+            _ = pressure_tick.tick(),
+                if cfg.max_rss_bytes > 0
+                    || cfg.abort_rss_bytes > 0
+                    || cfg.exit_rss_bytes > 0 =>
+            {
                 let current_rss = update_pressure_state(&cfg, &mut router);
                 if router.draining().is_some() {
                     let candidates = router.pressure_retirement_candidates(PRESSURE_IDLE_GRACE);
@@ -641,6 +658,27 @@ pub async fn run_pool(
                             });
                         }
                     }
+                }
+                if cfg.exit_rss_bytes > 0
+                    && let Some(current) = current_rss
+                    && current >= cfg.exit_rss_bytes
+                {
+                    let reason = format!(
+                        "worker exceeded hard RSS ceiling: current {current} bytes, \
+                         ceiling {} bytes",
+                        cfg.exit_rss_bytes
+                    );
+                    router.set_hard_limit_tripped(reason.clone());
+                    if let Some(path) = &cfg.status_file
+                        && let Err(error) = write_status_file(path, &status_document(&cfg, &router))
+                    {
+                        tracing::error!(
+                            "write hard-limit status {}: {error}",
+                            path.display()
+                        );
+                    }
+                    tracing::error!("pump: {reason} — exiting worker with status 70");
+                    std::process::exit(70);
                 }
             }
             _ = approval_route_tick.tick() => {
@@ -682,12 +720,14 @@ fn status_document(cfg: &PoolConfig, router: &Router) -> Value {
         "max_worker_tools": cfg.max_worker_tools,
         "max_rss_bytes": cfg.max_rss_bytes,
         "abort_rss_bytes": cfg.abort_rss_bytes,
+        "exit_rss_bytes": cfg.exit_rss_bytes,
         "peak_rss_bytes": peak_rss_bytes().ok(),
         "resident_rss_bytes": resident_rss_bytes().ok(),
         "draining": router.draining(),
         "retirements": router.retired_total(),
         "pressure_retirements": router.pressure_retired_total(),
         "pressure_aborts": router.pressure_abort_total(),
+        "hard_limit_tripped": router.hard_limit_tripped(),
         "updated_unix_secs": SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -709,7 +749,7 @@ fn write_status_file(path: &std::path::Path, document: &Value) -> anyhow::Result
 /// once it falls below the hysteresis watermark. A failed current reading never
 /// clears drain: loss of observation must not turn into an accidental resume.
 fn update_pressure_state(cfg: &PoolConfig, router: &mut Router) -> Option<u64> {
-    if cfg.max_rss_bytes == 0 && cfg.abort_rss_bytes == 0 {
+    if cfg.max_rss_bytes == 0 && cfg.abort_rss_bytes == 0 && cfg.exit_rss_bytes == 0 {
         return None;
     }
     match resident_rss_bytes() {
@@ -1574,6 +1614,7 @@ mod tests {
         let t1_generation = router.begin_bell("t1");
         assert!(router.on_turn_finished("t1", t1_generation));
         assert!(!router.on_turn_finished("t2", t2_generation.saturating_sub(1)));
+        router.set_hard_limit_tripped("hard limit test");
         router.on_approval_opened("req-1", "t2");
         let cfg = PoolConfig {
             session: "harness-rd".into(),
@@ -1585,6 +1626,7 @@ mod tests {
             max_worker_tools: 8,
             max_rss_bytes: 0,
             abort_rss_bytes: 0,
+            exit_rss_bytes: 0,
             task_idle_timeout: Duration::ZERO,
             approval_retry: Duration::from_secs(1),
             status_file: None,
@@ -1597,8 +1639,10 @@ mod tests {
         assert_eq!(document["open_approvals"], 1);
         assert_eq!(document["max_worker_tools"], 8);
         assert_eq!(document["abort_rss_bytes"], 0);
+        assert_eq!(document["exit_rss_bytes"], 0);
         assert_eq!(document["pressure_retirements"], 0);
         assert_eq!(document["pressure_aborts"], 0);
+        assert_eq!(document["hard_limit_tripped"], "hard limit test");
         assert!(
             document["resident_rss_bytes"].is_u64(),
             "current resident RSS is part of the status document"

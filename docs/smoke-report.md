@@ -7,7 +7,7 @@
 
 ## 1. 自动化测试基线（cargo test）
 
-**Metrics** — src 51 files / 21182 lines · tests 9 files / 3947 lines · 286 tests (lib 224 + bin 6 + integration 56)
+**Metrics** — src 51 files / 21248 lines · tests 9 files / 3948 lines · 286 tests (lib 224 + bin 6 + integration 56)
 **Integration** — core_loop 6 / discipline 2 / m1_tools 13 / m2_session 6 / m4_bus 15 / m5_pool 8 / sandbox_e2e 4 / wire_anthropic 2
 
 | 组 | 覆盖 |
@@ -1278,5 +1278,17 @@ deferred 路由送达。
 同一门铃在一个压力 episode 里只中断一次；新门铃会清除标记。审批取消语义同时收紧：
 超时才允许生成跨回合槽位，取消/失败直接撤摊。demo 入口支持
 `KESTREL_DEMO_ABORT_RSS_MB`。
+
+本轮未执行 build、clippy 或测试；当前验证仅到静态审阅与格式化。
+
+## 54. 2026-11-16 进程级 RSS 硬上限
+
+新增 `serve --rss-exit-mb`。硬上限要求 `--status-file`，触发时先原子发布
+`hard_limit_tripped`、当前/峰值 RSS 和阈值，再以退出码 70 结束 worker。启动时校验
+soft / abort / exit 三级阈值严格递增，错误配置直接拒绝。
+
+状态文件新增 `exit_rss_bytes` / `hard_limit_tripped`；demo 入口对应
+`KESTREL_DEMO_RSS_EXIT_MB`，并依赖 `KESTREL_DEMO_STATUS_DIR`。这是 worker 自检硬退出，
+不是外部 watchdog，也不伪造未完成回合的结果铃。
 
 本轮未执行 build、clippy 或测试；当前验证仅到静态审阅与格式化。
