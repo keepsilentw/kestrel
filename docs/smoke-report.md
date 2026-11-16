@@ -7,7 +7,7 @@
 
 ## 1. 自动化测试基线（cargo test）
 
-**Metrics** — src 51 files / 21046 lines · tests 9 files / 3946 lines · 284 tests (lib 222 + bin 6 + integration 56)
+**Metrics** — src 51 files / 21182 lines · tests 9 files / 3947 lines · 286 tests (lib 224 + bin 6 + integration 56)
 **Integration** — core_loop 6 / discipline 2 / m1_tools 13 / m2_session 6 / m4_bus 15 / m5_pool 8 / sandbox_e2e 4 / wire_anthropic 2
 
 | 组 | 覆盖 |
@@ -1266,5 +1266,17 @@ fsync、用 `gzip -dc` 解压并与源 JSONL 逐字节比较；只有比较通�
 worker 的请求路由使用 `ApprovalDeferred` 保留 24 小时，pump 每 60 秒清理过期项；task 退休
 仍会清除其全部路由。测试覆盖精确匹配、单次消费、TTL、矛盾 fail-closed、未来调用消费与
 deferred 路由送达。
+
+本轮未执行 build、clippy 或测试；当前验证仅到静态审阅与格式化。
+
+## 53. 2026-11-16 活动回合内存压力中止
+
+新增 `serve --rss-abort-mb`。超过该阈值时，pump 对每个活动 task 发送一次
+`AbortForMemory`，引擎走既有 cancel 树中断回合；工件记录 `memory_abort`，状态文件新增
+`abort_rss_bytes` / `pressure_aborts`。空闲 task 不在这里中断，继续走空闲引擎回收。
+
+同一门铃在一个压力 episode 里只中断一次；新门铃会清除标记。审批取消语义同时收紧：
+超时才允许生成跨回合槽位，取消/失败直接撤摊。demo 入口支持
+`KESTREL_DEMO_ABORT_RSS_MB`。
 
 本轮未执行 build、clippy 或测试；当前验证仅到静态审阅与格式化。

@@ -118,10 +118,9 @@ impl ApprovalBoard {
         ApprovalCompletion::Deferred
     }
 
-    /// Drop a waiter WITHOUT sending: the approval window elapsed, so the tool
-    /// is no longer listening. The exact detail is retained for a bounded
-    /// one-use future slot; the late reply still cannot wake the expired tool.
-    pub fn abandon(&self, req: &str) -> bool {
+    /// The approval window elapsed. Drop the waiter without sending, but retain
+    /// the exact detail for a bounded one-use future slot.
+    pub fn suspend(&self, req: &str) -> bool {
         let removed = self.waiters.lock().unwrap().remove(req).is_some();
         if !removed {
             return false;
@@ -138,6 +137,15 @@ impl ApprovalBoard {
         true
     }
 
+    /// The turn was cancelled or failed. Drop the waiter and its detail without
+    /// creating a future approval slot.
+    pub fn abandon(&self, req: &str) -> bool {
+        let removed = self.waiters.lock().unwrap().remove(req).is_some();
+        self.requests.lock().unwrap().remove(req);
+        self.expired.lock().unwrap().remove(req);
+        removed
+    }
+
     /// Is anyone still waiting on this request?
     pub fn has_waiter(&self, req: &str) -> bool {
         self.waiters.lock().unwrap().contains_key(req)
@@ -146,13 +154,7 @@ impl ApprovalBoard {
     /// Called when a turn ends so stale waiters never leak.
     pub fn drop_pending(&self) {
         self.waiters.lock().unwrap().clear();
-        let requests = std::mem::take(&mut *self.requests.lock().unwrap());
-        let expires_at = Instant::now() + self.deferred_ttl;
-        self.expired.lock().unwrap().extend(
-            requests
-                .into_iter()
-                .map(|(req, detail)| (req, ExpiredRequest { detail, expires_at })),
-        );
+        self.requests.lock().unwrap().clear();
     }
 
     /// Consume one decision for an exact tool+args payload. Matching is a
@@ -213,22 +215,22 @@ mod tests {
         );
     }
 
-    /// 到点之后没人听：`abandon` 必须让后来的批复变成「没有生效」，而不是
-    /// 假装唤醒了一个已经消失的等待者。
+    /// 到点之后没人听：`suspend` 必须让后来的批复进入未来槽位，而不是假装
+    /// 唤醒了已经消失的等待者。
     #[tokio::test]
-    async fn abandon_makes_a_late_reply_report_no_waiter() {
+    async fn suspend_makes_a_late_reply_a_deferred_slot() {
         let board = ApprovalBoard::default();
         let (req, _rx) = board.open();
         assert!(board.has_waiter(&req));
         // 模拟丢弃 rx（等待者消失）+ 到点撤摊：真实路径是 timeout 那一条
-        assert!(board.abandon(&req), "撤摊要说成功撤了一个");
+        assert!(board.suspend(&req), "撤摊要说成功撤了一个");
         assert!(!board.has_waiter(&req));
         assert_eq!(
             board.complete(&req, ApprovalDecision::AllowOnce),
             ApprovalCompletion::Deferred,
             "the expired waiter cannot apply the decision, but the exact slot may"
         );
-        assert!(!board.abandon(&req), "撤两次是假的：第二次没有等待者");
+        assert!(!board.suspend(&req), "撤两次是假的：第二次没有等待者");
         assert_eq!(
             board.take_deferred(&Value::Null),
             Some((req.clone(), ApprovalDecision::AllowOnce))
@@ -247,7 +249,7 @@ mod tests {
         let allowed = serde_json::json!({"tool":"bash","args":{"command":"cargo test"}});
         let req = "req-1".to_string();
         let _rx = board.open_with_detail(req.clone(), allowed.clone());
-        assert!(board.abandon(&req));
+        assert!(board.suspend(&req));
         assert_eq!(
             board.complete(&req, ApprovalDecision::AllowOnce),
             ApprovalCompletion::Deferred
@@ -267,7 +269,7 @@ mod tests {
         let expired = ApprovalBoard::with_deferred_ttl(Duration::ZERO);
         let req = "req-2".to_string();
         let _rx = expired.open_with_detail(req.clone(), allowed.clone());
-        assert!(expired.abandon(&req));
+        assert!(expired.suspend(&req));
         assert_eq!(
             expired.complete(&req, ApprovalDecision::AllowOnce),
             ApprovalCompletion::Stale
@@ -280,7 +282,7 @@ mod tests {
         let detail = serde_json::json!({"tool":"bash","args":{"command":"cargo test"}});
         let req = "req-3".to_string();
         let _rx = board.open_with_detail(req.clone(), detail.clone());
-        assert!(board.abandon(&req));
+        assert!(board.suspend(&req));
         assert_eq!(
             board.complete(&req, ApprovalDecision::AllowOnce),
             ApprovalCompletion::Deferred
@@ -293,5 +295,19 @@ mod tests {
             board.take_deferred(&detail),
             Some((req, ApprovalDecision::Deny))
         );
+    }
+
+    #[test]
+    fn cancellation_discards_the_request_without_deferring_it() {
+        let board = ApprovalBoard::default();
+        let detail = serde_json::json!({"tool":"bash","args":{"command":"cargo test"}});
+        let req = "req-cancelled".to_string();
+        let _rx = board.open_with_detail(req.clone(), detail.clone());
+        assert!(board.abandon(&req));
+        assert_eq!(
+            board.complete(&req, ApprovalDecision::AllowOnce),
+            ApprovalCompletion::Stale
+        );
+        assert_eq!(board.take_deferred(&detail), None);
     }
 }

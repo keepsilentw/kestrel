@@ -135,7 +135,7 @@ async fn request_bus_approval(
             // though the tool timed out before consuming it. The expired event
             // is still required so the worker can retain the deferred route and
             // emit a truthful `applied: false` receipt.
-            let _ = approvals.abandon(&req);
+            let _ = approvals.suspend(&req);
             emit(EventMsg::ApprovalExpired {
                 req,
                 reason: format!("timed out after {timeout:?}"),

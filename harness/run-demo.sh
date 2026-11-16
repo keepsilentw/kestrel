@@ -24,7 +24,8 @@
 #                             实验文件，用来验证「按 token 结算」这条路径——单价跟着
 #                             provider 住，不把费率数字钉进 demo。
 #   KESTREL_DEMO_MAX_TASKS / KESTREL_DEMO_MAX_PARALLEL_TOOLS /
-#   KESTREL_DEMO_MAX_WORKER_TOOLS / KESTREL_DEMO_MAX_RSS_MB
+#   KESTREL_DEMO_MAX_WORKER_TOOLS / KESTREL_DEMO_MAX_RSS_MB /
+#   KESTREL_DEMO_ABORT_RSS_MB
 #                             worker 的三级资源护栏（task 数 / 单 task 工具并发 /
 #                             全 worker 工具并发 / 内存软上限）。**没设就不传 flag**，
 #                             让 serve 用自己的默认值（4 / 4 / 8 / 0 = 不设限）——
@@ -98,6 +99,7 @@ RESOURCE_ARGS=()
 [ -z "${KESTREL_DEMO_MAX_PARALLEL_TOOLS+set}" ] || RESOURCE_ARGS+=(--max-parallel-tools "$KESTREL_DEMO_MAX_PARALLEL_TOOLS")
 [ -z "${KESTREL_DEMO_MAX_WORKER_TOOLS+set}" ] || RESOURCE_ARGS+=(--max-worker-tools "$KESTREL_DEMO_MAX_WORKER_TOOLS")
 [ -z "${KESTREL_DEMO_MAX_RSS_MB+set}" ] || RESOURCE_ARGS+=(--max-rss-mb "$KESTREL_DEMO_MAX_RSS_MB")
+[ -z "${KESTREL_DEMO_ABORT_RSS_MB+set}" ] || RESOURCE_ARGS+=(--rss-abort-mb "$KESTREL_DEMO_ABORT_RSS_MB")
 [ -z "${KESTREL_DEMO_STATUS_INTERVAL+set}" ] || RESOURCE_ARGS+=(--status-interval-secs "$KESTREL_DEMO_STATUS_INTERVAL")
 
 # 状态文件按 session 分开：两个 worker 写同一个路径就会互相覆盖，读到的「几个 task」

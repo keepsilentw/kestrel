@@ -60,6 +60,9 @@ pub struct ServeArgs {
     /// peak resident size reaches it the worker drains: new tasks are refused
     /// with a visible error bell, running tasks finish. 0 = no ceiling.
     pub max_rss_mb: u64,
+    /// Active-turn pressure threshold in megabytes. Reaching it interrupts
+    /// running engines so their turns can end; 0 disables active aborts.
+    pub rss_abort_mb: u64,
     /// Optional machine-readable worker status path.
     pub status_file: Option<PathBuf>,
     pub status_interval: Duration,
@@ -144,6 +147,7 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         max_parallel_tools: args.max_parallel_tools,
         max_worker_tools: args.max_worker_tools,
         max_rss_bytes: args.max_rss_mb.saturating_mul(1024 * 1024),
+        abort_rss_bytes: args.rss_abort_mb.saturating_mul(1024 * 1024),
         task_idle_timeout: args.task_idle_timeout,
         // 审批请求的重发节奏跟着这个 worker 的审批窗口走（runtime > role，
         // 与 approve 模式同一份来源，不在这里再读一次 role）

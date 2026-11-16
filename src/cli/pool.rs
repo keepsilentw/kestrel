@@ -50,6 +50,9 @@ pub enum TaskMsg {
         decision: ApprovalDecision,
         by: String,
     },
+    /// Interrupt the active turn because current RSS crossed the hard-pressure
+    /// threshold. The resulting artifact still records an aborted turn.
+    AbortForMemory { reason: String },
 }
 
 /// What a worker asks the pump to put on the bus. The pump is the only writer
@@ -110,12 +113,14 @@ pub struct Router {
     req_owner: HashMap<String, ApprovalRoute>,
     delivered: HashMap<String, u64>,
     idle_since: HashMap<String, Instant>,
+    aborted_under_pressure: HashSet<String>,
     max_tasks: usize,
     /// How many engines this worker has released. "task_count pinned at the cap"
     /// and "tasks churning through the cap" look identical from the outside
     /// unless something counts the releases.
     retired_total: usize,
     pressure_retired_total: usize,
+    pressure_abort_total: usize,
     /// A resource ceiling was crossed: new tasks are refused out loud, while
     /// tasks that already own an engine keep running. Refusing is the honest
     /// half of a soft ceiling — killing the process would take the in-flight
@@ -138,9 +143,11 @@ impl Router {
             req_owner: HashMap::new(),
             delivered: HashMap::new(),
             idle_since: HashMap::new(),
+            aborted_under_pressure: HashSet::new(),
             max_tasks,
             retired_total: 0,
             pressure_retired_total: 0,
+            pressure_abort_total: 0,
             draining: None,
         }
     }
@@ -164,6 +171,7 @@ impl Router {
     }
 
     pub fn on_bell(&mut self, task: &str) -> Action {
+        self.aborted_under_pressure.remove(task);
         if self.tasks.contains(task) {
             self.idle_since.remove(task);
             return Action::Deliver(task.to_string());
@@ -293,6 +301,7 @@ impl Router {
         self.req_owner.retain(|_, route| route.task != task);
         self.delivered.remove(task);
         self.idle_since.remove(task);
+        self.aborted_under_pressure.remove(task);
         self.retired_total += 1;
         true
     }
@@ -312,6 +321,29 @@ impl Router {
 
     pub fn pressure_retired_total(&self) -> usize {
         self.pressure_retired_total
+    }
+
+    pub fn pressure_abort_total(&self) -> usize {
+        self.pressure_abort_total
+    }
+
+    /// Active turns that have not already received an abort for the current
+    /// pressure episode. Idle tasks are left to pressure retirement instead.
+    pub fn pressure_abort_candidates(&mut self) -> Vec<String> {
+        let mut tasks: Vec<String> = self
+            .tasks
+            .iter()
+            .filter(|task| {
+                !self.idle_since.contains_key(*task) && !self.aborted_under_pressure.contains(*task)
+            })
+            .cloned()
+            .collect();
+        tasks.sort();
+        for task in &tasks {
+            self.aborted_under_pressure.insert(task.clone());
+            self.pressure_abort_total += 1;
+        }
+        tasks
     }
 
     fn idle_tasks(&self) -> Vec<String> {
@@ -358,6 +390,10 @@ pub struct PoolConfig {
     /// it the worker drains (refuses new tasks) and reclaims engines that
     /// completed their newest bell and stayed idle. 0 = no ceiling.
     pub max_rss_bytes: u64,
+    /// Harder pressure threshold: interrupt active turns once current RSS
+    /// reaches it. The work ends as an aborted turn, not a random allocation
+    /// failure. 0 disables active aborts.
+    pub abort_rss_bytes: u64,
     /// Idle time after which a task's engine proposes retirement. 0 = never,
     /// which leaves the slot taken for the life of the process.
     pub task_idle_timeout: Duration,
@@ -490,7 +526,7 @@ pub async fn run_pool(
                 // costs a new engine, and `getrusage` is one syscall. Checking
                 // here (instead of only at the status tick) means the first
                 // overshoot refuses the bell that crossed it, not the next one.
-                update_pressure_state(&cfg, &mut router);
+                let _ = update_pressure_state(&cfg, &mut router);
                 match router.on_bell(&task) {
                     Action::Reject { task, reason } => {
                         tracing::warn!("pump: {reason}");
@@ -569,8 +605,8 @@ pub async fn run_pool(
                     }
                 }
             }
-            _ = pressure_tick.tick(), if cfg.max_rss_bytes > 0 => {
-                update_pressure_state(&cfg, &mut router);
+            _ = pressure_tick.tick(), if cfg.max_rss_bytes > 0 || cfg.abort_rss_bytes > 0 => {
+                let current_rss = update_pressure_state(&cfg, &mut router);
                 if router.draining().is_some() {
                     let candidates = router.pressure_retirement_candidates(PRESSURE_IDLE_GRACE);
                     for task in candidates {
@@ -586,6 +622,25 @@ pub async fn run_pool(
                         }
                     }
                     joins.retain(|join| !join.is_finished());
+                }
+                if cfg.abort_rss_bytes > 0
+                    && let Some(current) = current_rss
+                    && current >= cfg.abort_rss_bytes
+                {
+                    let reason = format!(
+                        "worker memory pressure reached {} bytes (abort threshold {})",
+                        current, cfg.abort_rss_bytes
+                    );
+                    for task in router.pressure_abort_candidates() {
+                        if let Some(tx) = workers.get(&task) {
+                            tracing::warn!(
+                                "pump: task {task} is interrupted by memory pressure: {reason}"
+                            );
+                            let _ = tx.send(TaskMsg::AbortForMemory {
+                                reason: reason.clone(),
+                            });
+                        }
+                    }
                 }
             }
             _ = approval_route_tick.tick() => {
@@ -626,11 +681,13 @@ fn status_document(cfg: &PoolConfig, router: &Router) -> Value {
         "max_parallel_tools": cfg.max_parallel_tools,
         "max_worker_tools": cfg.max_worker_tools,
         "max_rss_bytes": cfg.max_rss_bytes,
+        "abort_rss_bytes": cfg.abort_rss_bytes,
         "peak_rss_bytes": peak_rss_bytes().ok(),
         "resident_rss_bytes": resident_rss_bytes().ok(),
         "draining": router.draining(),
         "retirements": router.retired_total(),
         "pressure_retirements": router.pressure_retired_total(),
+        "pressure_aborts": router.pressure_abort_total(),
         "updated_unix_secs": SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -651,34 +708,41 @@ fn write_status_file(path: &std::path::Path, document: &Value) -> anyhow::Result
 /// Enter drain while current resident memory is over the ceiling and resume
 /// once it falls below the hysteresis watermark. A failed current reading never
 /// clears drain: loss of observation must not turn into an accidental resume.
-fn update_pressure_state(cfg: &PoolConfig, router: &mut Router) {
-    if cfg.max_rss_bytes == 0 {
-        return;
+fn update_pressure_state(cfg: &PoolConfig, router: &mut Router) -> Option<u64> {
+    if cfg.max_rss_bytes == 0 && cfg.abort_rss_bytes == 0 {
+        return None;
     }
     match resident_rss_bytes() {
-        Ok(current) if current >= cfg.max_rss_bytes => {
-            let peak = peak_rss_bytes().unwrap_or(current).max(current);
-            let reason = format!(
-                "worker is draining: resident RSS {current} bytes reached the ceiling {} \
-                 (peak {peak} bytes) — new tasks are refused, running turns finish and \
-                 idle engines are reclaimed",
-                cfg.max_rss_bytes,
-            );
-            if router.draining().is_none() {
-                tracing::warn!("pump: {reason}");
-                router.set_draining(reason);
-            }
-        }
         Ok(current) => {
-            let recovery_ceiling = cfg.max_rss_bytes / PRESSURE_RECOVERY_DIVISOR * 4;
-            if current <= recovery_ceiling && router.clear_draining() {
-                tracing::warn!(
-                    "pump: resident RSS {current} bytes fell to or below the recovery \
-                     watermark {recovery_ceiling} bytes — accepting new tasks again"
-                );
+            if cfg.max_rss_bytes > 0 {
+                if current >= cfg.max_rss_bytes {
+                    let peak = peak_rss_bytes().unwrap_or(current).max(current);
+                    let reason = format!(
+                        "worker is draining: resident RSS {current} bytes reached the ceiling {} \
+                         (peak {peak} bytes) — new tasks are refused, running turns finish and \
+                         idle engines are reclaimed",
+                        cfg.max_rss_bytes,
+                    );
+                    if router.draining().is_none() {
+                        tracing::warn!("pump: {reason}");
+                        router.set_draining(reason);
+                    }
+                } else {
+                    let recovery_ceiling = cfg.max_rss_bytes / PRESSURE_RECOVERY_DIVISOR * 4;
+                    if current <= recovery_ceiling && router.clear_draining() {
+                        tracing::warn!(
+                            "pump: resident RSS {current} bytes fell to or below the recovery \
+                             watermark {recovery_ceiling} bytes — accepting new tasks again"
+                        );
+                    }
+                }
             }
+            Some(current)
         }
-        Err(error) => tracing::warn!("pump: resident RSS is unavailable: {error}"),
+        Err(error) => {
+            tracing::warn!("pump: resident RSS is unavailable: {error}");
+            None
+        }
     }
 }
 
@@ -811,6 +875,13 @@ fn spawn_worker(
                             });
                             continue;
                         }
+                        Some(TaskMsg::AbortForMemory { reason }) => {
+                            tracing::warn!(
+                                "task {task}: memory abort arrived while idle; no active turn"
+                            );
+                            let _ = reason;
+                            continue;
+                        }
                         None => break,
                     }
                 }
@@ -834,6 +905,7 @@ fn spawn_worker(
             let mut aborted = false;
             let mut usage = Usage::default();
             let mut approvals: Vec<Value> = Vec::new();
+            let mut memory_abort_reason: Option<String> = None;
             let mut open: BTreeMap<String, OpenApproval> = BTreeMap::new();
             let stop_seen: Option<StopReason>;
             loop {
@@ -1003,8 +1075,15 @@ fn spawn_worker(
                             });
                         }
                     }
-                    msg = inbox.recv(), if !open.is_empty() => {
+                    msg = inbox.recv() => {
                         match msg {
+                            Some(TaskMsg::AbortForMemory { reason }) => {
+                                if memory_abort_reason.is_none() {
+                                    tracing::warn!("task {task}: interrupting active turn: {reason}");
+                                    memory_abort_reason = Some(reason);
+                                    handle.interrupt();
+                                }
+                            }
                             Some(TaskMsg::Approval { req, decision, by }) => {
                                 if open.remove(&req).is_some() {
                                     let completion =
@@ -1170,6 +1249,7 @@ fn spawn_worker(
                 "evidence_warnings": annotation_warnings(&result_text),
                 "usage": usage,
                 "approvals": approvals,
+                "memory_abort": memory_abort_reason,
                 "ref": payload["ref"],
             });
             let body = serde_json::to_string_pretty(&artifact_json);
@@ -1460,6 +1540,32 @@ mod tests {
     }
 
     #[test]
+    fn pressure_abort_targets_active_turns_once_per_bell() {
+        let mut r = Router::new(4);
+        assert!(matches!(r.on_bell("idle"), Action::Spawn(_)));
+        assert!(matches!(r.on_bell("active"), Action::Spawn(_)));
+        let idle_generation = r.begin_bell("idle");
+        r.begin_bell("active");
+        assert!(r.on_turn_finished("idle", idle_generation));
+
+        assert_eq!(r.pressure_abort_candidates(), vec!["active".to_string()]);
+        assert_eq!(r.pressure_abort_total(), 1);
+        assert!(
+            r.pressure_abort_candidates().is_empty(),
+            "one pressure episode aborts a turn once"
+        );
+
+        assert_eq!(r.on_bell("active"), Action::Deliver("active".into()));
+        r.begin_bell("active");
+        assert_eq!(
+            r.pressure_abort_candidates(),
+            vec!["active".to_string()],
+            "a new bell starts a new abort episode"
+        );
+        assert_eq!(r.pressure_abort_total(), 2);
+    }
+
+    #[test]
     fn worker_status_document_is_atomic_and_reports_router_state() {
         let mut router = Router::new(4);
         assert!(matches!(router.on_bell("t2"), Action::Spawn(_)));
@@ -1478,6 +1584,7 @@ mod tests {
             max_parallel_tools: 4,
             max_worker_tools: 8,
             max_rss_bytes: 0,
+            abort_rss_bytes: 0,
             task_idle_timeout: Duration::ZERO,
             approval_retry: Duration::from_secs(1),
             status_file: None,
@@ -1489,7 +1596,9 @@ mod tests {
         assert_eq!(document["task_count"], 2);
         assert_eq!(document["open_approvals"], 1);
         assert_eq!(document["max_worker_tools"], 8);
+        assert_eq!(document["abort_rss_bytes"], 0);
         assert_eq!(document["pressure_retirements"], 0);
+        assert_eq!(document["pressure_aborts"], 0);
         assert!(
             document["resident_rss_bytes"].is_u64(),
             "current resident RSS is part of the status document"

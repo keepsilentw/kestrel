@@ -96,6 +96,7 @@ async fn harness_with(tag: &str, factory: EngineFactory, wires: Wires, limits: L
         max_parallel_tools: kestrel::tools::DEFAULT_MAX_PARALLEL_TOOLS,
         max_worker_tools: kestrel::tools::DEFAULT_MAX_WORKER_TOOLS,
         max_rss_bytes: limits.rss_ceiling,
+        abort_rss_bytes: 0,
         task_idle_timeout: limits.task_idle_timeout,
         approval_retry: limits.approval_retry,
         status_file: None,
