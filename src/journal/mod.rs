@@ -310,7 +310,7 @@ impl Journal {
                 + self
                     .segment_archive_dir()
                     .as_deref()
-                    .map(staged_files)
+                    .map(|dir| staged_files(Some(dir)))
                     .unwrap_or(0),
             segments,
             verification: None,
@@ -696,6 +696,73 @@ impl Journal {
             let _ = d.sync_all();
         }
         Ok(moves.len())
+    }
+
+    /// Preview compression of `.jsonl` files that were archived before gzip
+    /// support existed. Sources stay in `<stem>.segments/`; only their physical
+    /// representation changes.
+    pub fn archive_compression_plan(&self) -> anyhow::Result<Vec<ArchiveMove>> {
+        let _file = self.file.lock().unwrap();
+        self.archive_compression_plan_locked()
+    }
+
+    fn archive_compression_plan_locked(&self) -> anyhow::Result<Vec<ArchiveMove>> {
+        let archive = self
+            .segment_archive_dir()
+            .context("journal path has no archive directory")?;
+        let Some(stem) = self.path.file_stem().and_then(|s| s.to_str()) else {
+            anyhow::bail!("journal path has no usable file stem");
+        };
+        let prefix = format!("{stem}.seg");
+        Ok(segment_files(&archive, &prefix)
+            .into_iter()
+            .filter(|(_, _, path)| {
+                path.to_string_lossy().ends_with(".jsonl")
+                    && !path.to_string_lossy().ends_with(".jsonl.gz")
+            })
+            .map(|(from, to, source)| {
+                let name = source
+                    .file_name()
+                    .expect("segment_files only returns named files")
+                    .to_string_lossy();
+                let destination = archive.join(format!("{name}.gz"));
+                ArchiveMove {
+                    from,
+                    to,
+                    bytes: file_bytes(&source),
+                    destination_exists: destination.exists(),
+                    source,
+                    destination,
+                    compress: true,
+                }
+            })
+            .collect())
+    }
+
+    /// Compress already archived JSONL segments in place. Every target is
+    /// conflict-checked before the first source is touched.
+    pub fn compress_archived_segments(&self) -> anyhow::Result<usize> {
+        let _file = self.file.lock().unwrap();
+        let plan = self.archive_compression_plan_locked()?;
+        if plan.is_empty() {
+            return Ok(0);
+        }
+        if let Some(conflict) = plan.iter().find(|item| item.destination_exists) {
+            anyhow::bail!(
+                "refusing to overwrite compressed archive {} while compressing {}",
+                conflict.destination.display(),
+                conflict.source.display()
+            );
+        }
+        for item in &plan {
+            compress_segment(&item.source, &item.destination)?;
+        }
+        if let Some(archive) = self.segment_archive_dir()
+            && let Ok(d) = File::open(archive)
+        {
+            let _ = d.sync_all();
+        }
+        Ok(plan.len())
     }
 
     /// Fold everything older than the newest `keep` records into a checkpoint
@@ -1305,6 +1372,44 @@ mod tests {
         assert_eq!(status.archived_segments, 1);
         assert_eq!(status.segments[0].path, compressed);
         assert!(journal.verify().is_consistent(), "{:?}", journal.verify());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn existing_archived_segments_can_be_compressed_in_place() {
+        let dir = scratch("compress-existing-archive");
+        let path = dir.join("journal.jsonl");
+        let journal = Journal::create(&path).unwrap();
+        seed(&journal, 4);
+        let before = reconcile(&journal.replay_all());
+        journal.rotate(5).unwrap().expect("rotation");
+        assert_eq!(journal.archive_segments(0, false).unwrap(), 1);
+        let archive = journal.segment_archive_dir().unwrap();
+        assert_eq!(
+            segment_files(&archive, "journal.seg").len(),
+            1,
+            "the archived segment starts uncompressed"
+        );
+        assert_eq!(journal.archive_compression_plan().unwrap().len(), 1);
+        assert_eq!(journal.compress_archived_segments().unwrap(), 1);
+
+        let after = reconcile(&journal.replay_all());
+        assert_eq!(before.state, after.state);
+        assert_eq!(before.in_flight, after.in_flight);
+        let status = journal.status();
+        assert_eq!(status.archived_segments, 1);
+        assert!(
+            status.segments[0]
+                .path
+                .to_string_lossy()
+                .ends_with(".jsonl.gz")
+        );
+        assert!(journal.verify().is_consistent());
+        assert_eq!(
+            journal.compress_archived_segments().unwrap(),
+            0,
+            "re-running compression is a no-op"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

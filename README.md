@@ -2,7 +2,7 @@
 
 为星型多 Agent harness 写的 Rust harness kernel：引擎 + wire 层 + 工具/权限/沙箱 + 会话 + 总线/journal + CLI/配置。设计文档（中文）见本仓库 `docs/design.md`。
 
-**Metrics** — src 51 files / 20899 lines · tests 9 files / 3946 lines · 283 tests (lib 221 + bin 6 + integration 56)
+**Metrics** — src 51 files / 21046 lines · tests 9 files / 3946 lines · 284 tests (lib 222 + bin 6 + integration 56)
 
 Status: M0-M4 complete + 二期主体落地。三期于 2026-11-10 开工：worker 池的并发执行护栏同时提供每 task 的 `--max-parallel-tools`（缺省 4）和 worker 全局的 `--max-worker-tools`（缺省 8），任一为 `0` 时显式关闭对应上限；两级限制都不改变源序回写、串行工具写锁和取消语义（design §9.46 / §9.48）。journal 的已封闭段可移入 `<journal>.segments/`，可选 gzip 压缩为 `.jsonl.gz`；`replay_all()` 同时读取两处和两种格式，移动/压缩前后完整历史等价（§9.47 / §9.62）。`journal-archive --keep/--dry-run/--compress` 与 `journal-status --json/--check/--list/--approvals` 把归档的预览、压缩、库存与审批链都变成可查项。`serve --status-file` 原子发布活动 task、空闲 task、未决审批、当前/峰值 RSS 与各级上限（§9.52），`serve --max-rss-mb` 给整个 worker 一条内存**软**上限：当前 RSS 越线后进入 drain，新 task 被显式拒绝、在跑的回合跑完；已经完成且持续空闲的 task 引擎会被回收，当前 RSS 降到阈值的 80% 以下后自动恢复接单（§9.53 / §9.59 / §9.60）。`serve --task-idle-timeout-secs` 让空闲 task 退休引擎、释放 `--max-tasks` 的 slot，同一 task 再响时重开同一棵会话树（§9.55）。审批批复支持 24 小时内的跨回合一次性槽位：精确 tool + args 匹配、单次消费、矛盾批复 fail-closed（§9.63）。名义成本分类已细到 `peer × reason`（§9.49），判定 issue 已改为自带 `Artifact | Turn` 归因的类型（§9.50）。2026-11-13 的三期 RD/QA 真实端点联跑已 `pipeline complete`，四个 stage 的测试证据均为 `26 passed / 0 failed`，账本 `0.1593 cny, of which 0.0000 nominal`；同一轮把 `build` 从任意文件证据收紧为真实 `build_log`（§9.58）。剩下的未完成边界：活动回合的被动内存回收与强制 kill 式硬上限、归档保留/自动清理策略、Linux 沙箱、SA/Responses 真端点验证。上面那行数字由 `tests/discipline.rs` 与源码树对照校验。
 
@@ -281,10 +281,13 @@ cargo run -- journal-archive --journal journal.jsonl --keep 2
 结果写入 `.new`、fsync、解压并与原 JSONL 逐字节比较，通过后才 rename 发布并移除未压缩源；
 任何一步失败都保留原段。`replay_all()` 和 `--verify` 同样能读取压缩段。
 
+`--compress-archive` 处理历史遗留：把 `<stem>.segments/` 中已经存在的未压缩 `.jsonl` 原位
+迁移为 `.jsonl.gz`，不移动出归档目录，也不会同时处理已经压缩的段。
+
 加 `--dry-run` 可以先用同一份归档计划查看将被移动的段与冲突，不执行任何 rename：
 
 ```bash
-cargo run -- journal-archive --journal journal.jsonl --keep 2 --compress --dry-run
+cargo run -- journal-archive --journal journal.jsonl --keep 2 --compress --compress-archive --dry-run
 ```
 
 归档前后可以查看不重放历史的库存摘要：

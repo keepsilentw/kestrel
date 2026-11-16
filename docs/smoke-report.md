@@ -7,8 +7,8 @@
 
 ## 1. 自动化测试基线（cargo test）
 
-**Metrics** — src 51 files / 20899 lines · tests 9 files / 3946 lines · 283 tests (lib 221 + bin 6 + integration 56)
-**Integration** — core_loop 6 / discipline 2 / m1_tools 12 / m2_session 6 / m4_bus 15 / m5_pool 8 / sandbox_e2e 4 / wire_anthropic 2
+**Metrics** — src 51 files / 21046 lines · tests 9 files / 3946 lines · 284 tests (lib 222 + bin 6 + integration 56)
+**Integration** — core_loop 6 / discipline 2 / m1_tools 13 / m2_session 6 / m4_bus 15 / m5_pool 8 / sandbox_e2e 4 / wire_anthropic 2
 
 | 组 | 覆盖 |
 |---|---|
@@ -1250,6 +1250,9 @@ fsync、用 `gzip -dc` 解压并与源 JSONL 逐字节比较；只有比较通�
 同一目录出现同区间普通 JSONL 与 gzip 副本时，普通 JSONL 优先；跨目录仍是根目录优先。
 `--dry-run --compress` 复用真实计划并显示 `.gz` 目标。测试
 `compressed_archive_preserves_history_and_verifies` 覆盖压缩、历史等价、状态识别与校验。
+
+`--compress-archive` 可把历史上已经进入 `<stem>.segments/` 的 `.jsonl` 原位压缩；
+`existing_archived_segments_can_be_compressed_in_place` 覆盖历史等价、状态识别、校验与幂等。
 
 本轮未执行 build、clippy 或测试；当前验证仅到静态审阅与格式化。
 

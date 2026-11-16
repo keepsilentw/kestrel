@@ -314,6 +314,11 @@ struct JournalArchiveCmd {
     /// uncompressed source is removed.
     #[arg(long)]
     compress: bool,
+
+    /// Compress `.jsonl` segments already present in the archive directory.
+    /// This does not move files outside `<journal-stem>.segments/`.
+    #[arg(long)]
+    compress_archive: bool,
 }
 
 #[derive(Args, Debug)]
@@ -369,6 +374,11 @@ async fn main() -> anyhow::Result<()> {
             let journal = Journal::open(&path)?;
             if a.dry_run {
                 let plan = journal.archive_plan_with_compression(a.keep, a.compress)?;
+                let archive_plan = if a.compress_archive {
+                    journal.archive_compression_plan()?
+                } else {
+                    Vec::new()
+                };
                 let duplicates = journal.status().duplicate_segments;
                 if a.resolve_duplicates {
                     println!(
@@ -398,6 +408,25 @@ async fn main() -> anyhow::Result<()> {
                         }
                     );
                 }
+                for item in archive_plan {
+                    println!(
+                        "{} archived seg{}-{} / {} byte(s) / {}{}",
+                        if item.destination_exists {
+                            "blocked"
+                        } else {
+                            "compress"
+                        },
+                        item.from,
+                        item.to,
+                        item.bytes,
+                        item.source.display(),
+                        if item.destination_exists {
+                            format!(" -> existing {}", item.destination.display())
+                        } else {
+                            format!(" -> {}", item.destination.display())
+                        }
+                    );
+                }
                 return Ok(());
             }
             let moved = journal.archive_segments_with_compression(
@@ -405,6 +434,11 @@ async fn main() -> anyhow::Result<()> {
                 a.resolve_duplicates,
                 a.compress,
             )?;
+            let compressed_archive = if a.compress_archive {
+                journal.compress_archived_segments()?
+            } else {
+                0
+            };
             match journal.segment_archive_dir() {
                 Some(dir) => println!(
                     "journal archive: archived {moved} sealed segment(s) into {}{}",
@@ -415,6 +449,11 @@ async fn main() -> anyhow::Result<()> {
                     "journal archive: archived {moved} sealed segment(s){}",
                     if a.compress { " (gzip)" } else { "" }
                 ),
+            }
+            if a.compress_archive {
+                println!(
+                    "journal archive: compressed {compressed_archive} already archived segment(s)"
+                );
             }
             return Ok(());
         }

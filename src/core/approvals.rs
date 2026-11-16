@@ -231,7 +231,7 @@ mod tests {
         assert!(!board.abandon(&req), "撤两次是假的：第二次没有等待者");
         assert_eq!(
             board.take_deferred(&Value::Null),
-            Some((req, ApprovalDecision::AllowOnce))
+            Some((req.clone(), ApprovalDecision::AllowOnce))
         );
         assert_eq!(board.take_deferred(&Value::Null), None, "slots are one-use");
         assert_eq!(
@@ -245,7 +245,8 @@ mod tests {
     fn deferred_approval_matches_exact_detail_and_expires() {
         let board = ApprovalBoard::with_deferred_ttl(Duration::from_secs(60));
         let allowed = serde_json::json!({"tool":"bash","args":{"command":"cargo test"}});
-        let (req, _rx) = board.open_with_detail("req-1".into(), allowed.clone());
+        let req = "req-1".to_string();
+        let _rx = board.open_with_detail(req.clone(), allowed.clone());
         assert!(board.abandon(&req));
         assert_eq!(
             board.complete(&req, ApprovalDecision::AllowOnce),
@@ -264,7 +265,8 @@ mod tests {
         );
 
         let expired = ApprovalBoard::with_deferred_ttl(Duration::ZERO);
-        let (req, _rx) = expired.open_with_detail("req-2".into(), allowed.clone());
+        let req = "req-2".to_string();
+        let _rx = expired.open_with_detail(req.clone(), allowed.clone());
         assert!(expired.abandon(&req));
         assert_eq!(
             expired.complete(&req, ApprovalDecision::AllowOnce),
@@ -276,7 +278,8 @@ mod tests {
     fn contradictory_replays_of_one_request_fail_closed() {
         let board = ApprovalBoard::default();
         let detail = serde_json::json!({"tool":"bash","args":{"command":"cargo test"}});
-        let (req, _rx) = board.open_with_detail("req-3".into(), detail.clone());
+        let req = "req-3".to_string();
+        let _rx = board.open_with_detail(req.clone(), detail.clone());
         assert!(board.abandon(&req));
         assert_eq!(
             board.complete(&req, ApprovalDecision::AllowOnce),

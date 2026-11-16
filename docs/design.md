@@ -27,8 +27,8 @@
 > 归档链的断口与重复段的隔离出口（§9.56）、记录层的深度校验 `--verify`（§9.57）；
 > 代码部分都过了 fmt / clippy / test；
 > **真端点联跑未重跑**，demo 的接法只到语法与 flag 解析这一层。
-> **Metrics** — src 51 files / 20899 lines · tests 9 files / 3946 lines · 283 tests (lib 221 + bin 6 + integration 56)
-> **Integration** — core_loop 6 / discipline 2 / m1_tools 12 / m2_session 6 / m4_bus 15 / m5_pool 8 / sandbox_e2e 4 / wire_anthropic 2
+> **Metrics** — src 51 files / 21046 lines · tests 9 files / 3946 lines · 284 tests (lib 222 + bin 6 + integration 56)
+> **Integration** — core_loop 6 / discipline 2 / m1_tools 13 / m2_session 6 / m4_bus 15 / m5_pool 8 / sandbox_e2e 4 / wire_anthropic 2
 > 规模已过 plan 预算（10-13k）的上沿：多出来的部分几乎都花在「取消安全」与「对账」这两条纪律上。
 > 上面两行数字由 `tests/discipline.rs::metrics_lines_match_the_tree` 对照源码树重算校验——
 > 这些计数此前在三处文档里手抄过三次、漂移过三次（§9.19），现在它是闸门不是仪式。
@@ -648,6 +648,9 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
        `replay_all()` 状态等价、库存识别与 `--verify`。
     ⑥ 边界：压缩依赖系统 `gzip`，不是内置算法；它降低段文件占用，但不提供自动删除或保留
        策略。若 `gzip` 不可用，压缩路径失败并保留原段。
+    ⑦ `--compress-archive` 单独处理历史归档目录中尚未压缩的 `.jsonl`。它与根目录段迁移共用
+       `compress_segment` 的 `.new`、fsync、逐字节回读校验与 fail-closed 冲突检查；重复执行
+       为 0，测试 `existing_archived_segments_can_be_compressed_in_place` 钉住历史等价与幂等。
 
 63. **跨回合一次性审批槽位（2026-11-16）**：
     ① §9.31⑤ 明确拒绝“迟到 allow 自动兑现下一次同类调用”，因为那会把一次批准变成长期
