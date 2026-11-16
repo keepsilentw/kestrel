@@ -2,9 +2,9 @@
 
 为星型多 Agent harness 写的 Rust harness kernel：引擎 + wire 层 + 工具/权限/沙箱 + 会话 + 总线/journal + CLI/配置。设计文档（中文）见本仓库 `docs/design.md`。
 
-**Metrics** — src 51 files / 21248 lines · tests 9 files / 3948 lines · 286 tests (lib 224 + bin 6 + integration 56)
+**Metrics** — src 52 files / 21636 lines · tests 9 files / 3951 lines · 289 tests (lib 227 + bin 6 + integration 56)
 
-Status: M0-M4 complete + 二期主体落地。三期于 2026-11-10 开工：worker 池的并发执行护栏同时提供每 task 的 `--max-parallel-tools`（缺省 4）和 worker 全局的 `--max-worker-tools`（缺省 8），任一为 `0` 时显式关闭对应上限；两级限制都不改变源序回写、串行工具写锁和取消语义（design §9.46 / §9.48）。journal 的已封闭段可移入 `<journal>.segments/`，可选 gzip 压缩为 `.jsonl.gz`；`replay_all()` 同时读取两处和两种格式，移动/压缩前后完整历史等价（§9.47 / §9.62）。`journal-archive --keep/--dry-run/--compress/--compress-archive` 与 `journal-status --json/--check/--list/--approvals` 把归档的预览、压缩、库存与审批链都变成可查项。`serve --status-file` 原子发布活动 task、空闲 task、未决审批、当前/峰值 RSS 与各级上限（§9.52），`serve --max-rss-mb` 给整个 worker 一条内存**软**上限：当前 RSS 越线后进入 drain，新 task 被显式拒绝；已经完成且持续空闲的 task 引擎会被回收，当前 RSS 降到阈值的 80% 以下后自动恢复接单（§9.53 / §9.59 / §9.60）。`serve --rss-abort-mb` 在更高压力下中断活动回合，让工作以可审计的 abort 结束并释放内存（§9.64）；`serve --rss-exit-mb` 要求状态文件并发布硬上限原因后以状态 70 退出 worker（§9.65）。`serve --task-idle-timeout-secs` 让空闲 task 退休引擎、释放 `--max-tasks` 的 slot，同一 task 再响时重开同一棵会话树（§9.55）。审批批复支持 24 小时内的跨回合一次性槽位：精确 tool + args 匹配、单次消费、矛盾批复 fail-closed（§9.63）。名义成本分类已细到 `peer × reason`（§9.49），判定 issue 已改为自带 `Artifact | Turn` 归因的类型（§9.50）。2026-11-13 的三期 RD/QA 真实端点联跑已 `pipeline complete`，四个 stage 的测试证据均为 `26 passed / 0 failed`，账本 `0.1593 cny, of which 0.0000 nominal`；同一轮把 `build` 从任意文件证据收紧为真实 `build_log`（§9.58）。剩下的未完成边界：归档保留/自动清理策略、Linux 沙箱、SA/Responses 真端点验证。上面那行数字由 `tests/discipline.rs` 与源码树对照校验。
+Status: M0-M4 complete + 二期主体落地。三期于 2026-11-10 开工：worker 池的并发执行护栏同时提供每 task 的 `--max-parallel-tools`（缺省 4）和 worker 全局的 `--max-worker-tools`（缺省 8），任一为 `0` 时显式关闭对应上限；两级限制都不改变源序回写、串行工具写锁和取消语义（design §9.46 / §9.48）。journal 的已封闭段可移入 `<journal>.segments/`，可选 gzip 压缩为 `.jsonl.gz`；`replay_all()` 同时读取两处和两种格式，移动/压缩前后完整历史等价（§9.47 / §9.62）。`journal-archive --keep/--dry-run/--compress/--compress-archive` 与 `journal-status --json/--check/--list/--approvals` 把归档的预览、压缩、库存与审批链都变成可查项；审计保留策略明确为内核不自动删除历史，外部备份/清理由运营者离线执行（§9.69）。`serve --status-file` 原子发布活动 task、空闲 task、未决审批、当前/峰值 RSS 与各级上限（§9.52），`serve --max-rss-mb` 给整个 worker 一条内存**软**上限：当前 RSS 越线后进入 drain，新 task 被显式拒绝；已经完成且持续空闲的 task 引擎会被回收，当前 RSS 降到阈值的 80% 以下后自动恢复接单（§9.53 / §9.59 / §9.60）。`serve --rss-abort-mb` 在更高压力下中断活动回合，让工作以可审计的 abort 结束并释放内存（§9.64）；`serve --rss-exit-mb` 要求状态文件并发布硬上限原因后以状态 70 退出 worker（§9.65）。外部 `run-worker-supervised.sh` 对 crash / hard-limit 退出做有限退避重启（§9.68）。`serve --task-idle-timeout-secs` 让空闲 task 退休引擎、释放 `--max-tasks` 的 slot，同一 task 再响时重开同一棵会话树（§9.55）。审批批复支持 24 小时内的跨回合一次性槽位：精确 tool + args 匹配、单次消费、矛盾批复 fail-closed，并按 task 持久化跨 worker 重启（§9.63 / §9.67）。Linux 默认使用 bubblewrap：断网、只读根、写根白名单和只读岛；`bwrap` 缺失或代理网络模式直接 fail-closed（§9.66）。名义成本分类已细到 `peer × reason`（§9.49），判定 issue 已改为自带 `Artifact | Turn` 归因的类型（§9.50）。2026-11-13 的三期 RD/QA 真实端点联跑已 `pipeline complete`，四个 stage 的测试证据均为 `26 passed / 0 failed`，账本 `0.1593 cny, of which 0.0000 nominal`；同一轮把 `build` 从任意文件证据收紧为真实 `build_log`（§9.58）。剩下的未完成边界：Linux 真机沙箱验证、SA/Responses 真端点验证。上面那行数字由 `tests/discipline.rs` 与源码树对照校验。
 
 Verification note: the latest real-endpoint run used the deterministic SA build preflight. It generated a kernel-written `build.log` with command and exit 0, then completed `dev` / `review` / `test` / `build`; all four stages reported `26 passed / 0 failed`, ledger `0.1593 cny, of which 0.0000 nominal`, and `pipeline complete`. Earlier model-only build attempts correctly failed at the iteration cap; see design §9.58.
 
@@ -191,7 +191,9 @@ tool + args 和各 task 的短期槽位；下一回合出现完全相同调用�
 记成 `allow`；现在到点即撤摊、工件写 `expired / applied:false`。迟到批复若在 24 小时内到达，
 只进入精确匹配的单次槽位，不会唤醒旧工具；未来同调用消费时产生 `ApprovalReused` 事件并补发
 `applied:true` 回执。槽位不是长期通行证：只匹配完整 tool + args、只能用一次、过期或矛盾批复
-按 deny/stale 处理。
+按 deny/stale 处理。`serve` 按 task 把槽位持久化到
+`<artifacts>/approval-slots/<task-slug>.json`，worker 重启后恢复；文件写入使用 `.new` +
+fsync + rename，内容包含精确 detail 和过期时间，Unix 权限为 0600。
 
 同一颗 `req` 的**两张矛盾回执**按事实强弱合并，不按先到先得（§9.42）：at-least-once 让 SA 去重时
 把批复重投一次，第一份唤醒了工具（工件记 `applied:true`），第二份只换回 `applied:false (no open
@@ -242,6 +244,11 @@ session、role、排序后的活动 task、空闲 task、未决审批数、各�
 `serve --rss-exit-mb N`（缺省 `0` = 不启用）是进程级硬上限，必须同时配置
 `--status-file`。当前 RSS 达到该值时先原子写入 `hard_limit_tripped` 原因，再以退出码 70
 结束 worker；启用的 RSS 阈值必须严格递增：`max < abort < exit`。
+
+`harness/run-worker-supervised.sh` 是 worker 的外部 supervisor：
+`run-worker-supervised.sh --status-file <path> --max-restarts 3 -- <worker command...>`。
+它区分正常退出、崩溃和 hard-limit 退出，按配置退避并有限重启；demo 设置
+`KESTREL_DEMO_SUPERVISE=1` 即可让 RD/QA worker 都经过它。
 
 `serve --task-idle-timeout-secs N`（缺省 1800，`0` = 永不退休）让空闲 task 的引擎**退休**，
 把 slot 还给 `--max-tasks`。退休释放引擎，不释放历史：worker 记下 task ↔ 会话树的路径，同一个
@@ -350,4 +357,4 @@ tests/        fixtures/*.sse|*.jsonl|*.events.jsonl + 验收测试 + 纪律闸�
 
 ## Non-goals
 
-TUI / MCP / 插件 / OAuth / Linux 沙箱 / 全 family provider 通用性 / prompt 级权限——二期清单见 design.md §10。
+TUI / MCP / 插件 / OAuth / 全 family provider 通用性 / prompt 级权限——二期清单见 design.md §10。

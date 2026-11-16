@@ -7,7 +7,7 @@
 
 ## 1. 自动化测试基线（cargo test）
 
-**Metrics** — src 51 files / 21248 lines · tests 9 files / 3948 lines · 286 tests (lib 224 + bin 6 + integration 56)
+**Metrics** — src 52 files / 21636 lines · tests 9 files / 3951 lines · 289 tests (lib 227 + bin 6 + integration 56)
 **Integration** — core_loop 6 / discipline 2 / m1_tools 13 / m2_session 6 / m4_bus 15 / m5_pool 8 / sandbox_e2e 4 / wire_anthropic 2
 
 | 组 | 覆盖 |
@@ -1292,3 +1292,43 @@ soft / abort / exit 三级阈值严格递增，错误配置直接拒绝。
 不是外部 watchdog，也不伪造未完成回合的结果铃。
 
 本轮未执行 build、clippy 或测试；当前验证仅到静态审阅与格式化。
+
+## 55. 2026-11-16 Linux bubblewrap 沙箱
+
+Linux 平台新增 bubblewrap wrapper：只读根 `/`、写根 bind、写根内只读岛、独立
+`/proc`/`/dev`、`--unshare-all` 与 `--die-with-parent`。`bwrap` 缺失时不降级为无沙箱，
+而是返回 stderr + exit 126 的 fail-closed wrapper。
+
+端口代理网络模式尚未在 Linux 实现端口级限制，因此直接拒绝。测试覆盖 argv 形状、写根与
+只读岛顺序、缺失工具 fail-closed。当前开发机为 macOS，Linux 真机 namespace、bwrap 和审批
+升级链路尚未实测。
+
+## 56. 2026-11-16 deferred 审批跨重启恢复
+
+`serve` 为每个 task 把审批 board 的 expired/deferred 状态写入
+`<artifacts>/approval-slots/<task-slug>.json`。文件写入采用同目录 `.new`、fsync、rename，
+Unix 权限 0600；槽位仍绑定完整 tool + args、原 req、决定和绝对过期时间。
+
+重启后 pending detail 仍可接受迟到决定并生成槽位；已经消费的决定会先持久化删除，不会因
+重启再次出现。store 损坏时不猜授权，记录 error 并从空槽位开始。
+
+测试 `deferred_approvals_survive_a_board_restart` 覆盖 suspend、重启、迟到 allow、跨重启
+消费和消费后的持久化清空。
+
+## 57. 2026-11-16 worker 外部 supervisor
+
+新增 `harness/run-worker-supervised.sh`：正常退出直接结束；非零退出或 hard-limit 退出
+按退避和重启预算重新启动。可通过 `--status-file` 在日志中标注退出是否由
+`hard_limit_tripped` 触发。
+
+`run-demo.sh` 支持 `KESTREL_DEMO_SUPERVISE=1`，并新增重启次数/退避环境变量。脚本完成
+`bash -n` 检查；本轮未启动 demo，未制造真实退出码 70。
+
+## 58. 2026-11-16 journal 审计保留策略
+
+最终决定是不提供自动删除：journal 是审计真相，自动 purge 会让历史静默缩短。内核只提供
+活文件轮转、根段归档、gzip、库存、覆盖链与记录级校验；外部备份、冷存储和最终删除由运营者
+在 Kestrel 之外完成。
+
+因此磁盘占用会随审计历史增长，这是刻意保留成本，不是待实现项。执行外部策略前使用
+`journal-status --json/--check/--list` 获取完整库存与完整性状态。

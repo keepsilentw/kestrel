@@ -27,7 +27,7 @@
 > 归档链的断口与重复段的隔离出口（§9.56）、记录层的深度校验 `--verify`（§9.57）；
 > 代码部分都过了 fmt / clippy / test；
 > **真端点联跑未重跑**，demo 的接法只到语法与 flag 解析这一层。
-> **Metrics** — src 51 files / 21248 lines · tests 9 files / 3948 lines · 286 tests (lib 224 + bin 6 + integration 56)
+> **Metrics** — src 52 files / 21636 lines · tests 9 files / 3951 lines · 289 tests (lib 227 + bin 6 + integration 56)
 > **Integration** — core_loop 6 / discipline 2 / m1_tools 13 / m2_session 6 / m4_bus 15 / m5_pool 8 / sandbox_e2e 4 / wire_anthropic 2
 > 规模已过 plan 预算（10-13k）的上沿：多出来的部分几乎都花在「取消安全」与「对账」这两条纪律上。
 > 上面两行数字由 `tests/discipline.rs::metrics_lines_match_the_tree` 对照源码树重算校验——
@@ -39,7 +39,7 @@
 
 **定位**：为星型多 Agent harness（SA 协调者 + RD 写者 + QA 验证者，多进程各接异构 LLM 后端）提供的 Rust 引擎内核。无头/极简 CLI：`-p` 单发（默认模式）、`serve` 常驻 worker、`demo-sa` 脚本化 SA、`hub` 总线进程；worker 的后端/总线地址来自 role 文件（`[llm]`、`bus_socket`），CLI flag 可覆盖。
 
-**非目标**（二期清单见 §10）：TUI、MCP、插件/扩展系统、OAuth 订阅登录、Linux 沙箱、openai-responses wire、tree-sitter-bash 命令解析、execpolicy DSL。
+**非目标**（二期清单见 §10）：TUI、MCP、插件/扩展系统、OAuth 订阅登录、openai-responses wire、tree-sitter-bash 命令解析、execpolicy DSL。
 
 ## 2 总体架构
 
@@ -702,6 +702,58 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
     ⑥ 边界：这是 worker 自检后主动退出，不是外部 supervisor 的独立 watchdog；父进程仍需用
        进程退出码/状态文件做重启与告警。退出时不会伪造结果铃，也不把未完成回合记成成功。
 
+66. **Linux bubblewrap 沙箱（2026-11-16）**：
+    ① `platform_sandbox()` 在 Linux 上检测 `bwrap --version`；可用时使用 bubblewrap，缺失时
+       返回 fail-closed wrapper，以 stderr + exit 126 进入既有 sandbox-denial/审批路径。
+    ② 默认 `NetMode::None` 使用 `--unshare-all` 完全断网；只读根 `/`，随后按 writable roots
+       建立可写 bind，再对 `read_only_within` 做只读 bind，保留写根内只读岛。
+    ③ `--die-with-parent`、`--new-session`、独立 `/proc` 与 `/dev` 作为最小隔离底座。
+       `ProxyPorts` 目前没有 Linux 侧端口级网络强制实现，因此直接 fail-closed，不静默共享
+       宿主网络。
+    ④ Linux 测试覆盖 bwrap argv 顺序、写根/只读岛 bind，以及不支持网络模式时的 exit 126。
+    ⑤ 验证边界：当前开发机是 macOS；Linux 模块只有静态测试代码，尚未在 Linux 真机执行
+       bwrap、namespace 和审批升级链路。README 不把“已实现”写成“已实测”。
+
+67. **deferred 审批跨 worker 重启恢复（2026-11-16）**：
+    ① §9.63 的槽位原先只在引擎内存中，worker 重启即丢失。`serve` 现在为每个 task 建
+       `<artifacts>/approval-slots/<task-slug>.json`，EngineConfig 启动时恢复该文件。
+    ② 文件同时保存 `expired` 请求与已经落成的 `deferred` 槽位：前者让重启后的迟到批复仍能
+       找到精确 detail，后者让下一次完全相同的 tool + args 仍能消费原决定。
+    ③ 每次 suspend / deferred / consume / cancel 后原子重写：".new" + fsync + rename；
+       Unix 权限 0600。文件只包含精确 detail、source req、decision 和绝对过期时间。
+    ④ 消费后立即持久化删除，重启后不能重新生成同一通行证；过期项在恢复时丢弃。
+    ⑤ 路径由 task slug 决定，不同 task 不共享槽位；task 名仍走 `cli::task::slug`，不可穿越
+       approval-slots 目录。
+    ⑥ 测试 `deferred_approvals_survive_a_board_restart` 覆盖 pending detail 重启、迟到决定
+       落槽、消费后再次恢复为空。
+    ⑦ 边界：store 损坏或版本不认识时引擎启动记录 error 并从空槽位开始，不会猜测或放宽授权；
+       这可能在磁盘损坏时丢功能，但不会伪造批准。
+
+68. **worker 外部 supervisor（2026-11-16）**：
+    ① `--rss-exit-mb` 让 worker 可被硬上限主动结束，但单一进程无法重启自己。新增
+       `harness/run-worker-supervised.sh`：运行子进程，普通非零或退出码 70 时按退避重启，
+       正常退出直接结束，重启预算耗尽后把最后一次退出码传回调用者。
+    ② supervisor 可读取 `--status-file`，在每次退出日志中标出 `hard_limit=yes/no`；它不修改
+       状态文件，不替 worker 伪造结果，也不把 hard-limit 当成成功。
+    ③ `run-demo.sh` 设置 `KESTREL_DEMO_SUPERVISE=1` 后通过 supervisor 启动 RD/QA；
+       重启次数与退避分别由 `KESTREL_DEMO_SUPERVISE_MAX_RESTARTS` /
+       `KESTREL_DEMO_SUPERVISE_BACKOFF_SECS` 控制。
+    ④ 验证边界：脚本已做 `bash -n`；没有在本轮启动四进程 demo，也没有制造真实 hard-limit
+       退出。supervisor 只管理单 worker，不是多 worker 编排器。
+
+69. **journal 审计保留策略最终决定（2026-11-16）**：
+    ① journal 是审计真相源，任何内核自动删除都会让 `replay_all()` 从“完整历史”退化为
+       “最近一部分历史”，且坏删除不会像坏写入那样触发 fail-closed。因此 Kestrel 明确不做
+       自动 purge。
+    ② 内置保留阶梯是：活文件有界轮转 → 已封闭段移出根目录 → 可选 gzip 压缩 → 库存、
+       覆盖链和记录级校验。历史在每个阶段都仍可重放。
+    ③ 外部备份、冷存储、最终删除属于运营者的离线保留策略；必须先复制归档目录并在外部证明
+       可恢复，之后由 Kestrel 之外的流程删除。内核不提供“顺手删旧账”的 flag。
+    ④ `journal-status --json/--check/--list` 提供执行外部策略所需的活文件、根段、归档段、
+       压缩字节、重复区间、覆盖断口与残留文件清单。
+    ⑤ 结论：归档压缩与保留治理闭环；磁盘占用仍由历史增长决定，这是审计系统的刻意成本，
+       不是未实现缺陷。
+
 ## 10 二期清单
 
 > 2026-11-13 更新：三期 RD/QA 在严格 `build_log` 下完成了真实端点联跑；构建日志由 SA
@@ -710,7 +762,7 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
 
 已落地（2026-10-28 起）：~~`ApproveMode::Bus`~~（授权表 + 超时 fail-closed + journal 审计，§9.20）、~~SA 判定升级到「工件 + 证据文件」~~（绝对路径存在性/非空核对，§9.20）、~~bus 重连重放~~（离线 session 停车补投 + 客户端自动重连；RPC 与「写入即死」的帧不重放，§9.21）、~~journal 快照/截断语义~~（检查点 + 归档段 + 崩溃安全轮转，§9.22）、~~多任务并行~~（task 命名空间三处同源 + 前缀寻址，§9.23）、~~openai-responses wire~~（第三条 v1 wire，金身 + fixture 验证，**真端点未实测**，§9.24）、~~journal 投影增量化与轮转触发~~（在线投影 = 全量重放 + 条数/字节双上限，§9.25）、~~一个引擎内真正并发地服务多个 task~~（改为「一 task 一引擎」的 worker 池，单活跃槽不动，§9.26）、~~`BudgetSpent` 的价格表~~（预留 → 结算两段式、按 token 换账单、无价退回名义值并报出来，§9.27；2026-11-03）、~~journal 轮转的**默认策略**~~（活文件 512 条 / 1 MiB 双上限、三态 CLI、生产与测试同一条 `rotate_at_boundary`，§9.28；2026-11-03）、~~证据的类型化~~（`file` / `test_log` / `diff` / `screenshot` 各自可在盘上反驳 + `--evidence-spec` 的 stage 要求，坏表硬失败，§9.29；2026-11-03）、~~审批批复的可靠投递~~（请求 at-least-once + 按 req 幂等 + 台账从 journal 播种，判定仍只一次，§9.30；2026-11-03）、~~批复到底有没有生效~~（回执 `approval_receipt` + `ApprovalAcked` 落账 + 到点撤摊，**没生效的批准不许记成生效**，§9.31；2026-11-03）。
 
-仍在清单上（审批已落地 at-least-once 投递、回执、重启补投和 24 小时跨回合单次槽位，见 §9.30 / §9.31 / §9.63；仍未做跨 worker 进程重启的 deferred waiter 恢复）：tree-sitter-bash 命令解析、execpolicy DSL（Starlark）、landlock/bwrap（Linux 沙箱）、TUI（行级 diff 形制，pi-tui 蓝本）、MCP 客户端、model-in-the-loop evals（含 openai-responses 的真端点实测，§9.24）、worker 池资源护栏的剩余部分（工具并发数由 `--max-parallel-tools` / `--max-worker-tools` 封顶，见 §9.46 / §9.48；内存准入/空闲回收、压力恢复、活动回合中断与进程自检硬退出已落地，见 §9.53 / §9.59 / §9.60 / §9.64 / §9.65；外部 watchdog 与真·多进程编排仍留给 harness 上层）、归档段的**保留/自动清理策略**（移动、gzip 压缩、预览、库存、健康检查与记录级校验已落地，见 §9.47 / §9.62；自动删除仍会撞上「这不是删除」的语义边界）。
+仍在清单上（审批已落地 at-least-once 投递、回执、重启补投、24 小时跨回合单次槽位与跨 worker 重启恢复，见 §9.30 / §9.31 / §9.63 / §9.67）：tree-sitter-bash 命令解析、execpolicy DSL（Starlark）、Linux bubblewrap 真机验证与端口级网络策略（实现见 §9.66，当前仅静态覆盖）、TUI（行级 diff 形制，pi-tui 蓝本）、MCP 客户端、model-in-the-loop evals（含 openai-responses 的真端点实测，§9.24）、worker 池资源护栏的剩余部分（工具并发数由 `--max-parallel-tools` / `--max-worker-tools` 封顶，见 §9.46 / §9.48；内存准入/空闲回收、压力恢复、活动回合中断、进程自检硬退出与外部 supervisor 已落地，见 §9.53 / §9.59 / §9.60 / §9.64 / §9.65 / §9.68；真·多进程编排仍留给 harness 上层）。归档自动删除已明确为非目标，保留策略见 §9.69。
 
 2026-11-04 联跑新添的两格同日落地（§9.33）：验证类 stage 的 FAIL 回跳给写者返工（带额度 `max_reworks`、带原因 `ref.rework`、每关 iter 跨回跳不清零），bash 用 `output_path` 参数交出可核对的 `test_log`（内核把 stdout/stderr 连 `exit: ExitStatus{...}` 一起写进那个文件）。下一格因此有了明确的落点：SA 只要去读那行 `exit:`，「形状」就能升级成「结论」——现在它还只证明「这份文件是测试汇总」。
 
