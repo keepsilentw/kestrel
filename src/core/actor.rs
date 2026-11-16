@@ -13,7 +13,7 @@ use tokio_util::task::AbortOnDropHandle;
 use super::approvals::ApprovalBoard;
 use super::events::{Event, MessageItem};
 use super::id::IdGen;
-use super::ops::{Op, Submission};
+use super::ops::{ApprovalCompletion, Op, Submission};
 use super::steering::Steering;
 use crate::provider::wire::{ModelMeta, ResolvedAuth, Transport, WireFormat};
 use crate::tools::ToolRegistry;
@@ -205,13 +205,13 @@ impl AgentHandle {
         self.submit(Op::Interrupt);
     }
 
-    /// Deliver an approval decision and report whether the engine accepted it.
-    /// A request that expired first has no waiter, so this returns `false`.
+    /// Deliver an approval decision and report whether a waiter consumed it,
+    /// whether it was deferred for an exact future call, or whether it is stale.
     pub async fn respond_to_approval(
         &self,
         req: String,
         decision: super::ops::ApprovalDecision,
-    ) -> bool {
+    ) -> ApprovalCompletion {
         let (ack_tx, ack_rx) = oneshot::channel();
         let op = Op::Approval {
             req,
@@ -219,9 +219,9 @@ impl AgentHandle {
             ack: Some(ack_tx),
         };
         if self.tx.send(Submission::new(op)).is_err() {
-            return false;
+            return ApprovalCompletion::Stale;
         }
-        ack_rx.await.unwrap_or(false)
+        ack_rx.await.unwrap_or(ApprovalCompletion::Stale)
     }
 
     /// Take the event stream (once). Consumer owns it afterwards.

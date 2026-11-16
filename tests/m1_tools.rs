@@ -564,7 +564,10 @@ async fn approval_reverse_request_roundtrip() {
         }
     }
     let req = approval_req.expect("ApprovalRequest emitted");
-    assert!(approvals.complete(&req, kestrel::core::ops::ApprovalDecision::AllowOnce));
+    assert_eq!(
+        approvals.complete(&req, kestrel::core::ops::ApprovalDecision::AllowOnce),
+        kestrel::core::ops::ApprovalCompletion::Applied
+    );
 
     let results = handle.await.unwrap();
     assert!(!results[0].1.is_error, "{:?}", results[0].1);
@@ -647,9 +650,114 @@ async fn bus_approval_without_answer_denies_on_deadline() {
     let (req, reason) = expired.expect("the timeout must say this request is dead");
     assert!(reason.contains("timed out"), "{reason}");
     assert!(!board.has_waiter(&req), "到点之后台账里不能还挂着等待者");
+    assert_eq!(
+        board.complete(&req, kestrel::core::ops::ApprovalDecision::AllowOnce),
+        kestrel::core::ops::ApprovalCompletion::Deferred,
+        "撤摊之后来的批复不能唤醒旧工具，只能进入精确匹配槽位"
+    );
+}
+
+/// A late decision is not a long-term pass: it is consumed by one exact
+/// tool+args call, emits an auditable reuse event, and cannot wake the expired
+/// original waiter.
+#[tokio::test]
+async fn a_deferred_approval_is_consumed_by_one_exact_future_call() {
+    let registry = ToolRegistry::new(vec![Arc::new(kestrel::tools::bash::Bash)]);
+    let mut ctx = ctx_for(
+        std::env::temp_dir(),
+        kestrel::tools::ApproveMode::Bus {
+            timeout: Duration::from_millis(80),
+        },
+    );
+    ctx.engine = Arc::new(kestrel::permissions::PermissionEngine::new(PolicyTable {
+        default: Decision::Ask,
+        rules: vec![],
+        forbidden_prefixes: vec![],
+    }));
+    let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel();
+    let emit: kestrel::tools::orchestrator::EmitFn = Arc::new(move |m| {
+        let _ = seen_tx.send(m);
+    });
+    let board = kestrel::core::approvals::ApprovalBoard::default();
+    let idgen = Arc::new(kestrel::core::id::SeqGen::new()) as Arc<dyn kestrel::core::id::IdGen>;
+    let call = || {
+        tool_call(
+            "a",
+            "bash",
+            serde_json::json!({"command": "echo deferred-approval-ok"}),
+        )
+    };
+
+    let first = dispatch_batch(
+        &registry,
+        &[call()],
+        &ctx,
+        &tokio_util::sync::CancellationToken::new(),
+        &emit,
+        &board,
+        &idgen,
+    )
+    .await
+    .into_iter()
+    .next()
+    .expect("one outcome")
+    .1;
+    assert!(first.is_error, "the first call times out");
+
+    let mut expired_req = None;
+    while let Ok(msg) = seen_rx.try_recv() {
+        if let EventMsg::ApprovalExpired { req, .. } = msg {
+            expired_req = Some(req);
+        }
+    }
+    let expired_req = expired_req.expect("the timeout names the request");
+    assert_eq!(
+        board.complete(
+            &expired_req,
+            kestrel::core::ops::ApprovalDecision::AllowOnce
+        ),
+        kestrel::core::ops::ApprovalCompletion::Deferred
+    );
+
+    let second = dispatch_batch(
+        &registry,
+        &[call()],
+        &ctx,
+        &tokio_util::sync::CancellationToken::new(),
+        &emit,
+        &board,
+        &idgen,
+    )
+    .await
+    .into_iter()
+    .next()
+    .expect("one outcome")
+    .1;
+    assert!(!second.is_error, "{:?}", second);
+    assert!(second.content_text().contains("deferred-approval-ok"));
+
+    let mut reused = false;
+    while let Ok(msg) = seen_rx.try_recv() {
+        if let EventMsg::ApprovalReused {
+            source_req,
+            decision,
+            ..
+        } = msg
+        {
+            assert_eq!(source_req, expired_req);
+            assert_eq!(decision, kestrel::core::ops::ApprovalDecision::AllowOnce);
+            reused = true;
+        }
+    }
+    assert!(reused, "the exact future call consumed the deferred slot");
     assert!(
-        !board.complete(&req, kestrel::core::ops::ApprovalDecision::AllowOnce),
-        "撤摊之后来的批复不能算生效"
+        board
+            .take_deferred(&serde_json::json!({
+                "tool": "bash",
+                "args": {"command": "echo deferred-approval-ok"}
+            }))
+            .is_none(),
+        "the slot is one-use"
     );
 }
 
@@ -717,9 +825,10 @@ async fn sandbox_escalation_timeout_retires_the_approval_waiter() {
     let (req, reason) = expired.expect("the timeout must retire the request");
     assert!(reason.contains("timed out"), "{reason}");
     assert!(!board.has_waiter(&req), "the waiter must be gone");
-    assert!(
-        !board.complete(&req, kestrel::core::ops::ApprovalDecision::AllowOnce),
-        "a late allow must not report that it woke the tool"
+    assert_eq!(
+        board.complete(&req, kestrel::core::ops::ApprovalDecision::AllowOnce),
+        kestrel::core::ops::ApprovalCompletion::Deferred,
+        "a late allow is deferred, not reported as waking the expired tool"
     );
 }
 

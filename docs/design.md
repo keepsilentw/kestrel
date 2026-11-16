@@ -27,7 +27,7 @@
 > 归档链的断口与重复段的隔离出口（§9.56）、记录层的深度校验 `--verify`（§9.57）；
 > 代码部分都过了 fmt / clippy / test；
 > **真端点联跑未重跑**，demo 的接法只到语法与 flag 解析这一层。
-> **Metrics** — src 51 files / 20257 lines · tests 9 files / 3837 lines · 279 tests (lib 218 + bin 6 + integration 55)
+> **Metrics** — src 51 files / 20899 lines · tests 9 files / 3946 lines · 283 tests (lib 221 + bin 6 + integration 56)
 > **Integration** — core_loop 6 / discipline 2 / m1_tools 12 / m2_session 6 / m4_bus 15 / m5_pool 8 / sandbox_e2e 4 / wire_anthropic 2
 > 规模已过 plan 预算（10-13k）的上沿：多出来的部分几乎都花在「取消安全」与「对账」这两条纪律上。
 > 上面两行数字由 `tests/discipline.rs::metrics_lines_match_the_tree` 对照源码树重算校验——
@@ -634,6 +634,42 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
     ⑥ 边界：这是“运营者显式信任一个命令前缀”，不是自动识别构建系统，也不是命令语义证明；
        前缀仍可能对应一个只 `exit 0` 的脚本，真实性边界与 §9.58 相同。
 
+62. **归档段 gzip 压缩（2026-11-16）**：
+    ① `journal-archive --compress` 把移出根目录的已封闭段写成 `.jsonl.gz`。段仍按覆盖区间
+       命名，`replay_all()`、覆盖链检查、`--verify` 与状态库存同时识别压缩和未压缩段。
+    ② 压缩不是重新定义历史。流程是 `gzip -c` → 同目录 `.new` 临时文件 → fsync → `gzip -dc`
+       解压 → 与源 JSONL 逐字节比较 → rename 发布 → 移除源文件。比较或发布失败时源段保留；
+       崩溃留下 `.new` 时健康检查可见。
+    ③ 同一目录内若同时存在同区间 `.jsonl` 与 `.jsonl.gz`，普通 JSONL 副本优先，避免一次
+       中断的清理把读取结果取决于目录枚举顺序。跨目录仍有原来的“根目录优先”规则。
+    ④ `--dry-run --compress` 使用与真实执行相同的计划函数，目标路径直接显示 `.gz`；归档目录
+       已有同区间段时在任何变更前整体拒绝。
+    ⑤ 测试 `compressed_archive_preserves_history_and_verifies` 覆盖压缩计划、源段移除、
+       `replay_all()` 状态等价、库存识别与 `--verify`。
+    ⑥ 边界：压缩依赖系统 `gzip`，不是内置算法；它降低段文件占用，但不提供自动删除或保留
+       策略。若 `gzip` 不可用，压缩路径失败并保留原段。
+
+63. **跨回合一次性审批槽位（2026-11-16）**：
+    ① §9.31⑤ 明确拒绝“迟到 allow 自动兑现下一次同类调用”，因为那会把一次批准变成长期
+       通行证。这里加入的槽位不是放宽旧语义：它只在原审批窗口到点后保留 **24 小时**，绑定
+       完整 tool + args 的规范化 JSON，并且只能消费一次。相似命令、同工具不同参数都不匹配。
+    ② 审批板打开请求时保存精确 detail；`abandon` 不删除这份事实，而是转入带过期时间的
+       expired 表。迟到批复到达时，旧 waiter 仍不会被唤醒，`ApprovalCompletion::Deferred`
+       表示决定只进入未来槽位；worker 回执仍是 `applied:false`。
+    ③ 下一回合出现完全相同调用时，orchestrator 先取槽位；命中则发
+       `ApprovalReused{source_req, decision, detail}`，不重新询问审批者。槽位立即删除；
+       事件随工件落账，并向原 `req` 补发 `applied:true` 回执，SA 的强弱合并会把原请求
+       更正为最终生效。
+    ④ worker 的请求路由在超时后由 `ApprovalClosed` 改为 `ApprovalDeferred`，保留 24 小时；
+       pump 每 60 秒清理过期路由。task 退休时其路由仍随 task 一起释放，不跨 task 复用批准。
+    ⑤ 安全默认：同一 `req` 的重复迟到批复允许重投；若出现矛盾，`Deny` 覆盖 `AllowOnce`，
+       槽位最终按 deny 落账。超过 TTL 的批复返回 `Stale`，不会形成永久批准。
+    ⑥ 测试覆盖审批板精确匹配、单次消费、过期、矛盾 fail-closed，orchestrator 的未来调用
+       消费与路由在 defer 后仍可送达。
+    ⑦ 边界：这解决的是“人工晚批后，下一回合同一调用如何使用这次决定”，不是跨进程持久化
+       waiter。worker 进程重启仍会丢失内存槽位；审批 journal 能证明曾收到决定，但新进程不会
+       自动把旧决定执行到新调用上。
+
 ## 10 二期清单
 
 > 2026-11-13 更新：三期 RD/QA 在严格 `build_log` 下完成了真实端点联跑；构建日志由 SA
@@ -642,7 +678,7 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
 
 已落地（2026-10-28 起）：~~`ApproveMode::Bus`~~（授权表 + 超时 fail-closed + journal 审计，§9.20）、~~SA 判定升级到「工件 + 证据文件」~~（绝对路径存在性/非空核对，§9.20）、~~bus 重连重放~~（离线 session 停车补投 + 客户端自动重连；RPC 与「写入即死」的帧不重放，§9.21）、~~journal 快照/截断语义~~（检查点 + 归档段 + 崩溃安全轮转，§9.22）、~~多任务并行~~（task 命名空间三处同源 + 前缀寻址，§9.23）、~~openai-responses wire~~（第三条 v1 wire，金身 + fixture 验证，**真端点未实测**，§9.24）、~~journal 投影增量化与轮转触发~~（在线投影 = 全量重放 + 条数/字节双上限，§9.25）、~~一个引擎内真正并发地服务多个 task~~（改为「一 task 一引擎」的 worker 池，单活跃槽不动，§9.26）、~~`BudgetSpent` 的价格表~~（预留 → 结算两段式、按 token 换账单、无价退回名义值并报出来，§9.27；2026-11-03）、~~journal 轮转的**默认策略**~~（活文件 512 条 / 1 MiB 双上限、三态 CLI、生产与测试同一条 `rotate_at_boundary`，§9.28；2026-11-03）、~~证据的类型化~~（`file` / `test_log` / `diff` / `screenshot` 各自可在盘上反驳 + `--evidence-spec` 的 stage 要求，坏表硬失败，§9.29；2026-11-03）、~~审批批复的可靠投递~~（请求 at-least-once + 按 req 幂等 + 台账从 journal 播种，判定仍只一次，§9.30；2026-11-03）、~~批复到底有没有生效~~（回执 `approval_receipt` + `ApprovalAcked` 落账 + 到点撤摊，**没生效的批准不许记成生效**，§9.31；2026-11-03）。
 
-仍在清单上（审批已闭环到「有没有生效」这一层：请求 at-least-once、批复有回执、未回执的批复重启后补投一次。剩下的是**跨回合挂起的审批槽位**——「SA 下班、明早再批」需要未决请求的第二份真相与新的取消语义，见 §9.31⑤）：tree-sitter-bash 命令解析、execpolicy DSL（Starlark）、landlock/bwrap（Linux 沙箱）、TUI（行级 diff 形制，pi-tui 蓝本）、MCP 客户端、model-in-the-loop evals（含 openai-responses 的真端点实测，§9.24）、worker 池资源护栏的剩余部分（工具并发数由 `--max-parallel-tools` / `--max-worker-tools` 封顶，见 §9.46 / §9.48；内存是 `--max-rss-mb` 的**软**准入门槛，超限后已会回收持续空闲的引擎，见 §9.53 / §9.59；**活动回合的内存回收**、强制 kill 式硬上限与真·多进程编排仍留给 harness 上层）、归档段的**压缩与保留策略**（离线移动 / 预览 / 库存 / 健康检查已由 `journal-archive` + `journal-status` 落地，见 §9.47；磁盘占用仍只增不减，自动删除会撞上「这不是删除」的语义边界）。
+仍在清单上（审批已落地 at-least-once 投递、回执、重启补投和 24 小时跨回合单次槽位，见 §9.30 / §9.31 / §9.63；仍未做跨 worker 进程重启的 deferred waiter 恢复）：tree-sitter-bash 命令解析、execpolicy DSL（Starlark）、landlock/bwrap（Linux 沙箱）、TUI（行级 diff 形制，pi-tui 蓝本）、MCP 客户端、model-in-the-loop evals（含 openai-responses 的真端点实测，§9.24）、worker 池资源护栏的剩余部分（工具并发数由 `--max-parallel-tools` / `--max-worker-tools` 封顶，见 §9.46 / §9.48；内存是 `--max-rss-mb` 的**软**准入门槛，超限后已会回收持续空闲的引擎，见 §9.53 / §9.59；**活动回合的内存回收**、强制 kill 式硬上限与真·多进程编排仍留给 harness 上层）、归档段的**保留/自动清理策略**（移动、gzip 压缩、预览、库存、健康检查与记录级校验已落地，见 §9.47 / §9.62；自动删除仍会撞上「这不是删除」的语义边界）。
 
 2026-11-04 联跑新添的两格同日落地（§9.33）：验证类 stage 的 FAIL 回跳给写者返工（带额度 `max_reworks`、带原因 `ref.rework`、每关 iter 跨回跳不清零），bash 用 `output_path` 参数交出可核对的 `test_log`（内核把 stdout/stderr 连 `exit: ExitStatus{...}` 一起写进那个文件）。下一格因此有了明确的落点：SA 只要去读那行 `exit:`，「形状」就能升级成「结论」——现在它还只证明「这份文件是测试汇总」。
 

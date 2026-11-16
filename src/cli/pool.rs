@@ -29,8 +29,9 @@ use crate::cli::serve::{
 };
 use crate::cli::task::{artifact_name, task_of};
 use crate::core::actor::AgentHandle;
+use crate::core::approvals::DEFAULT_DEFERRED_APPROVAL_TTL;
 use crate::core::events::{Event, EventMsg, MessageItem};
-use crate::core::ops::ApprovalDecision;
+use crate::core::ops::{ApprovalCompletion, ApprovalDecision};
 use crate::provider::wire::{StopReason, Usage};
 use crate::tools::ApproveMode;
 
@@ -64,6 +65,11 @@ pub enum Outbound {
     },
     /// Turn over: the request can no longer be answered meaningfully.
     ApprovalClosed {
+        req: String,
+    },
+    /// The live waiter expired, but the engine retained the exact request for a
+    /// bounded one-use cross-turn slot. Keep routing replies to that task.
+    ApprovalDeferred {
         req: String,
     },
     /// An idle worker PROPOSING its own retirement. Only the pump may drop the
@@ -101,7 +107,7 @@ pub enum Action {
 #[derive(Default)]
 pub struct Router {
     tasks: HashSet<String>,
-    req_owner: HashMap<String, String>,
+    req_owner: HashMap<String, ApprovalRoute>,
     delivered: HashMap<String, u64>,
     idle_since: HashMap<String, Instant>,
     max_tasks: usize,
@@ -116,6 +122,11 @@ pub struct Router {
     /// turns with it, and `setrlimit`-style hard caps turn an overshoot into a
     /// random allocation failure inside somebody's tool call.
     draining: Option<String>,
+}
+
+struct ApprovalRoute {
+    task: String,
+    expires_at: Instant,
 }
 
 impl Router {
@@ -214,7 +225,19 @@ impl Router {
     }
 
     pub fn on_approval_opened(&mut self, req: &str, task: &str) {
-        self.req_owner.insert(req.to_string(), task.to_string());
+        self.req_owner.insert(
+            req.to_string(),
+            ApprovalRoute {
+                task: task.to_string(),
+                expires_at: Instant::now() + DEFAULT_DEFERRED_APPROVAL_TTL,
+            },
+        );
+    }
+
+    pub fn on_approval_deferred(&mut self, req: &str) {
+        if let Some(route) = self.req_owner.get_mut(req) {
+            route.expires_at = Instant::now() + DEFAULT_DEFERRED_APPROVAL_TTL;
+        }
     }
 
     /// Replies are routed by request id and never broadcast: an `allow` that
@@ -223,11 +246,15 @@ impl Router {
         let Some(req) = req else {
             return Action::Drop("approval reply without a req id".to_string());
         };
-        match self.req_owner.remove(req) {
-            Some(task) => Action::Reply {
-                task,
+        match self.req_owner.get(req) {
+            Some(route) if route.expires_at >= Instant::now() => Action::Reply {
+                task: route.task.clone(),
                 req: req.to_string(),
             },
+            Some(_) => {
+                self.req_owner.remove(req);
+                Action::Drop(format!("deferred approval {req} expired"))
+            }
             None => Action::Drop(format!("no open request {req}")),
         }
     }
@@ -241,7 +268,17 @@ impl Router {
     }
 
     pub fn open_requests(&self) -> usize {
-        self.req_owner.len()
+        self.req_owner
+            .values()
+            .filter(|route| route.expires_at >= Instant::now())
+            .count()
+    }
+
+    pub fn prune_expired_requests(&mut self) -> usize {
+        let before = self.req_owner.len();
+        let now = Instant::now();
+        self.req_owner.retain(|_, route| route.expires_at >= now);
+        before - self.req_owner.len()
     }
 
     /// Release one task slot. Retirement frees an engine, never history: the
@@ -253,7 +290,7 @@ impl Router {
         if !self.tasks.remove(task) {
             return false;
         }
-        self.req_owner.retain(|_, owner| owner != task);
+        self.req_owner.retain(|_, route| route.task != task);
         self.delivered.remove(task);
         self.idle_since.remove(task);
         self.retired_total += 1;
@@ -339,6 +376,7 @@ struct OpenApproval {
 /// busy again before its engine is released.
 const PRESSURE_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 const PRESSURE_IDLE_GRACE: Duration = Duration::from_secs(5);
+const APPROVAL_ROUTE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 /// Resume below 80% of the ceiling. The gap between enter and resume is
 /// deliberate hysteresis: a worker hovering at the ceiling must not flap
 /// between accepting and rejecting tasks every sample.
@@ -369,6 +407,8 @@ pub async fn run_pool(
     status_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut pressure_tick = tokio::time::interval(PRESSURE_CHECK_INTERVAL);
     pressure_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut approval_route_tick = tokio::time::interval(APPROVAL_ROUTE_SWEEP_INTERVAL);
+    approval_route_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // A dedicated reader task, not a `select!` arm: when select! loses a race it
     // drops the losing future, and a frame that was already on its way would be
@@ -408,6 +448,7 @@ pub async fn run_pool(
                     continue;
                 }
                 if frame.payload["type"].as_str() == Some("approval_decision") {
+                    router.prune_expired_requests();
                     let action = router.on_approval_reply(frame.payload["req"].as_str());
                     match action {
                         Action::Reply { task, req } => {
@@ -497,6 +538,7 @@ pub async fn run_pool(
                     Some(Outbound::Notify { session, payload }) => client.notify(&session, payload),
                     Some(Outbound::ApprovalOpened { req, task }) => router.on_approval_opened(&req, &task),
                     Some(Outbound::ApprovalClosed { req }) => router.close_request(&req),
+                    Some(Outbound::ApprovalDeferred { req }) => router.on_approval_deferred(&req),
                     Some(Outbound::TurnFinished { task, generation }) => {
                         let _ = router.on_turn_finished(&task, generation);
                     }
@@ -544,6 +586,12 @@ pub async fn run_pool(
                         }
                     }
                     joins.retain(|join| !join.is_finished());
+                }
+            }
+            _ = approval_route_tick.tick() => {
+                let expired = router.prune_expired_requests();
+                if expired > 0 {
+                    tracing::debug!("pump: pruned {expired} expired approval route(s)");
                 }
             }
             _ = status_tick.tick(), if cfg.status_file.is_some() => {
@@ -736,12 +784,31 @@ fn spawn_worker(
                             generation,
                         }) => (sender, payload, generation),
                         Some(TaskMsg::Approval { req, decision, by }) => {
-                            // a reply with no turn running has nobody to wake
+                            let completion =
+                                handle.respond_to_approval(req.clone(), decision).await;
+                            let (applied, reason) = match completion {
+                                ApprovalCompletion::Applied => (true, "the waiting tool was woken"),
+                                ApprovalCompletion::Deferred => {
+                                    (false, "stored as a one-use deferred approval")
+                                }
+                                ApprovalCompletion::Stale => {
+                                    (false, "no waiter or deferred slot accepted it")
+                                }
+                            };
                             tracing::warn!(
-                                "task {task}: late {} reply {req} from {by} is dropped, \
-                                 not queued",
+                                "task {task}: late {} reply {req} from {by}: {reason}",
                                 decision_name(decision)
                             );
+                            let _ = out_tx.send(Outbound::Notify {
+                                session: by,
+                                payload: approval_receipt_frame(
+                                    &cfg.session,
+                                    &req,
+                                    decision,
+                                    applied,
+                                    reason,
+                                ),
+                            });
                             continue;
                         }
                         None => break,
@@ -826,6 +893,33 @@ fn spawn_worker(
                             } => {
                                 result_text = text;
                             }
+                            EventMsg::ApprovalReused {
+                                source_req,
+                                decision,
+                                detail,
+                            } => {
+                                let _ = out_tx.send(Outbound::ApprovalClosed {
+                                    req: source_req.clone(),
+                                });
+                                approvals.push(serde_json::json!({
+                                    "req": source_req,
+                                    "decision": decision_name(decision),
+                                    "by": approver.clone(),
+                                    "applied": true,
+                                    "reused": true,
+                                    "detail": detail,
+                                }));
+                                let _ = out_tx.send(Outbound::Notify {
+                                    session: approver.clone(),
+                                    payload: approval_receipt_frame(
+                                        &cfg.session,
+                                        &source_req,
+                                        decision,
+                                        true,
+                                        "the deferred approval was consumed by an exact call",
+                                    ),
+                                });
+                            }
                             // 等待者已经撤摊（到点或被中断）：停止重发、回执一句
                             // 「没生效」，并把它记进工件。不记的话，后来那份重复的
                             // 批复就会在账上伪装成「曾经生效过」。
@@ -834,7 +928,7 @@ fn spawn_worker(
                                     .remove(&req)
                                     .map(|waiting| waiting.to)
                                     .unwrap_or_else(|| approver.clone());
-                                let _ = out_tx.send(Outbound::ApprovalClosed { req: req.clone() });
+                                let _ = out_tx.send(Outbound::ApprovalDeferred { req: req.clone() });
                                 approvals.push(serde_json::json!({
                                     "req": req,
                                     "decision": "expired",
@@ -913,43 +1007,128 @@ fn spawn_worker(
                         match msg {
                             Some(TaskMsg::Approval { req, decision, by }) => {
                                 if open.remove(&req).is_some() {
-                                    let applied =
+                                    let completion =
                                         handle.respond_to_approval(req.clone(), decision).await;
-                                    let _ = out_tx.send(Outbound::ApprovalClosed { req: req.clone() });
-                                    if applied {
-                                        approvals.push(serde_json::json!({
-                                            "req": req,
-                                            "decision": decision_name(decision),
-                                            "by": by,
-                                            "applied": true,
-                                        }));
-                                        // 生效了也要回执：审批者那条「谁放宽了沙箱」的记录
-                                        // 只有拿到这句话才算闭环
-                                        let _ = out_tx.send(Outbound::Notify {
-                                            session: by,
-                                            payload: approval_receipt_frame(
-                                                &cfg.session,
-                                                &req,
-                                                decision,
-                                                true,
-                                                "the waiting tool was woken",
-                                            ),
-                                        });
-                                    } else {
-                                        // 本地 open 表与引擎的等待者之间存在事件竞态。
-                                        // 引擎拒绝接收就是事实来源；随后到达的
-                                        // ApprovalExpired 会落 expired 记录并回执 false。
-                                        tracing::warn!(
-                                            "task {task}: approval {req} arrived after its \
-                                             waiter expired; not booking it as applied"
-                                        );
+                                    match completion {
+                                        ApprovalCompletion::Applied => {
+                                            let _ = out_tx
+                                                .send(Outbound::ApprovalClosed { req: req.clone() });
+                                            approvals.push(serde_json::json!({
+                                                "req": req,
+                                                "decision": decision_name(decision),
+                                                "by": by,
+                                                "applied": true,
+                                            }));
+                                            let _ = out_tx.send(Outbound::Notify {
+                                                session: by,
+                                                payload: approval_receipt_frame(
+                                                    &cfg.session,
+                                                    &req,
+                                                    decision,
+                                                    true,
+                                                    "the waiting tool was woken",
+                                                ),
+                                            });
+                                        }
+                                        ApprovalCompletion::Deferred => {
+                                            let _ = out_tx.send(Outbound::ApprovalDeferred {
+                                                req: req.clone(),
+                                            });
+                                            tracing::warn!(
+                                                "task {task}: approval {req} was stored for an \
+                                                 exact future call; the original waiter expired"
+                                            );
+                                            let _ = out_tx.send(Outbound::Notify {
+                                                session: by,
+                                                payload: approval_receipt_frame(
+                                                    &cfg.session,
+                                                    &req,
+                                                    decision,
+                                                    false,
+                                                    "stored as a one-use deferred approval",
+                                                ),
+                                            });
+                                        }
+                                        ApprovalCompletion::Stale => {
+                                            let _ = out_tx
+                                                .send(Outbound::ApprovalClosed { req: req.clone() });
+                                            tracing::warn!(
+                                                "task {task}: approval {req} is stale; neither a \
+                                                 waiter nor a deferred slot accepted it"
+                                            );
+                                            let _ = out_tx.send(Outbound::Notify {
+                                                session: by,
+                                                payload: approval_receipt_frame(
+                                                    &cfg.session,
+                                                    &req,
+                                                    decision,
+                                                    false,
+                                                    "no waiter or deferred slot accepted it",
+                                                ),
+                                            });
+                                        }
                                     }
                                 } else {
-                                    // 已经答过，或回合结束时就关掉了：同一个 req 的
-                                    // 第二份 allow 绝不能再把工具跑一遍
-                                    tracing::debug!(
-                                        "task {task}: duplicate or stale approval reply {req} ignored"
-                                    );
+                                    let completion =
+                                        handle.respond_to_approval(req.clone(), decision).await;
+                                    match completion {
+                                        ApprovalCompletion::Deferred => {
+                                            tracing::warn!(
+                                                "task {task}: late approval {req} was stored for \
+                                                 one exact future call"
+                                            );
+                                            let _ = out_tx.send(Outbound::Notify {
+                                                session: by,
+                                                payload: approval_receipt_frame(
+                                                    &cfg.session,
+                                                    &req,
+                                                    decision,
+                                                    false,
+                                                    "stored as a one-use deferred approval",
+                                                ),
+                                            });
+                                        }
+                                        ApprovalCompletion::Applied => {
+                                            // A waiter existed in the engine even though the
+                                            // worker's local mirror had already expired. Trust
+                                            // the engine and close the audit loop truthfully.
+                                            let _ = out_tx
+                                                .send(Outbound::ApprovalClosed { req: req.clone() });
+                                            approvals.push(serde_json::json!({
+                                                "req": req,
+                                                "decision": decision_name(decision),
+                                                "by": by,
+                                                "applied": true,
+                                            }));
+                                            let _ = out_tx.send(Outbound::Notify {
+                                                session: by,
+                                                payload: approval_receipt_frame(
+                                                    &cfg.session,
+                                                    &req,
+                                                    decision,
+                                                    true,
+                                                    "the waiting tool was woken",
+                                                ),
+                                            });
+                                        }
+                                        ApprovalCompletion::Stale => {
+                                            let _ = out_tx
+                                                .send(Outbound::ApprovalClosed { req: req.clone() });
+                                            tracing::debug!(
+                                                "task {task}: duplicate or stale approval reply {req} ignored"
+                                            );
+                                            let _ = out_tx.send(Outbound::Notify {
+                                                session: by,
+                                                payload: approval_receipt_frame(
+                                                    &cfg.session,
+                                                    &req,
+                                                    decision,
+                                                    false,
+                                                    "no waiter or deferred slot accepted it",
+                                                ),
+                                            });
+                                        }
+                                    }
                                 }
                             }
                             Some(TaskMsg::Bell {
@@ -1094,7 +1273,17 @@ mod tests {
                 req: "req-7".into()
             }
         );
-        // the same reply twice: the second one has no owner
+        // at-least-once may deliver the same reply twice. Keep routing until
+        // the engine says the request is closed; the engine dedups or upgrades
+        // a deferred decision rather than executing twice.
+        assert_eq!(
+            r.on_approval_reply(Some("req-7")),
+            Action::Reply {
+                task: "t2".into(),
+                req: "req-7".into()
+            }
+        );
+        r.close_request("req-7");
         assert!(matches!(
             r.on_approval_reply(Some("req-7")),
             Action::Drop(_)
@@ -1109,6 +1298,17 @@ mod tests {
         assert_eq!(r.open_requests(), 1);
         r.close_request("req-8");
         assert_eq!(r.open_requests(), 0);
+        // A live waiter that expired keeps ownership long enough for a bounded
+        // cross-turn decision to reach the engine's deferred slot.
+        r.on_approval_opened("req-9", "t1");
+        r.on_approval_deferred("req-9");
+        assert_eq!(
+            r.on_approval_reply(Some("req-9")),
+            Action::Reply {
+                task: "t1".into(),
+                req: "req-9".into()
+            }
+        );
     }
 
     /// A soft ceiling must not strand work that is already running: drain mode

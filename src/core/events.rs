@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::id::ReqId;
+use super::ops::ApprovalDecision;
 use crate::provider::wire::{StopReason, ToolContent, Usage};
 
 /// One conversation item. Persisted projection lives in the session tree (M2);
@@ -114,6 +115,14 @@ pub enum EventMsg {
     ApprovalRequest {
         req: ReqId,
         prompt: String,
+        detail: Value,
+    },
+    /// A one-use decision deferred from an expired request was consumed by an
+    /// exact tool+args match. This is auditable without pretending the original
+    /// waiter was awake.
+    ApprovalReused {
+        source_req: ReqId,
+        decision: ApprovalDecision,
         detail: Value,
     },
     /// The approval window elapsed (or its wait was cancelled): **nobody is

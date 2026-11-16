@@ -48,9 +48,10 @@ async fn prepare_one(
                 }
                 ApproveMode::HeadlessAllow => ApprovalDecision::AllowOnce,
                 ApproveMode::Bus { timeout } => {
-                    match request_bus_approval(
+                    let detail = approval_detail(&call.name, &call.args, detail);
+                    match await_bus_approval(
                         prompt.clone(),
-                        approval_detail(&call.name, &call.args, detail),
+                        detail,
                         timeout,
                         emit,
                         approvals,
@@ -118,20 +119,22 @@ async fn request_bus_approval(
     token: &CancellationToken,
 ) -> Waited {
     let req = idgen.next_id();
+    // Register the waiter before publishing the request: a very fast approver
+    // must not lose its decision to a not-yet-open oneshot.
+    let rx = approvals.open_with_detail(req.clone(), detail.clone());
     emit(EventMsg::ApprovalRequest {
         req: req.clone(),
         prompt,
-        detail,
+        detail: detail.clone(),
     });
-    let rx = approvals.open_with(req.clone());
     let waited = wait_decision(rx, token, timeout).await;
     match waited {
         Waited::Decision(d) => Waited::Decision(d),
         Waited::TimedOut => {
             // A concurrent reply may already have removed the waiter even
             // though the tool timed out before consuming it. The expired event
-            // is still required so the worker can close the request and emit a
-            // truthful `applied: false` receipt.
+            // is still required so the worker can retain the deferred route and
+            // emit a truthful `applied: false` receipt.
             let _ = approvals.abandon(&req);
             emit(EventMsg::ApprovalExpired {
                 req,
@@ -148,6 +151,29 @@ async fn request_bus_approval(
             Waited::Cancelled
         }
     }
+}
+
+/// Prefer a one-use decision deferred from an exact earlier request. Otherwise
+/// open a fresh bus request. This path is shared by tool-policy approval and
+/// sandbox escalation, so both use the same exact-match semantics.
+async fn await_bus_approval(
+    prompt: String,
+    detail: Value,
+    timeout: Duration,
+    emit: &EmitFn,
+    approvals: &ApprovalBoard,
+    idgen: &Arc<dyn IdGen>,
+    token: &CancellationToken,
+) -> Waited {
+    if let Some((source_req, decision)) = approvals.take_deferred(&detail) {
+        emit(EventMsg::ApprovalReused {
+            source_req,
+            decision,
+            detail,
+        });
+        return Waited::Decision(decision);
+    }
+    request_bus_approval(prompt, detail, timeout, emit, approvals, idgen, token).await
 }
 
 /// How a bus-approval wait can end. A silent approver never means an
@@ -255,15 +281,16 @@ async fn run_one(
                 }
                 ApproveMode::HeadlessAllow => ApprovalDecision::AllowOnce,
                 ApproveMode::Bus { timeout } => {
-                    match request_bus_approval(
+                    let detail = approval_detail(
+                        &call.name,
+                        &call.args,
+                        serde_json::json!({ "stderr": stderr, "call_id": call.call_id }),
+                    );
+                    match await_bus_approval(
                         "sandboxed command failed (suspected sandbox denial); \
                          rerun outside the sandbox?"
                             .into(),
-                        approval_detail(
-                            &call.name,
-                            &call.args,
-                            serde_json::json!({ "stderr": stderr, "call_id": call.call_id }),
-                        ),
+                        detail,
                         timeout,
                         emit,
                         approvals,

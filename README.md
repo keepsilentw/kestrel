@@ -2,9 +2,9 @@
 
 为星型多 Agent harness 写的 Rust harness kernel：引擎 + wire 层 + 工具/权限/沙箱 + 会话 + 总线/journal + CLI/配置。设计文档（中文）见本仓库 `docs/design.md`。
 
-**Metrics** — src 51 files / 20257 lines · tests 9 files / 3837 lines · 279 tests (lib 218 + bin 6 + integration 55)
+**Metrics** — src 51 files / 20899 lines · tests 9 files / 3946 lines · 283 tests (lib 221 + bin 6 + integration 56)
 
-Status: M0-M4 complete + 二期主体落地。三期于 2026-11-10 开工：worker 池的并发执行护栏同时提供每 task 的 `--max-parallel-tools`（缺省 4）和 worker 全局的 `--max-worker-tools`（缺省 8），任一为 `0` 时显式关闭对应上限；两级限制都不改变源序回写、串行工具写锁和取消语义（design §9.46 / §9.48）。journal 的已封闭段可移入 `<journal>.segments/`，`replay_all()` 同时读取两处，移动而非删除历史（§9.47）；`journal-archive --keep/--dry-run` 与 `journal-status --json/--check/--list/--approvals` 把归档的预览、执行、库存与审批链都变成可查项。`serve --status-file` 原子发布活动 task、空闲 task、未决审批、当前/峰值 RSS 与各级上限（§9.52），`serve --max-rss-mb` 给整个 worker 一条内存**软**上限：当前 RSS 越线后进入 drain，新 task 被显式拒绝、在跑的回合跑完；已经完成且持续空闲的 task 引擎会被回收，当前 RSS 降到阈值的 80% 以下后自动恢复接单（§9.53 / §9.59 / §9.60）。`serve --task-idle-timeout-secs` 让空闲 task 退休引擎、释放 `--max-tasks` 的 slot，同一 task 再响时重开同一棵会话树（§9.55）。名义成本分类已细到 `peer × reason`（§9.49），判定 issue 已改为自带 `Artifact | Turn` 归因的类型（§9.50）。2026-11-13 的三期 RD/QA 真实端点联跑已 `pipeline complete`，四个 stage 的测试证据均为 `26 passed / 0 failed`，账本 `0.1593 cny, of which 0.0000 nominal`；同一轮把 `build` 从任意文件证据收紧为真实 `build_log`（§9.58）。剩下的未完成边界：活动回合的被动内存回收与强制 kill 式硬上限、归档段压缩、跨回合审批槽位、Linux 沙箱、SA/Responses 真端点验证。上面那行数字由 `tests/discipline.rs` 与源码树对照校验。
+Status: M0-M4 complete + 二期主体落地。三期于 2026-11-10 开工：worker 池的并发执行护栏同时提供每 task 的 `--max-parallel-tools`（缺省 4）和 worker 全局的 `--max-worker-tools`（缺省 8），任一为 `0` 时显式关闭对应上限；两级限制都不改变源序回写、串行工具写锁和取消语义（design §9.46 / §9.48）。journal 的已封闭段可移入 `<journal>.segments/`，可选 gzip 压缩为 `.jsonl.gz`；`replay_all()` 同时读取两处和两种格式，移动/压缩前后完整历史等价（§9.47 / §9.62）。`journal-archive --keep/--dry-run/--compress` 与 `journal-status --json/--check/--list/--approvals` 把归档的预览、压缩、库存与审批链都变成可查项。`serve --status-file` 原子发布活动 task、空闲 task、未决审批、当前/峰值 RSS 与各级上限（§9.52），`serve --max-rss-mb` 给整个 worker 一条内存**软**上限：当前 RSS 越线后进入 drain，新 task 被显式拒绝、在跑的回合跑完；已经完成且持续空闲的 task 引擎会被回收，当前 RSS 降到阈值的 80% 以下后自动恢复接单（§9.53 / §9.59 / §9.60）。`serve --task-idle-timeout-secs` 让空闲 task 退休引擎、释放 `--max-tasks` 的 slot，同一 task 再响时重开同一棵会话树（§9.55）。审批批复支持 24 小时内的跨回合一次性槽位：精确 tool + args 匹配、单次消费、矛盾批复 fail-closed（§9.63）。名义成本分类已细到 `peer × reason`（§9.49），判定 issue 已改为自带 `Artifact | Turn` 归因的类型（§9.50）。2026-11-13 的三期 RD/QA 真实端点联跑已 `pipeline complete`，四个 stage 的测试证据均为 `26 passed / 0 failed`，账本 `0.1593 cny, of which 0.0000 nominal`；同一轮把 `build` 从任意文件证据收紧为真实 `build_log`（§9.58）。剩下的未完成边界：活动回合的被动内存回收与强制 kill 式硬上限、归档保留/自动清理策略、Linux 沙箱、SA/Responses 真端点验证。上面那行数字由 `tests/discipline.rs` 与源码树对照校验。
 
 Verification note: the latest real-endpoint run used the deterministic SA build preflight. It generated a kernel-written `build.log` with command and exit 0, then completed `dev` / `review` / `test` / `build`; all four stages reported `26 passed / 0 failed`, ledger `0.1593 cny, of which 0.0000 nominal`, and `pipeline complete`. Earlier model-only build attempts correctly failed at the iteration cap; see design §9.58.
 
@@ -180,16 +180,18 @@ Ask——审批不能放宽角色的写范围。`test_log` 的汇总表认 cargo
 幂等：答过的请求原样重发上次那个批复，不重判、也不再落第二对记录；SA 重启后台账从 journal
 播种，仍然认得「这个 req 我答过了」。worker 也去重：同一个 `req` 的第二份 `allow` 只记一次、
 只唤醒一次工具。语义没动——到点仍是 deny，只是那现在意味着「问了三次都没人答」。也没假装做全：
-批复**迟到**（回合结束即关闭在途请求）仍停在超时 deny，跨进程重启的 ack 仍是 §10 上的一格。
+批复**迟到**不再永久失效：审批窗口到点后，worker 保留原请求路由 24 小时，审批板保留精确
+tool + args 和各 task 的短期槽位；下一回合出现完全相同调用时只消费一次该决定。
 
 回执把最后那段模糊消掉（design.md §9.31）：worker 对**每一份**批复都回一句
 `approval_receipt{req, applied, reason}`——`applied: true` 是「唤醒了还在等的工具」，
 `applied: false` 是「收到了，但这格已经过期」。回执落 journal（`approval_acked`），台账因此
 能分出「判过却没有回执」的批复，SA 重启时对它们各补投一次。顺带修掉一个会谎报的缺陷：
 审批窗口到点时等待者曾留在台账里，后来那份批复「发送成功」，工件就把一次从未生效的批准
-记成 `allow`；现在到点即撤摊、工件写 `expired / applied:false`。**没生效的批准不许记成生效**，
-因为 journal 与工件会互相印证一个假结论。仍不做的事：迟到批复不会在下一次同样调用上重新
-兑现（那等于把一次 allow 变成长期通行证，要放宽只能改授权表）；跨回合挂起的审批槽位仍在 §10。
+记成 `allow`；现在到点即撤摊、工件写 `expired / applied:false`。迟到批复若在 24 小时内到达，
+只进入精确匹配的单次槽位，不会唤醒旧工具；未来同调用消费时产生 `ApprovalReused` 事件并补发
+`applied:true` 回执。槽位不是长期通行证：只匹配完整 tool + args、只能用一次、过期或矛盾批复
+按 deny/stale 处理。
 
 同一颗 `req` 的**两张矛盾回执**按事实强弱合并，不按先到先得（§9.42）：at-least-once 让 SA 去重时
 把批复重投一次，第一份唤醒了工具（工件记 `applied:true`），第二份只换回 `applied:false (no open
@@ -271,15 +273,18 @@ iteration / 每 peer 花费 / 未结算的铃）、`live_records()`、`file_byte
 cargo run -- journal-archive --journal journal.jsonl --keep 2
 ```
 
-程序把 `<stem>.seg<from>-<to>.jsonl` 原子移动到 `<stem>.segments/`。这不是删除：
-`replay_all()` 会按区间同时读取根目录和归档目录；重复执行返回移动 0 个，目标同名文件
-存在时会在移动任何文件之前整体报错。`--keep 2` 把最新两个已封闭段留在根目录，只移动更旧的；
-缺省 `--keep 0` 移动全部。归档只治理目录，不压缩存储，磁盘占用不会因此下降。
+程序把 `<stem>.seg<from>-<to>.jsonl` 原子移动到 `<stem>.segments/`。`replay_all()` 会按区间
+同时读取根目录和归档目录；重复执行返回移动 0 个，目标同名文件存在时会在移动任何文件之前
+整体报错。`--keep 2` 把最新两个已封闭段留在根目录，只移动更旧的；缺省 `--keep 0` 移动全部。
+
+加 `--compress` 时目标改为 `<stem>.seg<from>-<to>.jsonl.gz`。内核调用系统 `gzip`，先把压缩
+结果写入 `.new`、fsync、解压并与原 JSONL 逐字节比较，通过后才 rename 发布并移除未压缩源；
+任何一步失败都保留原段。`replay_all()` 和 `--verify` 同样能读取压缩段。
 
 加 `--dry-run` 可以先用同一份归档计划查看将被移动的段与冲突，不执行任何 rename：
 
 ```bash
-cargo run -- journal-archive --journal journal.jsonl --keep 2 --dry-run
+cargo run -- journal-archive --journal journal.jsonl --keep 2 --compress --dry-run
 ```
 
 归档前后可以查看不重放历史的库存摘要：

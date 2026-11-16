@@ -7,7 +7,7 @@
 
 ## 1. 自动化测试基线（cargo test）
 
-**Metrics** — src 51 files / 20257 lines · tests 9 files / 3837 lines · 279 tests (lib 218 + bin 6 + integration 55)
+**Metrics** — src 51 files / 20899 lines · tests 9 files / 3946 lines · 283 tests (lib 221 + bin 6 + integration 56)
 **Integration** — core_loop 6 / discipline 2 / m1_tools 12 / m2_session 6 / m4_bus 15 / m5_pool 8 / sandbox_e2e 4 / wire_anthropic 2
 
 | 组 | 覆盖 |
@@ -1238,5 +1238,30 @@ Linux 读取 `/proc/self/status` 的 `VmRSS`，其他平台读取 `ps -o rss= -p
 
 demo 入口通过换行分隔的 `KESTREL_DEMO_TRUSTED_BUILD_PREFIXES` 传入多个前缀。测试覆盖
 自定义前缀通过、相邻单词不得误匹配，以及 CLI 对空值和控制字符的拒绝。
+
+本轮未执行 build、clippy 或测试；当前验证仅到静态审阅与格式化。
+
+## 51. 2026-11-16 journal 归档段 gzip 压缩
+
+`journal-archive --compress` 现在把已封闭段发布为 `.jsonl.gz`。发布前会写同目录 `.new`、
+fsync、用 `gzip -dc` 解压并与源 JSONL 逐字节比较；只有比较通过才 rename 并移除源段。
+`replay_all()`、覆盖链检查、`--verify` 和状态库存均识别压缩段。
+
+同一目录出现同区间普通 JSONL 与 gzip 副本时，普通 JSONL 优先；跨目录仍是根目录优先。
+`--dry-run --compress` 复用真实计划并显示 `.gz` 目标。测试
+`compressed_archive_preserves_history_and_verifies` 覆盖压缩、历史等价、状态识别与校验。
+
+本轮未执行 build、clippy 或测试；当前验证仅到静态审阅与格式化。
+
+## 52. 2026-11-16 跨回合一次性审批槽位
+
+审批窗口到点后，旧 waiter 仍按原语义撤摊；迟到批复进入审批板的 deferred 槽位。槽位绑定
+完整 tool + args，TTL 为 24 小时，只能消费一次，`Deny` 覆盖矛盾的重复 `AllowOnce`。
+下一回合出现完全相同调用时，orchestrator 发 `ApprovalReused`，不重新询问审批者，并按原
+`req` 补发 `applied:true` 回执。
+
+worker 的请求路由使用 `ApprovalDeferred` 保留 24 小时，pump 每 60 秒清理过期项；task 退休
+仍会清除其全部路由。测试覆盖精确匹配、单次消费、TTL、矛盾 fail-closed、未来调用消费与
+deferred 路由送达。
 
 本轮未执行 build、clippy 或测试；当前验证仅到静态审阅与格式化。

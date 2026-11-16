@@ -2,6 +2,7 @@
 
 use super::events::MessageItem;
 use super::id::ReqId;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug)]
 pub struct Submission {
@@ -43,7 +44,7 @@ pub enum Op {
         decision: ApprovalDecision,
         /// Optional acknowledgement used by the worker to learn whether a live
         /// tool waiter actually received the decision.
-        ack: Option<tokio::sync::oneshot::Sender<bool>>,
+        ack: Option<tokio::sync::oneshot::Sender<ApprovalCompletion>>,
     },
     /// Inter-turn model/provider swap, applied at the next `prepare_next_turn`.
     /// M0 carries the resolved spec; M3 resolves ids through the registry.
@@ -53,8 +54,19 @@ pub enum Op {
     Shutdown,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ApprovalDecision {
     AllowOnce,
     Deny,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalCompletion {
+    /// A live tool waiter received the decision.
+    Applied,
+    /// The waiter expired, so the decision is stored for one exact future call.
+    Deferred,
+    /// Nobody can use this reply.
+    Stale,
 }
