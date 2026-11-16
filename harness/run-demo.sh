@@ -35,6 +35,9 @@
 #   KESTREL_DEMO_STATUS_DIR   设了才给每个 worker 传 --status-file（该目录下
 #                             harness-rd.json / harness-qa.json）；不设 = 不写状态文件。
 #   KESTREL_DEMO_STATUS_INTERVAL  状态刷新秒数（不设 = serve 的默认 5）。
+#   KESTREL_DEMO_SUPERVISE    置 1 时用外部脚本监督 RD/QA worker 并有限重启。
+#   KESTREL_DEMO_SUPERVISE_MAX_RESTARTS / _BACKOFF_SECS
+#                             监督重启次数与退避（默认 3 / 2 秒）。
 #   KESTREL_DEMO_TRUSTED_BUILD_PREFIXES  额外受信构建命令前缀，每行一个。
 #
 # 用法：./run-demo.sh
@@ -107,18 +110,37 @@ RESOURCE_ARGS=()
 # 就成了别人的数。
 STATUS_RD=()
 STATUS_QA=()
+STATUS_RD_PATH=""
+STATUS_QA_PATH=""
 if [ -n "${KESTREL_DEMO_STATUS_DIR:-}" ]; then
   mkdir -p "$KESTREL_DEMO_STATUS_DIR"
-  STATUS_RD+=(--status-file "$KESTREL_DEMO_STATUS_DIR/harness-rd.json")
-  STATUS_QA+=(--status-file "$KESTREL_DEMO_STATUS_DIR/harness-qa.json")
+  STATUS_RD_PATH="$KESTREL_DEMO_STATUS_DIR/harness-rd.json"
+  STATUS_QA_PATH="$KESTREL_DEMO_STATUS_DIR/harness-qa.json"
+  STATUS_RD+=(--status-file "$STATUS_RD_PATH")
+  STATUS_QA+=(--status-file "$STATUS_QA_PATH")
 fi
 
-"$BIN" serve --session harness-rd --bus-socket "$SOCKET" \
+launch_worker() {
+  local status_file="$1"
+  shift
+  if [ "${KESTREL_DEMO_SUPERVISE:-0}" = "1" ]; then
+    local supervise_args=(
+      --max-restarts "${KESTREL_DEMO_SUPERVISE_MAX_RESTARTS:-3}"
+      --backoff-secs "${KESTREL_DEMO_SUPERVISE_BACKOFF_SECS:-2}"
+    )
+    [ -z "$status_file" ] || supervise_args+=(--status-file "$status_file")
+    "$HERE/run-worker-supervised.sh" "${supervise_args[@]}" -- "$@"
+  else
+    "$@"
+  fi
+}
+
+launch_worker "$STATUS_RD_PATH" "$BIN" serve --session harness-rd --bus-socket "$SOCKET" \
   --role "$HERE/roles/rd.toml" --artifacts-dir "$ARTIFACTS" \
   ${RESOURCE_ARGS[@]+"${RESOURCE_ARGS[@]}"} ${STATUS_RD[@]+"${STATUS_RD[@]}"} &
 PIDS+=($!)
 PYTHONPYCACHEPREFIX="$EVIDENCE_DIR/pycache" \
-  "$BIN" serve --session harness-qa --bus-socket "$SOCKET" \
+  launch_worker "$STATUS_QA_PATH" "$BIN" serve --session harness-qa --bus-socket "$SOCKET" \
   --role "$HERE/roles/qa.toml" --artifacts-dir "$ARTIFACTS" \
   ${RESOURCE_ARGS[@]+"${RESOURCE_ARGS[@]}"} ${STATUS_QA[@]+"${STATUS_QA[@]}"} &
 PIDS+=($!)
