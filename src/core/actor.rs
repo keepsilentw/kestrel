@@ -96,6 +96,8 @@ pub struct EngineConfig {
     pub sandbox: Arc<dyn crate::sandbox::Sandbox>,
     pub engine: Arc<crate::permissions::PermissionEngine>,
     pub approve: crate::tools::ApproveMode,
+    /// Optional task-specific cross-turn approval state.
+    pub approval_store: Option<PathBuf>,
     /// Session persistence (M2); None disables.
     pub session: Option<Arc<crate::session::SessionStore>>,
 }
@@ -117,6 +119,16 @@ impl AgentHandle {
         let (tx, rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let root = CancellationToken::new();
+        let approvals = match config.approval_store {
+            Some(path) => ApprovalBoard::with_store(path.clone()).unwrap_or_else(|error| {
+                tracing::error!(
+                    "load approval store {}: {error}; deferred approvals start empty",
+                    path.display()
+                );
+                ApprovalBoard::default()
+            }),
+            None => ApprovalBoard::default(),
+        };
         let shared = Arc::new(Shared {
             active: Mutex::new(ActiveModel {
                 provider: config.provider,
@@ -130,7 +142,7 @@ impl AgentHandle {
             history: Mutex::new(Vec::new()),
             history_ids: Mutex::new(Vec::new()),
             steering: Steering::new(),
-            approvals: ApprovalBoard::default(),
+            approvals,
             events: event_tx,
             idgen: config.idgen,
             max_rounds: config.max_rounds,

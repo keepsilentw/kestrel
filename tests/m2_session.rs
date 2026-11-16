@@ -60,6 +60,7 @@ fn spawn(
         sandbox: Arc::new(Unsandboxed),
         engine: Arc::new(PermissionEngine::new(Default::default())),
         approve: ApproveMode::HeadlessDeny,
+        approval_store: None,
         session: Some(store),
     });
     let rx = handle.take_event_rx().unwrap();

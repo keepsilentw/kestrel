@@ -132,6 +132,9 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let system = role.system_prompt(&base).context("role system prompt")?;
     std::fs::create_dir_all(&args.artifacts_dir)
         .with_context(|| format!("create artifacts dir {}", args.artifacts_dir.display()))?;
+    let approval_store_dir = args.artifacts_dir.join("approval-slots");
+    std::fs::create_dir_all(&approval_store_dir)
+        .with_context(|| format!("create approval slot dir {}", approval_store_dir.display()))?;
     let approve = args.approve.unwrap_or_else(|| role.approve_mode());
 
     // The worker lives in its first writable root (the dispatch worktree);
@@ -242,6 +245,9 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             fs: fs.clone(),
             engine: Arc::clone(&engine_policy),
             approve,
+            approval_store: Some(
+                approval_store_dir.join(format!("{}.json", crate::cli::task::slug(task))),
+            ),
             session: Some(Arc::new(store)),
         });
         let events = handle

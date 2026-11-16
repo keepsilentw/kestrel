@@ -1,10 +1,12 @@
 //! Approval board: pending reverse-requests waiting for an `Op::Approval`.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::oneshot;
 
@@ -22,6 +24,29 @@ struct DeferredApproval {
     source_req: String,
     decision: ApprovalDecision,
     expires_at: Instant,
+    detail: Value,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredApprovalState {
+    version: u32,
+    expired: Vec<StoredExpired>,
+    deferred: Vec<StoredDeferred>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredExpired {
+    req: String,
+    detail: Value,
+    expires_unix_secs: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredDeferred {
+    source_req: String,
+    decision: ApprovalDecision,
+    expires_unix_secs: u64,
+    detail: Value,
 }
 
 pub struct ApprovalBoard {
@@ -31,6 +56,7 @@ pub struct ApprovalBoard {
     expired: Mutex<HashMap<String, ExpiredRequest>>,
     deferred: Mutex<HashMap<String, DeferredApproval>>,
     deferred_ttl: Duration,
+    store_path: Mutex<Option<PathBuf>>,
 }
 
 impl Default for ApprovalBoard {
@@ -42,6 +68,7 @@ impl Default for ApprovalBoard {
             expired: Mutex::new(HashMap::new()),
             deferred: Mutex::new(HashMap::new()),
             deferred_ttl: DEFAULT_DEFERRED_APPROVAL_TTL,
+            store_path: Mutex::new(None),
         }
     }
 }
@@ -52,6 +79,59 @@ impl ApprovalBoard {
             deferred_ttl,
             ..Self::default()
         }
+    }
+
+    /// Restore deferred approval state from a task-specific file. A missing
+    /// file is a normal first start; an unreadable file is returned as an error
+    /// so the caller can surface it instead of silently discarding approvals.
+    pub fn with_store(path: PathBuf) -> anyhow::Result<Self> {
+        let board = Self {
+            store_path: Mutex::new(Some(path.clone())),
+            ..Self::default()
+        };
+        if !path.exists() {
+            return Ok(board);
+        }
+        let bytes = std::fs::read(&path)
+            .map_err(|error| anyhow::anyhow!("read approval store {}: {error}", path.display()))?;
+        let stored: StoredApprovalState = serde_json::from_slice(&bytes)
+            .map_err(|error| anyhow::anyhow!("parse approval store {}: {error}", path.display()))?;
+        if stored.version != 1 {
+            anyhow::bail!(
+                "unsupported approval store version {} in {}",
+                stored.version,
+                path.display()
+            );
+        }
+        let now = Instant::now();
+        let now_unix = unix_secs(SystemTime::now())?;
+        for item in stored.expired {
+            if item.expires_unix_secs > now_unix {
+                let remaining = Duration::from_secs(item.expires_unix_secs - now_unix);
+                board.expired.lock().unwrap().insert(
+                    item.req,
+                    ExpiredRequest {
+                        detail: item.detail,
+                        expires_at: now + remaining,
+                    },
+                );
+            }
+        }
+        for item in stored.deferred {
+            if item.expires_unix_secs > now_unix {
+                let remaining = Duration::from_secs(item.expires_unix_secs - now_unix);
+                board.deferred.lock().unwrap().insert(
+                    approval_key(&item.detail),
+                    DeferredApproval {
+                        source_req: item.source_req,
+                        decision: item.decision,
+                        expires_at: now + remaining,
+                        detail: item.detail,
+                    },
+                );
+            }
+        }
+        Ok(board)
     }
 
     /// Open a waiter under an externally generated id (engine IdGen).
@@ -96,25 +176,31 @@ impl ApprovalBoard {
             };
             if Instant::now() > entry.expires_at {
                 expired.remove(req);
+                drop(expired);
+                self.persist_best_effort("expire suspended request");
                 return ApprovalCompletion::Stale;
             }
             entry.clone()
         };
         let key = approval_key(&expired.detail);
-        let mut deferred = self.deferred.lock().unwrap();
-        deferred
-            .entry(key)
-            .and_modify(|slot| {
-                // A contradictory replay of the same decision must fail closed.
-                if decision == ApprovalDecision::Deny {
-                    slot.decision = ApprovalDecision::Deny;
-                }
-            })
-            .or_insert(DeferredApproval {
-                source_req: req.to_string(),
-                decision,
-                expires_at: expired.expires_at,
-            });
+        {
+            let mut deferred = self.deferred.lock().unwrap();
+            deferred
+                .entry(key)
+                .and_modify(|slot| {
+                    // A contradictory replay of the same decision must fail closed.
+                    if decision == ApprovalDecision::Deny {
+                        slot.decision = ApprovalDecision::Deny;
+                    }
+                })
+                .or_insert(DeferredApproval {
+                    source_req: req.to_string(),
+                    decision,
+                    expires_at: expired.expires_at,
+                    detail: expired.detail,
+                });
+        }
+        self.persist_best_effort("defer decision");
         ApprovalCompletion::Deferred
     }
 
@@ -126,13 +212,16 @@ impl ApprovalBoard {
             return false;
         }
         if let Some(detail) = self.requests.lock().unwrap().remove(req) {
-            self.expired.lock().unwrap().insert(
-                req.to_string(),
-                ExpiredRequest {
-                    detail,
-                    expires_at: Instant::now() + self.deferred_ttl,
-                },
-            );
+            {
+                self.expired.lock().unwrap().insert(
+                    req.to_string(),
+                    ExpiredRequest {
+                        detail,
+                        expires_at: Instant::now() + self.deferred_ttl,
+                    },
+                );
+            }
+            self.persist_best_effort("suspend request");
         }
         true
     }
@@ -143,6 +232,7 @@ impl ApprovalBoard {
         let removed = self.waiters.lock().unwrap().remove(req).is_some();
         self.requests.lock().unwrap().remove(req);
         self.expired.lock().unwrap().remove(req);
+        self.persist_best_effort("discard request");
         removed
     }
 
@@ -161,22 +251,104 @@ impl ApprovalBoard {
     /// canonical JSON comparison, not a prefix, path pattern or tool name.
     pub fn take_deferred(&self, detail: &Value) -> Option<(String, ApprovalDecision)> {
         let now = Instant::now();
-        let mut deferred = self.deferred.lock().unwrap();
-        deferred.retain(|_, slot| slot.expires_at >= now);
         let key = approval_key(detail);
-        let slot = deferred.remove(&key)?;
+        let slot = {
+            let mut deferred = self.deferred.lock().unwrap();
+            deferred.retain(|_, slot| slot.expires_at >= now);
+            deferred.remove(&key)?
+        };
         // A duplicate reply for the source request must not recreate the slot
         // after it has been consumed once.
         self.expired
             .lock()
             .unwrap()
             .retain(|_, request| request.expires_at >= now && approval_key(&request.detail) != key);
+        self.persist_best_effort("consume deferred request");
         Some((slot.source_req, slot.decision))
+    }
+
+    fn persist_best_effort(&self, operation: &str) {
+        if let Err(error) = self.persist() {
+            tracing::error!("approval store failed during {operation}: {error}");
+        }
+    }
+
+    fn persist(&self) -> anyhow::Result<()> {
+        let Some(path) = self.store_path.lock().unwrap().clone() else {
+            return Ok(());
+        };
+        let now_system = SystemTime::now();
+        let now_instant = Instant::now();
+        let expired = self
+            .expired
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(req, item)| {
+                Ok(StoredExpired {
+                    req: req.clone(),
+                    detail: item.detail.clone(),
+                    expires_unix_secs: unix_secs(
+                        now_system + item.expires_at.saturating_duration_since(now_instant),
+                    )?,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let deferred = self
+            .deferred
+            .lock()
+            .unwrap()
+            .values()
+            .map(|item| {
+                Ok(StoredDeferred {
+                    source_req: item.source_req.clone(),
+                    decision: item.decision,
+                    detail: item.detail.clone(),
+                    expires_unix_secs: unix_secs(
+                        now_system + item.expires_at.saturating_duration_since(now_instant),
+                    )?,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let body = serde_json::to_vec_pretty(&StoredApprovalState {
+            version: 1,
+            expired,
+            deferred,
+        })?;
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("approval-slots.json");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let staged = path.with_file_name(format!(".{file_name}.{}.new", std::process::id()));
+        std::fs::write(&staged, body)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600))?;
+        }
+        std::fs::File::open(&staged)?.sync_all()?;
+        std::fs::rename(&staged, &path)?;
+        if let Some(parent) = path.parent()
+            && let Ok(dir) = std::fs::File::open(parent)
+        {
+            let _ = dir.sync_all();
+        }
+        Ok(())
     }
 }
 
 fn approval_key(detail: &Value) -> String {
     serde_json::to_string(detail).unwrap_or_default()
+}
+
+fn unix_secs(time: SystemTime) -> anyhow::Result<u64> {
+    Ok(time
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| anyhow::anyhow!("approval expiry precedes Unix epoch: {error}"))?
+        .as_secs())
 }
 
 #[cfg(test)]
@@ -309,5 +481,40 @@ mod tests {
             ApprovalCompletion::Stale
         );
         assert_eq!(board.take_deferred(&detail), None);
+    }
+
+    #[test]
+    fn deferred_approvals_survive_a_board_restart() {
+        let path = std::env::temp_dir().join(format!(
+            "kestrel-approval-store-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let detail = serde_json::json!({"tool":"bash","args":{"command":"cargo test"}});
+        let req = "req-persisted".to_string();
+        {
+            let board = ApprovalBoard::with_store(path.clone()).unwrap();
+            let _rx = board.open_with_detail(req.clone(), detail.clone());
+            assert!(board.suspend(&req));
+            assert!(path.exists(), "suspending writes the pending slot");
+        }
+        {
+            let restored = ApprovalBoard::with_store(path.clone()).unwrap();
+            assert_eq!(
+                restored.complete(&req, ApprovalDecision::AllowOnce),
+                ApprovalCompletion::Deferred
+            );
+            assert_eq!(
+                restored.take_deferred(&detail),
+                Some((req.clone(), ApprovalDecision::AllowOnce))
+            );
+        }
+        let restored = ApprovalBoard::with_store(path.clone()).unwrap();
+        assert_eq!(
+            restored.take_deferred(&detail),
+            None,
+            "consumption is durable"
+        );
+        std::fs::remove_file(path).ok();
     }
 }

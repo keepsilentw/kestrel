@@ -43,6 +43,7 @@ fn spawn_engine(
             Default::default(),
         )),
         approve: kestrel::tools::ApproveMode::HeadlessDeny,
+        approval_store: None,
         session: None,
     });
     let rx = handle.take_event_rx().expect("single consumer");

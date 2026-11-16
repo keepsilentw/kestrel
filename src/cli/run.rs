@@ -141,6 +141,7 @@ pub async fn run_once(args: RunArgs) -> anyhow::Result<i32> {
         fs,
         engine,
         approve: args.approve,
+        approval_store: None,
         session,
     });
     let mut rx = handle.take_event_rx().expect("event rx available once");

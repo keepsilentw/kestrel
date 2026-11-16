@@ -75,6 +75,7 @@ pub fn spawn_engine(
         sandbox,
         engine: policy,
         approve,
+        approval_store: None,
         session: None,
     });
     let rx = handle.take_event_rx().expect("single consumer");
