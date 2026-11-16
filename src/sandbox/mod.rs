@@ -1,11 +1,13 @@
-//! Sandbox layer (macOS-only v1): Seatbelt wrap as the default execution
-//! boundary (codex 双层模型), with a trait seam for future Linux backends.
+//! Sandbox layer: Seatbelt on macOS and bubblewrap on Linux, using the same
+//! filesystem policy seam.
 
+pub mod bubblewrap;
 pub mod denial;
 pub mod seatbelt;
 pub use seatbelt::Seatbelt;
 
 use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -52,12 +54,28 @@ impl Sandbox for Unsandboxed {
 }
 
 pub fn platform_sandbox() -> std::sync::Arc<dyn Sandbox> {
-    #[cfg(target_os = "macos")]
-    {
-        std::sync::Arc::new(seatbelt::Seatbelt)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        std::sync::Arc::new(Unsandboxed)
-    }
+    static SANDBOX: OnceLock<Arc<dyn Sandbox>> = OnceLock::new();
+    SANDBOX
+        .get_or_init(|| {
+            #[cfg(target_os = "macos")]
+            {
+                Arc::new(seatbelt::Seatbelt)
+            }
+            #[cfg(target_os = "linux")]
+            {
+                if bubblewrap::Bubblewrap::available() {
+                    Arc::new(bubblewrap::Bubblewrap)
+                } else {
+                    tracing::warn!(
+                        "bubblewrap (bwrap) is unavailable; Linux commands fail closed until approved"
+                    );
+                    Arc::new(bubblewrap::FailClosedLinux)
+                }
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            {
+                Arc::new(Unsandboxed)
+            }
+        })
+        .clone()
 }
