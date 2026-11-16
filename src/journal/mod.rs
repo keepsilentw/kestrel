@@ -17,8 +17,9 @@ pub use records::{
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Cursor, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::Context;
 use serde::Serialize;
@@ -140,6 +141,7 @@ pub struct ArchiveMove {
     pub source: PathBuf,
     pub destination: PathBuf,
     pub destination_exists: bool,
+    pub compress: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -304,7 +306,12 @@ impl Journal {
             duplicate_segments,
             coverage_gaps,
             total_segment_bytes: segments.iter().map(|segment| segment.bytes).sum(),
-            staged_files: staged_files(journal_dir(&self.path).as_deref()),
+            staged_files: staged_files(journal_dir(&self.path).as_deref())
+                + self
+                    .segment_archive_dir()
+                    .as_deref()
+                    .map(staged_files)
+                    .unwrap_or(0),
             segments,
             verification: None,
             approvals: None,
@@ -555,11 +562,25 @@ impl Journal {
     /// Preview exactly what `archive_segments` would move. The append lock keeps
     /// a concurrent rotation from changing the answer halfway through planning.
     pub fn archive_plan(&self, keep_latest: usize) -> anyhow::Result<Vec<ArchiveMove>> {
-        let _file = self.file.lock().unwrap();
-        self.archive_plan_locked(keep_latest)
+        self.archive_plan_with_compression(keep_latest, false)
     }
 
-    fn archive_plan_locked(&self, keep_latest: usize) -> anyhow::Result<Vec<ArchiveMove>> {
+    /// Preview the same plan with archived files either moved as JSONL or
+    /// compressed into `.jsonl.gz`.
+    pub fn archive_plan_with_compression(
+        &self,
+        keep_latest: usize,
+        compress: bool,
+    ) -> anyhow::Result<Vec<ArchiveMove>> {
+        let _file = self.file.lock().unwrap();
+        self.archive_plan_locked(keep_latest, compress)
+    }
+
+    fn archive_plan_locked(
+        &self,
+        keep_latest: usize,
+        compress: bool,
+    ) -> anyhow::Result<Vec<ArchiveMove>> {
         let Some(dir) = journal_dir(&self.path) else {
             anyhow::bail!("journal path has no parent directory");
         };
@@ -573,15 +594,26 @@ impl Journal {
         let archive = self
             .segment_archive_dir()
             .context("journal path has no archive directory")?;
+        let archived_ranges: std::collections::BTreeSet<(u64, u64)> =
+            segment_files(&archive, &prefix)
+                .into_iter()
+                .map(|(from, to, _)| (from, to))
+                .collect();
         Ok(segments
             .into_iter()
             .map(|(from, to, source)| {
-                let destination = archive.join(
-                    source
-                        .file_name()
-                        .expect("segment_files only returns named files"),
-                );
-                let destination_exists = destination.exists();
+                let file_name = source
+                    .file_name()
+                    .expect("segment_files only returns named files");
+                let file_name = file_name.to_string_lossy();
+                let compress_this = compress && !file_name.ends_with(".gz");
+                let destination = archive.join(if compress_this {
+                    format!("{file_name}.gz")
+                } else {
+                    file_name.into_owned()
+                });
+                let destination_exists =
+                    destination.exists() || archived_ranges.contains(&(from, to));
                 ArchiveMove {
                     from,
                     to,
@@ -589,6 +621,7 @@ impl Journal {
                     source,
                     destination,
                     destination_exists,
+                    compress: compress_this,
                 }
             })
             .collect())
@@ -606,11 +639,23 @@ impl Journal {
         keep_latest: usize,
         resolve_duplicates: bool,
     ) -> anyhow::Result<usize> {
+        self.archive_segments_with_compression(keep_latest, resolve_duplicates, false)
+    }
+
+    /// Archive sealed segments, optionally compressing each one with the system
+    /// `gzip` command. The source is removed only after the compressed copy has
+    /// been fsynced, renamed, and decoded back to byte-identical JSONL.
+    pub fn archive_segments_with_compression(
+        &self,
+        keep_latest: usize,
+        resolve_duplicates: bool,
+        compress: bool,
+    ) -> anyhow::Result<usize> {
         let _file = self.file.lock().unwrap();
         if resolve_duplicates {
             self.quarantine_duplicate_segments_locked()?;
         }
-        let moves = self.archive_plan_locked(keep_latest)?;
+        let moves = self.archive_plan_locked(keep_latest, compress)?;
         if moves.is_empty() {
             return Ok(0);
         }
@@ -632,13 +677,17 @@ impl Journal {
         std::fs::create_dir_all(&archive)
             .with_context(|| format!("create segment archive {}", archive.display()))?;
         for plan in &moves {
-            std::fs::rename(&plan.source, &plan.destination).with_context(|| {
-                format!(
-                    "move segment {} into {}",
-                    plan.source.display(),
-                    archive.display()
-                )
-            })?;
+            if plan.compress {
+                compress_segment(&plan.source, &plan.destination)?;
+            } else {
+                std::fs::rename(&plan.source, &plan.destination).with_context(|| {
+                    format!(
+                        "move segment {} into {}",
+                        plan.source.display(),
+                        archive.display()
+                    )
+                })?;
+            }
         }
         if let Ok(d) = File::open(dir) {
             let _ = d.sync_all();
@@ -736,11 +785,14 @@ impl Journal {
 
 /// Replay one journal file; a torn tail is skipped (same rule as `replay`).
 fn replay_path(path: &Path) -> Vec<JournalRecord> {
-    let Ok(f) = File::open(path) else {
+    let Ok(bytes) = read_journal_bytes(path) else {
         return vec![];
     };
     let mut out = Vec::new();
-    for line in BufReader::new(f).lines().map_while(Result::ok) {
+    for line in BufReader::new(Cursor::new(bytes))
+        .lines()
+        .map_while(Result::ok)
+    {
         if line.trim().is_empty() {
             continue;
         }
@@ -752,10 +804,91 @@ fn replay_path(path: &Path) -> Vec<JournalRecord> {
     out
 }
 
+fn read_journal_bytes(path: &Path) -> anyhow::Result<Vec<u8>> {
+    let bytes = std::fs::read(path)?;
+    if !bytes.starts_with(&[0x1f, 0x8b]) {
+        return Ok(bytes);
+    }
+    let output = Command::new("gzip")
+        .arg("-dc")
+        .arg(path)
+        .output()
+        .context("run gzip to decompress a journal segment")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "gzip -dc {} failed with {}: {}",
+        path.display(),
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(output.stdout)
+}
+
+fn compress_segment(source: &Path, destination: &Path) -> anyhow::Result<()> {
+    let output = Command::new("gzip")
+        .arg("-c")
+        .arg(source)
+        .output()
+        .with_context(|| format!("compress journal segment {}", source.display()))?;
+    anyhow::ensure!(
+        output.status.success(),
+        "gzip -c {} failed with {}: {}",
+        source.display(),
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+
+    let file_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("compressed segment has no usable file name")?;
+    let staged = destination.with_file_name(format!(".{file_name}.{}.new", std::process::id()));
+    if let Err(error) = std::fs::write(&staged, &output.stdout) {
+        let _ = std::fs::remove_file(&staged);
+        return Err(error).context("write staged compressed segment");
+    }
+    if let Err(error) = File::open(&staged).and_then(|file| file.sync_all()) {
+        let _ = std::fs::remove_file(&staged);
+        return Err(error).context("fsync staged compressed segment");
+    }
+
+    let original = std::fs::read(source)
+        .with_context(|| format!("read segment to verify compression {}", source.display()))?;
+    let decoded = read_journal_bytes(&staged)
+        .with_context(|| format!("decode staged compressed segment {}", staged.display()))?;
+    if decoded != original {
+        let _ = std::fs::remove_file(&staged);
+        anyhow::bail!(
+            "compressed segment {} did not decode back to {}",
+            source.display(),
+            destination.display()
+        );
+    }
+
+    if let Err(error) = std::fs::rename(&staged, destination) {
+        let _ = std::fs::remove_file(&staged);
+        return Err(error).with_context(|| {
+            format!(
+                "publish compressed segment {} from {}",
+                destination.display(),
+                staged.display()
+            )
+        });
+    }
+    if let Some(dir) = destination.parent()
+        && let Ok(d) = File::open(dir)
+    {
+        let _ = d.sync_all();
+    }
+    std::fs::remove_file(source)
+        .with_context(|| format!("remove compressed source segment {}", source.display()))?;
+    Ok(())
+}
+
 fn segment_files(dir: &Path, prefix: &str) -> Vec<(u64, u64, PathBuf)> {
-    let mut found = Vec::new();
+    let mut found = BTreeMap::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return found;
+        return Vec::new();
     };
     for entry in entries.map_while(Result::ok) {
         let name = entry.file_name();
@@ -763,18 +896,35 @@ fn segment_files(dir: &Path, prefix: &str) -> Vec<(u64, u64, PathBuf)> {
         let Some(rest) = name.strip_prefix(prefix) else {
             continue;
         };
-        let Some(range) = rest.strip_suffix(".jsonl") else {
+        let Some(range) = rest
+            .strip_suffix(".jsonl.gz")
+            .or_else(|| rest.strip_suffix(".jsonl"))
+        else {
             continue;
         };
         let Some((from, to)) = range.split_once('-') else {
             continue;
         };
         if let (Ok(from), Ok(to)) = (from.parse::<u64>(), to.parse::<u64>()) {
-            found.push((from, to, entry.path()));
+            let path = entry.path();
+            found
+                .entry((from, to))
+                .and_modify(|existing: &mut PathBuf| {
+                    // Prefer the plain JSONL copy if compression left both
+                    // behind after an interrupted cleanup.
+                    if existing.to_string_lossy().ends_with(".gz")
+                        && !path.to_string_lossy().ends_with(".gz")
+                    {
+                        *existing = path.clone();
+                    }
+                })
+                .or_insert(path);
         }
     }
-    found.sort();
     found
+        .into_iter()
+        .map(|((from, to), path)| (from, to, path))
+        .collect()
 }
 
 fn file_bytes(path: &Path) -> u64 {
@@ -1117,6 +1267,44 @@ mod tests {
             before_second.state,
             "moving files changes location, not state"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn compressed_archive_preserves_history_and_verifies() {
+        let dir = scratch("compressed-archive");
+        let path = dir.join("journal.jsonl");
+        let journal = Journal::create(&path).unwrap();
+        seed(&journal, 4);
+        let before = reconcile(&journal.replay_all());
+        let rotated = journal.rotate(5).unwrap().expect("rotation");
+        let plan = journal.archive_plan_with_compression(0, true).unwrap();
+        assert_eq!(plan.len(), 1);
+        assert!(plan[0].compress);
+        assert!(plan[0].destination.to_string_lossy().ends_with(".jsonl.gz"));
+
+        assert_eq!(
+            journal
+                .archive_segments_with_compression(0, false, true)
+                .unwrap(),
+            1
+        );
+        let archive = journal.segment_archive_dir().unwrap();
+        let compressed = archive.join(format!(
+            "{}.gz",
+            rotated.archived_to.file_name().unwrap().to_string_lossy()
+        ));
+        assert!(compressed.exists(), "compressed archive exists");
+        assert!(!rotated.archived_to.exists(), "uncompressed source is gone");
+        assert_eq!(replay_path(&compressed).len(), 10);
+
+        let after = reconcile(&journal.replay_all());
+        assert_eq!(before.state, after.state);
+        assert_eq!(before.in_flight, after.in_flight);
+        let status = journal.status();
+        assert_eq!(status.archived_segments, 1);
+        assert_eq!(status.segments[0].path, compressed);
+        assert!(journal.verify().is_consistent(), "{:?}", journal.verify());
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -308,6 +308,12 @@ struct JournalArchiveCmd {
     /// deleted; without this a duplicated range blocks the move by design.
     #[arg(long)]
     resolve_duplicates: bool,
+
+    /// Compress archived segments to `.jsonl.gz` with the system `gzip`. The
+    /// compressed copy is decoded and compared with the source before the
+    /// uncompressed source is removed.
+    #[arg(long)]
+    compress: bool,
 }
 
 #[derive(Args, Debug)]
@@ -362,7 +368,7 @@ async fn main() -> anyhow::Result<()> {
             let path = shellexpand_home(&a.journal.to_string_lossy());
             let journal = Journal::open(&path)?;
             if a.dry_run {
-                let plan = journal.archive_plan(a.keep)?;
+                let plan = journal.archive_plan_with_compression(a.keep, a.compress)?;
                 let duplicates = journal.status().duplicate_segments;
                 if a.resolve_duplicates {
                     println!(
@@ -376,6 +382,8 @@ async fn main() -> anyhow::Result<()> {
                         "{} seg{}-{} / {} byte(s) / {}{}",
                         if item.destination_exists {
                             "blocked"
+                        } else if item.compress {
+                            "compress"
                         } else {
                             "move"
                         },
@@ -392,13 +400,21 @@ async fn main() -> anyhow::Result<()> {
                 }
                 return Ok(());
             }
-            let moved = journal.archive_segments(a.keep, a.resolve_duplicates)?;
+            let moved = journal.archive_segments_with_compression(
+                a.keep,
+                a.resolve_duplicates,
+                a.compress,
+            )?;
             match journal.segment_archive_dir() {
                 Some(dir) => println!(
-                    "journal archive: moved {moved} sealed segment(s) into {}",
-                    dir.display()
+                    "journal archive: archived {moved} sealed segment(s) into {}{}",
+                    dir.display(),
+                    if a.compress { " (gzip)" } else { "" }
                 ),
-                None => println!("journal archive: moved {moved} sealed segment(s)"),
+                None => println!(
+                    "journal archive: archived {moved} sealed segment(s){}",
+                    if a.compress { " (gzip)" } else { "" }
+                ),
             }
             return Ok(());
         }
