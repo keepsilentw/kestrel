@@ -27,14 +27,14 @@
 > 归档链的断口与重复段的隔离出口（§9.56）、记录层的深度校验 `--verify`（§9.57）；
 > 代码部分都过了 fmt / clippy / test；
 > **真端点联跑未重跑**，demo 的接法只到语法与 flag 解析这一层。
-> 2026-11-18：11-14/16 的改动在当前 HEAD 复跑 fmt / clippy / test，298 项全绿；
+> 2026-11-18：11-14/16 的改动在当前 HEAD 复跑 fmt / clippy / test，301 项全绿；
 > 同日真实端点 demo 用 `--sa-role --sa-routing` 跑通 Spec 起草、每关受控路由与
 > 四阶段执行（每关 11 passed / 0 failed，账本 1.3451 cny，`harness-sa: 0.0102 cny`；
 > Build iter1 超时后迟到铃被忽略，iter2 通过）；
 > supervisor 与状态文件同时启用，模拟子进程验证了 exit 1 / exit 70 的重启分支；
 > Linux 真机与真实 worker 的 RSS 压力阈值仍未实测。
-> **Metrics** — src 52 files / 22681 lines · tests 9 files / 4010 lines · 298 tests (lib 235 + bin 6 + integration 57)
-> **Integration** — core_loop 6 / discipline 2 / m1_tools 13 / m2_session 6 / m4_bus 16 / m5_pool 8 / sandbox_e2e 4 / wire_anthropic 2
+> **Metrics** — src 52 files / 22891 lines · tests 9 files / 4041 lines · 301 tests (lib 237 + bin 6 + integration 58)
+> **Integration** — core_loop 6 / discipline 2 / m1_tools 13 / m2_session 6 / m4_bus 17 / m5_pool 8 / sandbox_e2e 4 / wire_anthropic 2
 > 规模已过 plan 预算（10-13k）的上沿：多出来的部分几乎都花在「取消安全」与「对账」这两条纪律上。
 > 上面两行数字由 `tests/discipline.rs::metrics_lines_match_the_tree` 对照源码树重算校验——
 > 这些计数此前在三处文档里手抄过三次、漂移过三次（§9.19），现在它是闸门不是仪式。
@@ -763,7 +763,7 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
 
 70. **真实端点四进程 demo 复核，以及预算预检的负零（2026-11-18）**：
     ① 当前 HEAD 复跑 `cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、
-       `cargo test`：298 项全绿。
+       `cargo test`：301 项全绿。
     ② 真实端点四进程 demo 再次 `pipeline complete`：`dev` / `review` / `test` / `build`
        四关均 pass，每关 `22 passed / 0 failed`，账本 `0.1250 cny, of which 0.0000 nominal`；
        2 组审批请求/裁决/回执全部 `applied=true`。本轮启用了外部 supervisor 与 worker
@@ -860,8 +860,25 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
     ④ 测试 `parked_bells_and_session_ownership_survive_a_hub_restart` 用两个不同 socket
        共用同一 state 文件模拟 hub 进程重启：重启前的铃先补投，重启后发给同一离线
        session 的新铃继续停车，证明 session 归属也一起恢复。
-    ⑤ 边界：state 文件仍按 `32/会话 + 256 全局` 的帧数上限，不按字节封顶；单帧最大
-       4 MiB 时文件理论可到 1 GiB。session 表也只增不减，尚无 TTL/淘汰。这是下一层治理。
+    ⑤ 边界（已由 §9.75 收口）：当时的 state 文件只按 `32/会话 + 256 全局` 的帧数封顶，
+       session 表也没有 TTL；下一节补上了 8 MiB 字节上限与 7 天 session TTL。
+
+75. **hub state 的字节上限与 stale session 治理（2026-11-18）**：
+    ① 持久化 schema 升到 v2：每个 session 存 `peer + seen_at`；v1 文件（只有 peer 字符串）
+       在读取时迁移，迁移时刻视为最近一次 Hello，给旧 session 一个完整 TTL 窗口。
+    ② Session TTL 为 7 天。`bind` 与每次 `persist_now` 都会 prune：超时 session 从
+       `sessions`、`session_seen` 和它的 parked 队列一起移除；parked 里没有对应 session
+       的孤儿 key 也一并清掉。
+    ③ Parking 增加 8 MiB 总字节上限：每帧先算 JSON 字节数，超限时从当前 session 的队首
+       开始丢最旧，必要时扫描其它 session；单帧本身超过 8 MiB 直接不停车。帧数上限仍是
+       32/会话 + 256 全局，两个上限同时生效。
+    ④ 测试：
+       `parking_byte_cap_drops_the_oldest_frame`、
+       `a_frame_larger_than_the_byte_cap_is_not_parked`、
+       `stale_sessions_are_pruned_from_the_persisted_table`；重启恢复测试继续覆盖 v2
+       的 session/parked 往返。
+    ⑤ 边界：TTL 与字节上限目前是常量，不是 CLI 配置；drop-oldest 会丢帧（parked 本来就是
+       有界、非 durable maildir），SA 的 write-ahead 对账仍是投递语义的兜底。
 
 ## 10 二期清单
 

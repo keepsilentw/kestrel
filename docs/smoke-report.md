@@ -7,8 +7,8 @@
 
 ## 1. 自动化测试基线（cargo test）
 
-**Metrics** — src 52 files / 22681 lines · tests 9 files / 4010 lines · 298 tests (lib 235 + bin 6 + integration 57)
-**Integration** — core_loop 6 / discipline 2 / m1_tools 13 / m2_session 6 / m4_bus 16 / m5_pool 8 / sandbox_e2e 4 / wire_anthropic 2
+**Metrics** — src 52 files / 22891 lines · tests 9 files / 4041 lines · 301 tests (lib 237 + bin 6 + integration 58)
+**Integration** — core_loop 6 / discipline 2 / m1_tools 13 / m2_session 6 / m4_bus 17 / m5_pool 8 / sandbox_e2e 4 / wire_anthropic 2
 
 | 组 | 覆盖 |
 |---|---|
@@ -1341,7 +1341,7 @@ Unix 权限 0600；槽位仍绑定完整 tool + args、原 req、决定和绝对
 |---|---|
 | `cargo fmt --check` | 通过，无输出 |
 | `cargo clippy --all-targets -- -D warnings` | 通过，0 warning |
-| `cargo test` | 298 passed / 0 failed（lib 235 + bin 6 + integration 57） |
+| `cargo test` | 301 passed / 0 failed（lib 237 + bin 6 + integration 58） |
 | doc-tests | 0 项，通过 |
 
 这组结果证明当前树可以编译、clippy 干净，且包含 RSS 准入/回收、deferred 审批、bubblewrap
@@ -1495,5 +1495,28 @@ Build 超时说明 QA 在有受信预检时仍做了过多检查；QA 提示词�
 | 重启后发给同一离线 session | 从恢复的 session 表识别为已知，继续停车 |
 | 顺序 | `before-restart` 先于 `after-restart` |
 
-边界：state 文件按帧数封顶（每 session 32、全局 256），没有字节上限；session 表也尚无
-TTL/淘汰，长时间运行仍需治理。
+边界（已由 §65 收口）：当时 state 文件只按帧数封顶（每 session 32、全局 256），
+session 表也没有 TTL；下一节补上了 8 MiB 字节上限与 7 天 session TTL。
+
+## 65. 2026-11-18 hub state 字节上限与 session TTL
+
+持久化 schema 升到 v2：每个 session 存 `peer + seen_at`；v1 文件读取时迁移，迁移时刻视为
+最近一次 Hello。Session TTL 为 7 天，`bind` 与 `persist_now` 都会移除超时 session 及其
+parked 队列，并清掉没有 session 归属的孤儿 parked key。
+
+Parking 新增 8 MiB 总字节上限：
+
+- 每帧按 JSON 字节数计入
+- 超限时从当前 session 队首开始丢最旧，必要时扫描其它 session
+- 单帧本身超过 8 MiB 直接不停车
+- 帧数上限仍是每 session 32、全局 256
+
+| 测试 | 结果 |
+|---|---|
+| `parking_byte_cap_drops_the_oldest_frame` | 最旧帧被淘汰，保留最新 |
+| `a_frame_larger_than_the_byte_cap_is_not_parked` | 超大帧不进入队列 |
+| `stale_sessions_are_pruned_from_the_persisted_table` | 过期 session 在 wire 上回到 `unknown session` |
+| `parked_bells_and_session_ownership_survive_a_hub_restart` | v2 schema 下重启恢复仍通过 |
+
+边界：TTL 与字节上限目前是常量，不是 CLI 配置；drop-oldest 会丢帧，parked 本来就是有界、
+非 durable maildir，投递语义仍由 SA 的 write-ahead 对账兜底。
