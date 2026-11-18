@@ -7,7 +7,7 @@
 
 ## 1. 自动化测试基线（cargo test）
 
-**Metrics** — src 52 files / 21636 lines · tests 9 files / 3951 lines · 289 tests (lib 227 + bin 6 + integration 56)
+**Metrics** — src 52 files / 22544 lines · tests 9 files / 3951 lines · 297 tests (lib 235 + bin 6 + integration 56)
 **Integration** — core_loop 6 / discipline 2 / m1_tools 13 / m2_session 6 / m4_bus 15 / m5_pool 8 / sandbox_e2e 4 / wire_anthropic 2
 
 | 组 | 覆盖 |
@@ -1332,3 +1332,147 @@ Unix 权限 0600；槽位仍绑定完整 tool + args、原 req、决定和绝对
 
 因此磁盘占用会随审计历史增长，这是刻意保留成本，不是待实现项。执行外部策略前使用
 `journal-status --json/--check/--list` 获取完整库存与完整性状态。
+
+## 59. 2026-11-18 当前 HEAD 质量闸门复跑
+
+§48-§57 的改动此前只做过静态审阅与格式化；2026-11-18 在当前 HEAD 上复跑质量闸门：
+
+| 闸门 | 结果 |
+|---|---|
+| `cargo fmt --check` | 通过，无输出 |
+| `cargo clippy --all-targets -- -D warnings` | 通过，0 warning |
+| `cargo test` | 297 passed / 0 failed（lib 235 + bin 6 + integration 56） |
+| doc-tests | 0 项，通过 |
+
+这组结果证明当前树可以编译、clippy 干净，且包含 RSS 准入/回收、deferred 审批、bubblewrap
+argv、journal gzip 等新测试在内的全部单测与集成测试通过。
+
+本节复跑本身没有包含真实端点四进程 demo；同一日的 §60 随后补上了 demo 与 supervisor
+退出分支。Linux 真机 bubblewrap 和真实 worker 的 RSS 压力阈值仍未验证。
+
+## 60. 2026-11-18 真实端点四进程 demo 与预算负零修复
+
+当前 HEAD 用隔离目录跑真实端点四进程 demo，启用 `KESTREL_DEMO_SUPERVISE=1` 与
+`KESTREL_DEMO_STATUS_DIR`，预算上限 10 cny。
+
+第一次用 5 cny 预算时，SA 在第一次派发前按价格表算出下一次预留 5.0720，预检直接拒绝：
+这证明停损看的是带价的预留上界，而不是等事后账单。但那一行同时暴露了一个旧修复遗漏：
+
+```
+[sa] budget stop-loss: spent -0.0000 (nominal -0.0000) + next reservation ...
+```
+
+§9.45 只把收尾报账接进了 `money()`，预算预检仍用裸 `{:.4}` 打印空账的 `-0.0`。现在抽出
+`budget_stop_loss_message()`，所有金额统一走 `money()`；回归测试
+`an_empty_ledger_stop_loss_line_does_not_read_as_a_debt` 钉住 `0.0000` 与预留上界的文案。
+
+预算改成 10 cny 后完整跑通：
+
+| 项目 | 结果 |
+|---|---|
+| `dev` / `review` / `test` / `build` | 四关均 pass |
+| 每关测试结论 | `22 passed / 0 failed` |
+| 账本 | `0.1250 cny, of which 0.0000 nominal` |
+| 审批 | 2 请求 / 2 裁决 / 2 回执，均 `applied=true` |
+| 最终状态 | `pipeline complete` |
+| worker 状态文件 | RD/QA 均落盘，含 RSS、task 与退休计数 |
+| supervisor 普通重启 | 模拟子进程首次 exit 1、第二次 exit 0：首次按 `restart=0/1` 退避后重启成功 |
+| supervisor hard-limit | 状态文件含 `hard_limit_tripped`、子进程 exit 70：日志标记 `hard_limit=yes` 后重启成功 |
+
+这一轮验证了 supervisor 入口、worker 状态文件、审批请求/裁决/回执和四阶段证据链路；
+没有用真实 worker 制造 RSS 软/中止/硬三级阈值，也没有覆盖 Linux bubblewrap。worker 仍产生了
+三条全角括注的形状告警，SA 在写侧修掉路径后判定通过；这不是失败，但说明提示词侧的路径洁癖
+仍值得继续收。
+
+## 61. 2026-11-18 真实 SA 起草 Spec
+
+新增 `demo-sa --sa-role harness/roles/sa.toml`：SA 先用 MiMo 跑一个有界回合起草
+`Spec.md`，再把路径广播进每颗门铃的 `ref.spec`；RD/QA 提示词要求先读它。模型没有工具，
+阶段推进、预算、证据核对和返工路由仍由确定性执行器负责。
+
+### 第一次真跑：Spec 过大 + 迟到回铃串代
+
+- Spec 5177 字节，要求 `src/` / `tests/` 目录和额外 demo 脚本；RD iter1 因 `mkdir` 被拒
+  并耗尽回合预算，iter2 才通过。
+- QA Review 超过 300s 回铃窗口；旧 iteration 的迟到结果铃被下一 iteration 的等待循环
+  当成新结果，SA 去读尚未写出的工件并连续重派，最终 `iteration cap reached for Review`。
+- 修复：`result_bell_matches()` 要求 `task_id + stage + iteration` 精确匹配；迟到铃显式
+  忽略。提示词收紧为最小实现、不新增子目录/额外 demo、验收 4-6 条、全文 1500 字内。
+
+### 第二次真跑：通过
+
+| 项目 | 结果 |
+|---|---|
+| Spec | 2479 字节，MiMo `325 in / 819 out` |
+| SA 成本 | `harness-sa: 0.0020 cny` |
+| 四阶段 | 全部 pass，每关 `11 passed / 0 failed` |
+| 账本 | `0.2059 cny, of which 0.0000 nominal` |
+| 最终状态 | `pipeline complete` |
+| journal | `usage_reported` / `budget_settled` 带 `stage=None`，另有 `spec_drafted` |
+
+仍未完成：SA 不选择下一关、不直接消费 worker 回铃、也不参与判定；完整模型驱动协调器
+仍是后续工作。
+
+## 62. 2026-11-18 SA 过渡复核
+
+新增 `demo-sa --sa-transitions`：每个 stage 判定后，SA 再生成一段最多 400 字的执行提示，
+PASS 进 `ref.handoff`，FAIL 进 `ref.rework.sa_note`。提示是 advisory；判定、路由、预算
+和证据核对仍由确定性执行器负责。
+
+### 第一次真跑暴露的两个缺陷
+
+1. **Handoff 指错下一关**：Review 后模型提示“下一关 Build”，跳过了 Test；QA 在 Test
+   阶段去索要 build 证据并 `FAIL: build evidence unavailable`。修复：transition prompt
+   写入固定顺序 `dev -> review -> test -> build` 和实际下一关，并明确 stage 以 `check`
+   为准；QA 提示词也禁止因 handoff 索要下一关证据。
+2. **Preflight 与 QA 共用 build.log**：QA 自己跑的 `py_compile` 被沙箱拒绝后，把
+   `artifacts/evidence/build.log` 覆盖成 exit 1，SA 已经通过的受信预检因此丢失。修复：
+   预检改名为 `build-preflight.log`，路径进 `ref.build_preflight`；QA 有该字段时直接声明
+   它，不再重跑构建命令。
+
+### 最终真跑
+
+| 项目 | 结果 |
+|---|---|
+| Spec | 1762 bytes |
+| Dev | iter1 缺判定词重派，iter2 pass |
+| Review / Test / Build | 各 iter1 pass |
+| 每关测试 | `11 passed / 0 failed` |
+| 账本 | `0.1521 cny, of which 0.0000 nominal` |
+| SA 成本 | `harness-sa: 0.0099 cny`（4214 in / 2859 out） |
+| 最终状态 | `pipeline complete` |
+
+模型仍不决定路由；下一步若继续，应把“是否 advance / rework / stop”提成受控的模型决策，
+但保留确定性允许集与预算/证据闸门。
+
+## 63. 2026-11-18 SA 受控路由
+
+新增 `demo-sa --sa-routing`：过渡复核首行输出
+`ACTION: advance|rework|redispatch|stop`，模型只能在当前判定的允许集里选。非法动作、缺失
+`ACTION:` 行、模型调用失败都退回确定性路线；`RoutingDecided` 审计记录写入
+`deterministic / chosen / source / note`。
+
+### 早期真跑：模型选了 stop
+
+第一次路由真跑里，Dev iter2 因 `estimate_rounds=2` 耗尽，模型选择 `stop` 并给出人工升级
+理由。这个 stop 在允许集内，但把规划估计当成了硬预算。prompt 随即说明：
+`estimate_rounds` 只是估计，只有不可恢复错误或确定性 iteration/预算耗尽才 stop。
+
+### 最终真跑
+
+| 项目 | 结果 |
+|---|---|
+| Spec | 2112 bytes |
+| Dev iter1 | model 选 `redispatch`（确定性也是 redispatch） |
+| Dev iter2 | model 选 `advance` |
+| Review / Test | model 选 `advance` |
+| Build iter1 | 回合超时，无工件；迟到结果铃被忽略 |
+| Build iter2 | model 选 `advance` |
+| 每关测试 | `11 passed / 0 failed` |
+| 账本 | `1.3451 cny, of which 0.0000 nominal` |
+| SA 成本 | `harness-sa: 0.0102 cny` |
+| 最终状态 | `pipeline complete` |
+
+Build 超时说明 QA 在有受信预检时仍做了过多检查；QA 提示词已收紧为「最多 1 条源码核对，
+不重跑 unittest，不因 Spec 提到 pytest 就安装/重试」。模型仍不能覆盖 PASS/FAIL，也不能
+选择 Allowlist 外的动作。
