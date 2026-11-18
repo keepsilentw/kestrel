@@ -24,11 +24,8 @@ use crate::core::actor::{AgentHandle, EngineConfig};
 use crate::core::id::{SystemClock, UuidGen};
 use crate::core::ops::ApprovalDecision;
 use crate::permissions::PermissionEngine;
-use crate::provider::anthropic::AnthropicWire;
-use crate::provider::openai_chat::OpenAiChatWire;
-use crate::provider::openai_responses::OpenAiResponsesWire;
 use crate::provider::retry::RetryTransport;
-use crate::provider::wire::{HttpTransport, ModelMeta, ResolvedAuth, WireFormat, WireId};
+use crate::provider::wire::{HttpTransport, ModelMeta, ResolvedAuth};
 use crate::sandbox::platform_sandbox;
 use crate::session::SessionStore;
 use crate::tools::ApproveMode;
@@ -178,11 +175,7 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let model = args.model.clone();
     let api_key = args.api_key.clone();
     let home = crate::config::kestrel_home();
-    let wire: Arc<dyn WireFormat> = match model.wire {
-        WireId::AnthropicMessages => Arc::new(AnthropicWire),
-        WireId::OpenAiCompletions => Arc::new(OpenAiChatWire),
-        WireId::OpenAiResponses => Arc::new(OpenAiResponsesWire),
-    };
+    let wire = crate::provider::wire_for(&model);
     let engine_policy = Arc::clone(&engine_policy);
     let worker_tool_slots = worker_tool_slots.clone();
     let task_sessions = Arc::new(Mutex::new(TaskSessions::default()));

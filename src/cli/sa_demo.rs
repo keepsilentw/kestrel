@@ -4,6 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -16,13 +17,19 @@ use crate::cli::evidence::{
 };
 use crate::cli::serve::{approval_command, approval_receipt_from_frame, decision_name};
 use crate::cli::task::artifact_path;
+use crate::config::RoleConfig;
+use crate::core::actor::{AgentHandle, EngineConfig};
+use crate::core::events::{EventMsg, MessageItem};
+use crate::core::id::UuidGen;
 use crate::core::ops::ApprovalDecision;
 use crate::journal::Journal;
 use crate::journal::records::Attribution;
 use crate::journal::records::{JournalRecord, JudgmentIssue, Stage, TestRun, ThinBell, Verdict};
 use crate::permissions::{Decision, PermissionEngine};
-use crate::provider::config::Registry;
-use crate::provider::wire::{CostPerMTok, Usage};
+use crate::provider::config::{KeyResolver, Registry};
+use crate::provider::retry::RetryTransport;
+use crate::provider::wire::{CostPerMTok, HttpTransport, ResolvedAuth, StopReason, Usage};
+use crate::sandbox::platform_sandbox;
 
 pub struct DemoSaArgs {
     pub bus_socket: PathBuf,
@@ -85,6 +92,15 @@ pub struct DemoSaArgs {
     /// stage 的证据要求表（JSON：`{"test": ["test_log"], ...}`）。没给 = 不要求任何
     /// 类型，只要 worker 点名的东西在盘上成立——也就是类型化之前的语义。
     pub evidence_spec: Option<PathBuf>,
+    /// SA 角色文件。给了就先用该角色的后端起草 `Spec.md`，再把 spec 路径广播进
+    /// 每颗门铃的 `ref.spec`；预算、usage 与 Spec 落盘都进 journal。
+    pub sa_role: Option<PathBuf>,
+    /// 每个 stage 判定后让 SA 再看一次，并把执行提示广播给下一关/返工。
+    /// 这只是**提示**，不改变确定性判定与路由；每次调用单独计费。
+    pub sa_transitions: bool,
+    /// 允许 SA 在确定性允许集内选择 advance / rework / redispatch / stop。
+    /// 判定本身仍不可被覆盖；不允许的动作退回确定性路线。
+    pub sa_routing: bool,
 }
 
 /// 一个 peer 后端的定价依据：SA 用它把 token 换成钱。
@@ -464,6 +480,7 @@ fn rework_payload(
     iter: u64,
     issues: &[JudgmentIssue],
     verdict_artifact: &Path,
+    sa_note: Option<&str>,
 ) -> serde_json::Value {
     let last_test = journal
         .projection()
@@ -477,12 +494,16 @@ fn rework_payload(
                 "runs": test.runs.iter().map(describe_run).collect::<Vec<String>>(),
             })
         });
-    serde_json::json!({
+    let mut payload = serde_json::json!({
         "from": format!("{} iter{iter}", format!("{stage:?}").to_lowercase()),
         "issues": issues,
         "verdict_artifact": verdict_artifact.display().to_string(),
         "last_test": last_test,
-    })
+    });
+    if let Some(note) = sa_note {
+        payload["sa_note"] = serde_json::json!(note);
+    }
+    payload
 }
 
 /// Execute the operator-declared build once, with the same command/exit log
@@ -521,7 +542,10 @@ async fn run_build_preflight(
         code: output.status.code(),
         signal: std::os::unix::process::ExitStatusExt::signal(&output.status),
     };
-    let path = evidence_dir.join("build.log");
+    // Keep the kernel-generated preflight separate from any verifier-produced
+    // build log. Sharing `build.log` let a QA `py_compile` failure overwrite a
+    // passing preflight before the SA judged the artifact.
+    let path = evidence_dir.join("build-preflight.log");
     let log = format!(
         "command: {command}\nexit: {exit:?}\n--- stdout ---\n{stdout}--- stderr ---\n{stderr}"
     );
@@ -540,8 +564,433 @@ async fn run_build_preflight(
     })
 }
 
+const SA_PEER: &str = "harness-sa";
+
+fn spec_prompt(task: &str) -> String {
+    format!(
+        "请为下面的任务起草 Spec.md。只输出 Markdown 正文，不要代码围栏，不要解释。\n\
+         必须包含：目标、范围与非目标、验收标准、风险，以及单独一行 `estimate_rounds: N`。\n\
+         验收标准要能被 review/test/build 三个阶段核对；不要设计需要联网才能运行的步骤。\n\
+         保持最小实现：除非任务明确要求，不要新增子目录、额外 demo 脚本或可选功能；\n\
+         验收标准控制在 4-6 条，每条都能用一条命令核对；全文控制在 1500 字以内。\n\n\
+         任务：\n{task}\n"
+    )
+}
+
+/// 模型偶尔会把整份 Markdown 包进 ``` 围栏；Spec 文件里不需要这层壳。
+fn strip_markdown_fence(text: &str) -> String {
+    let trimmed = text.trim();
+    let Some(rest) = trimmed.strip_prefix("```") else {
+        return trimmed.to_string();
+    };
+    let body = rest.split_once('\n').map(|(_, body)| body).unwrap_or("");
+    let body = body.trim_end();
+    body.strip_suffix("```").unwrap_or(body).trim().to_string()
+}
+
+/// A worker may finish an older iteration after the SA timed out and moved on.
+/// That late result bell must not satisfy the *new* wait: it would settle the
+/// wrong reservation and point the SA at an artifact for an iteration that has
+/// not finished yet. Frames with dispatch coordinates must match exactly; an
+/// error frame without coordinates is left to the existing error path.
+fn result_bell_matches(
+    payload: &serde_json::Value,
+    task_id: &str,
+    stage: &str,
+    iteration: u64,
+) -> bool {
+    let has_result = payload["result_ref"].is_string() || payload["error"].is_string();
+    if !has_result {
+        return true;
+    }
+    let task_ok = payload["task_id"]
+        .as_str()
+        .is_none_or(|value| value == task_id);
+    let stage_ok = payload["stage"].as_str().is_none_or(|value| value == stage);
+    let iteration_ok = payload["iteration"]
+        .as_u64()
+        .is_none_or(|value| value == iteration);
+    task_ok && stage_ok && iteration_ok
+}
+
+fn truncate_chars(text: &str, max: usize) -> String {
+    let mut out: String = text.chars().take(max).collect();
+    if text.chars().count() > max {
+        out.push_str("\n...");
+    }
+    out
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SaRoute {
+    Advance,
+    Rework,
+    Redispatch,
+    Stop,
+}
+
+impl SaRoute {
+    fn as_str(self) -> &'static str {
+        match self {
+            SaRoute::Advance => "advance",
+            SaRoute::Rework => "rework",
+            SaRoute::Redispatch => "redispatch",
+            SaRoute::Stop => "stop",
+        }
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "advance" => Some(SaRoute::Advance),
+            "rework" => Some(SaRoute::Rework),
+            "redispatch" => Some(SaRoute::Redispatch),
+            "stop" => Some(SaRoute::Stop),
+            _ => None,
+        }
+    }
+}
+
+/// The deterministic route and the routes the model is allowed to choose from.
+/// The allowlist is the safety boundary: a model can say "stop" early, or ask
+/// for one more verifier pass, but it cannot turn a FAIL into an advance.
+fn route_choices(verdict: &Verdict, stage: Stage, reworks_left: u64) -> (SaRoute, Vec<SaRoute>) {
+    if verdict.pass {
+        return (SaRoute::Advance, vec![SaRoute::Advance]);
+    }
+    let artifact_rework =
+        rework_target(stage) == Some(Stage::Dev) && verdict.attribution == Attribution::Artifact;
+    if artifact_rework {
+        if reworks_left == 0 {
+            (SaRoute::Stop, vec![SaRoute::Stop])
+        } else {
+            (
+                SaRoute::Rework,
+                vec![SaRoute::Rework, SaRoute::Redispatch, SaRoute::Stop],
+            )
+        }
+    } else {
+        (
+            SaRoute::Redispatch,
+            vec![SaRoute::Redispatch, SaRoute::Stop],
+        )
+    }
+}
+
+/// Parse the first `ACTION:` line and keep the rest as the human note. A
+/// missing/unknown action is `None`; the caller then falls back deterministically.
+fn parse_sa_route(text: &str) -> (Option<SaRoute>, String) {
+    let mut action = None;
+    let mut note = String::new();
+    for line in text.lines() {
+        let lower = line.to_ascii_lowercase();
+        if action.is_none()
+            && let Some(pos) = lower.find("action:")
+        {
+            action = SaRoute::parse(&line[pos + "action:".len()..]);
+            continue;
+        }
+        if !line.trim().is_empty() {
+            note.push_str(line.trim());
+            note.push('\n');
+        }
+    }
+    (action, strip_markdown_fence(note.trim()))
+}
+
+fn transition_prompt(
+    stage: Stage,
+    iter: u64,
+    verdict: &Verdict,
+    spec_path: Option<&Path>,
+    deterministic: SaRoute,
+    allowed: &[SaRoute],
+) -> String {
+    let next = match stage {
+        Stage::Spec => "dev",
+        Stage::Dev => "review",
+        Stage::Review => "test",
+        Stage::Test => "build",
+        Stage::Build | Stage::Release => "(final stage; no next stage)",
+    };
+    let issues = if verdict.issues.is_empty() {
+        "none".to_string()
+    } else {
+        verdict.issues.join(" | ")
+    };
+    let tests = if verdict.test_runs.is_empty() {
+        "none".to_string()
+    } else {
+        verdict
+            .test_runs
+            .iter()
+            .map(describe_run)
+            .collect::<Vec<_>>()
+            .join(" | ")
+    };
+    let spec = spec_path
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .map(|text| truncate_chars(&text, 2000))
+        .unwrap_or_else(|| "(none)".to_string());
+    format!(
+        "只做 SA 过渡复核：不能改变 PASS/FAIL，但可以在允许集内选择路由，不输出 JSON。\n\
+         当前 stage: {stage:?} iter{iter}\n\
+         固定顺序: dev -> review -> test -> build；当前 stage 之后是: {next}\n\
+         环境: 沙箱无网络，不能 pip/npm 安装依赖；Python 测试只用标准库 unittest，\n\
+         不要建议 pytest。路由选择只在允许集内生效；执行提示是 advisory，stage 以 check 为准。\n\
+         `estimate_rounds` 是规划估计，不是硬停损；不要仅因估计轮次到达就 stop。\n\
+         只有不可恢复错误，或确定性 iteration / 预算耗尽时才选择 stop。\n\
+         判定: {}\n\
+         issues: {issues}\n\
+         test: {tests}\n\
+         Spec 摘要:\n{spec}\n\n\
+         确定性建议: {}；允许动作: {}。\n\
+         首行必须写 `ACTION: <advance|rework|redispatch|stop>`，然后最多 400 字执行提示：\n\
+         - PASS：下一关先看什么、最容易漏的验收点是什么。\n\
+         - FAIL：写者/验证者下一步必须先修哪一件事，避免重复同一失败。\n",
+        if verdict.pass { "PASS" } else { "FAIL" },
+        deterministic.as_str(),
+        allowed
+            .iter()
+            .map(|route| route.as_str())
+            .collect::<Vec<_>>()
+            .join("|")
+    )
+}
+
+/// SA 角色后端的单回合封装。每次调用都走同一套预算预留/结算，避免 Spec 与
+/// 过渡复核各写一份账务逻辑。
+struct SaBackend {
+    role: String,
+    provider: String,
+    model_id: String,
+    model: crate::provider::wire::ModelMeta,
+    key: String,
+    system: String,
+    fs: crate::sandbox::FsPolicy,
+    policy: Arc<PermissionEngine>,
+    approve: crate::tools::ApproveMode,
+}
+
+struct SaTurn<'a> {
+    journal: &'a Journal,
+    ledger: &'a PriceLedger,
+    unit: &'a str,
+    iteration: u64,
+    label: &'a str,
+    prompt: String,
+}
+
+impl SaBackend {
+    fn load(args: &DemoSaArgs, role_path: &Path) -> anyhow::Result<Self> {
+        let role = RoleConfig::load(role_path)
+            .with_context(|| format!("load SA role {}", role_path.display()))?;
+        let base = role_path.parent().unwrap_or(Path::new("."));
+        let llm = role
+            .llm
+            .as_ref()
+            .with_context(|| format!("SA role {} has no [llm]", role_path.display()))?;
+        let registry_path = args
+            .prices
+            .clone()
+            .unwrap_or_else(|| crate::config::kestrel_home().join("providers.toml"));
+        let registry = Registry::load(&registry_path)
+            .with_context(|| format!("load provider registry {}", registry_path.display()))?;
+        Ok(Self {
+            role: role.role.clone(),
+            provider: llm.provider.clone(),
+            model_id: llm.model.clone(),
+            model: registry.model_meta(&llm.provider, &llm.model)?,
+            key: KeyResolver::new().resolve(&registry.providers[&llm.provider].key)?,
+            system: role.system_prompt(base)?,
+            fs: role.fs_policy(base)?,
+            policy: Arc::new(PermissionEngine::new(role.policy_table(base)?)),
+            approve: role.approve_mode(),
+        })
+    }
+
+    async fn ask(&self, args: &DemoSaArgs, turn: SaTurn<'_>) -> anyhow::Result<String> {
+        let state = turn.journal.projection().state;
+        let total: f64 = state.spent.values().sum();
+        let nominal: f64 = state.nominal.values().sum();
+        let (reserve, priced) = turn.ledger.reservation(SA_PEER, args.per_dispatch_cost);
+        if total + reserve > args.max_cost {
+            anyhow::bail!(budget_stop_loss_message(
+                total,
+                nominal,
+                reserve,
+                priced,
+                args.max_cost,
+                turn.unit
+            ));
+        }
+        turn.journal.append(&JournalRecord::reserved_planning(
+            args.task_id.clone(),
+            SA_PEER,
+            turn.iteration,
+            reserve,
+            priced,
+        ))?;
+
+        let handle = AgentHandle::spawn(EngineConfig {
+            provider: crate::provider::wire_for(&self.model),
+            model: self.model.clone(),
+            auth: ResolvedAuth::key(self.key.clone()),
+            transport: Arc::new(RetryTransport::new(Arc::new(HttpTransport::new()))),
+            system: self.system.clone(),
+            tools: Vec::new(),
+            max_rounds: 1,
+            max_parallel_tools: 0,
+            worker_tool_slots: None,
+            cwd: args.artifacts.clone(),
+            role: self.role.clone(),
+            idgen: Arc::new(UuidGen),
+            sandbox: platform_sandbox(),
+            fs: self.fs.clone(),
+            engine: Arc::clone(&self.policy),
+            approve: self.approve,
+            approval_store: None,
+            session: None,
+        });
+        let mut events = handle
+            .take_event_rx()
+            .context("SA model event stream was already taken")?;
+        handle.turn(vec![MessageItem::user_text(turn.prompt)]);
+
+        let mut text = String::new();
+        let mut usage = None;
+        let mut stop = None;
+        while let Some(event) = events.recv().await {
+            match event.msg {
+                EventMsg::MessageDone {
+                    item: MessageItem::AssistantText { text: chunk },
+                } => {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(&chunk);
+                }
+                EventMsg::TurnComplete {
+                    usage: turn_usage,
+                    stop: turn_stop,
+                } => {
+                    usage = Some(turn_usage);
+                    stop = Some(turn_stop);
+                    break;
+                }
+                EventMsg::Fatal { error } => {
+                    anyhow::bail!("[sa] {} turn failed: {error}", turn.label);
+                }
+                _ => {}
+            }
+        }
+        handle.shutdown().await;
+        let stop = stop.context(format!("SA {} turn ended without TurnComplete", turn.label))?;
+        if stop != StopReason::Stop {
+            anyhow::bail!(
+                "[sa] {} turn stopped with {stop:?}; refusing a partial answer",
+                turn.label
+            );
+        }
+        let usage = usage.context(format!("SA {} turn reported no usage", turn.label))?;
+        turn.journal.append(&JournalRecord::UsageReported {
+            peer: SA_PEER.into(),
+            usage,
+        })?;
+        let untrustworthy = under_reports_input(&usage);
+        match (turn.ledger.settle(SA_PEER, &usage), untrustworthy) {
+            (Some(cost), false) => {
+                turn.journal.append(&JournalRecord::settled_planning(
+                    args.task_id.clone(),
+                    SA_PEER,
+                    turn.iteration,
+                    usage,
+                    cost,
+                    true,
+                ))?;
+                println!(
+                    "[sa] {}: settled {cost:.4} {} for {} in / {} out tokens",
+                    turn.label, turn.unit, usage.input_tokens, usage.output_tokens
+                );
+            }
+            (Some(_), true) => {
+                turn.journal
+                    .append(&JournalRecord::settled_planning_as_nominal(
+                        args.task_id.clone(),
+                        SA_PEER,
+                        turn.iteration,
+                        usage,
+                        reserve,
+                        crate::journal::records::NominalReason::UnderReported,
+                    ))?;
+                println!(
+                    "[sa] {}: SA reported 0 input tokens with {} out — booking the \
+                     reservation {reserve:.4} {} as NOMINAL",
+                    turn.label, usage.output_tokens, turn.unit
+                );
+            }
+            (None, _) => println!(
+                "[sa] {}: {SA_PEER} has no rate — the reservation stays as the bill (nominal)",
+                turn.label
+            ),
+        }
+        Ok(text)
+    }
+}
+
+/// 第一段真实 SA 能力：先让 SA 角色的后端起草 Spec，再进入确定性派发状态机。
+/// 模型只决定「做什么、验什么」，预算停损、证据核对、门铃顺序和返工路由仍由内核执行。
+async fn draft_spec(
+    args: &DemoSaArgs,
+    backend: &SaBackend,
+    journal: &Journal,
+    ledger: &PriceLedger,
+    unit: &str,
+    iteration: u64,
+) -> anyhow::Result<PathBuf> {
+    tokio::fs::create_dir_all(&args.artifacts)
+        .await
+        .with_context(|| format!("create artifacts dir {}", args.artifacts.display()))?;
+    let text = backend
+        .ask(
+            args,
+            SaTurn {
+                journal,
+                ledger,
+                unit,
+                iteration,
+                label: "spec",
+                prompt: spec_prompt(&args.task),
+            },
+        )
+        .await?;
+    let spec = strip_markdown_fence(&text);
+    if spec.len() < 20 {
+        anyhow::bail!(
+            "[sa] SA returned an empty or too-short Spec ({} byte(s))",
+            spec.len()
+        );
+    }
+    let path = args
+        .artifacts
+        .join(format!("{}-SPEC.md", crate::cli::task::slug(&args.task_id)));
+    tokio::fs::write(&path, format!("{spec}\n"))
+        .await
+        .with_context(|| format!("write Spec {}", path.display()))?;
+    journal.append(&JournalRecord::SpecDrafted {
+        task: args.task_id.clone(),
+        path: path.display().to_string(),
+        provider: backend.provider.clone(),
+        model: backend.model_id.clone(),
+    })?;
+    println!("[sa] spec: {} ({} bytes)", path.display(), spec.len());
+    Ok(path)
+}
+
 /// dispatch → wait bell → reconcile（读盘为准）→ 推进/回派，直至 release。
 pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
+    if (args.sa_transitions || args.sa_routing) && args.sa_role.is_none() {
+        anyhow::bail!("--sa-transitions/--sa-routing require --sa-role");
+    }
     let journal = Journal::create(&args.journal)?;
     // 审批台账从 journal 播种：SA 重启后仍然认得「这个 req 我已经答过了」，
     // 于是 worker 的重发只会拿到同一份批复，而不是第二次判定 + 第二对审计记录。
@@ -596,6 +1045,22 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
     // 钱有一个币种，而且这个币种有来源（价格表声明 > `--currency`）。同一次运行里
     // 混两种币种直接失败：账本是加总的，「0.1 美元 + 0.5 元」不是任何数（§9.44）。
     let unit = ledger.unit(&args.currency)?;
+    let sa_backend = match &args.sa_role {
+        Some(role_path) => Some(SaBackend::load(&args, role_path)?),
+        None => None,
+    };
+    let mut sa_turns = 0u64;
+    let spec_path = match &sa_backend {
+        Some(backend) => {
+            sa_turns += 1;
+            Some(draft_spec(&args, backend, &journal, &ledger, &unit, sa_turns).await?)
+        }
+        None => None,
+    };
+    let sa_routing_enabled = args.sa_routing && sa_backend.is_some();
+    let mut sa_transitions_enabled =
+        (args.sa_transitions || args.sa_routing) && sa_backend.is_some();
+    let mut sa_handoff: Option<String> = None;
     // 证据要求表：坏表硬失败（读不出来就当「没有要求」是 fail-open，验收标准会被
     // 静默放宽）。没给 = 只核存在性。
     let requirements = match &args.evidence_spec {
@@ -610,7 +1075,11 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
             EvidenceSpec::default()
         }
     };
-    let unpriced: Vec<&str> = [args.rd_peer.as_str(), args.qa_peer.as_str()]
+    let mut priced_peers = vec![args.rd_peer.as_str(), args.qa_peer.as_str()];
+    if args.sa_role.is_some() {
+        priced_peers.push(SA_PEER);
+    }
+    let unpriced: Vec<&str> = priced_peers
         .into_iter()
         .filter(|p| !ledger.is_priced(p))
         .collect();
@@ -652,6 +1121,7 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
         // A failed build is an artifact issue and follows the normal Dev rework
         // path; it never asks the verifier model to invent a substitute.
         let mut trusted_evidence = Vec::new();
+        let mut build_preflight = None;
         if stage == Stage::Build
             && let Some(command) = args
                 .build_command
@@ -667,6 +1137,7 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
             .await?;
             if preflight.issues.is_empty() {
                 println!("[sa] build preflight: {}", preflight.evidence.path);
+                build_preflight = Some(PathBuf::from(&preflight.evidence.path));
                 trusted_evidence.push(preflight.evidence);
             } else {
                 let issues: Vec<JudgmentIssue> = preflight
@@ -713,6 +1184,7 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
                     iter,
                     &issues,
                     Path::new(&preflight.evidence.path),
+                    None,
                 ));
                 iters[writer_idx] += 1;
                 idx = writer_idx;
@@ -738,16 +1210,14 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
             let nominal: f64 = state.nominal.values().sum();
             let (reserve, priced) = ledger.reservation(target, args.per_dispatch_cost);
             if total + reserve > args.max_cost {
-                anyhow::bail!(
-                    "[sa] budget stop-loss: spent {total:.4} (nominal {nominal:.4}) + next \
-                     reservation {reserve:.4}{} > max {:.4} {unit}",
-                    if priced {
-                        " = priced upper bound"
-                    } else {
-                        " (nominal)"
-                    },
-                    args.max_cost
-                );
+                anyhow::bail!(budget_stop_loss_message(
+                    total,
+                    nominal,
+                    reserve,
+                    priced,
+                    args.max_cost,
+                    &unit
+                ));
             }
             if iter > args.max_iterations {
                 // 上限要说清是**怎么**撞上的：写者的 iter 里混着验证 FAIL 换来的返工
@@ -786,6 +1256,15 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
                         "evidence": args.artifacts.join("evidence"),
                         "worktree": args.worktree,
                     });
+                    if let Some(spec) = &spec_path {
+                        bell_ref["spec"] = serde_json::json!(spec);
+                    }
+                    if let Some(preflight) = &build_preflight {
+                        bell_ref["build_preflight"] = serde_json::json!(preflight);
+                    }
+                    if let Some(note) = &sa_handoff {
+                        bell_ref["handoff"] = serde_json::json!(note);
+                    }
                     // 「上一关为什么没过」进铃的 ref：写者拿到的是可核对的失败原因
                     // （连同一个判定工件路径），不是「再试一次」这种措辞。
                     if let Some(note) = &rework_note {
@@ -847,7 +1326,18 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
                             &mut approvals,
                         )?;
                     }
-                    Ok(Ok(env)) => break Some(env),
+                    Ok(Ok(env)) => {
+                        if result_bell_matches(&env.payload, &args.task_id, &stage_name, iter) {
+                            break Some(env);
+                        }
+                        println!(
+                            "[sa] {stage_name} iter{iter}: ignoring a late result bell for \
+                             task={} stage={} iteration={}",
+                            env.payload["task_id"].as_str().unwrap_or("?"),
+                            env.payload["stage"].as_str().unwrap_or("?"),
+                            env.payload["iteration"].as_u64().unwrap_or(0)
+                        );
+                    }
                     Ok(Err(e)) => {
                         println!("[sa] bell read failed: {e} -> inspecting disk");
                         break None;
@@ -993,59 +1483,176 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
                     journal.len()
                 );
             }
-            if verdict.pass {
-                println!("[sa] {stage_name} iter{iter}: pass");
-                break StageOutcome::Pass;
+            let (deterministic_route, allowed_routes) =
+                route_choices(&verdict, stage, reworks_left);
+            let mut route = deterministic_route;
+            let mut route_source = "deterministic";
+            let mut sa_note = None;
+            if sa_transitions_enabled && let Some(backend) = &sa_backend {
+                sa_turns += 1;
+                let label = format!("{stage_name} iter{iter} transition");
+                match backend
+                    .ask(
+                        &args,
+                        SaTurn {
+                            journal: &journal,
+                            ledger: &ledger,
+                            unit: &unit,
+                            iteration: sa_turns,
+                            label: &label,
+                            prompt: transition_prompt(
+                                stage,
+                                iter,
+                                &verdict,
+                                spec_path.as_deref(),
+                                deterministic_route,
+                                &allowed_routes,
+                            ),
+                        },
+                    )
+                    .await
+                {
+                    Ok(text) => {
+                        let (action, note) = parse_sa_route(&text);
+                        if sa_routing_enabled {
+                            if let Some(action) = action {
+                                if allowed_routes.contains(&action) {
+                                    route = action;
+                                    route_source = "model";
+                                } else {
+                                    println!(
+                                        "[sa] {stage_name} iter{iter}: model action {} is not \
+                                         allowed here ({}); keeping {}",
+                                        action.as_str(),
+                                        allowed_routes
+                                            .iter()
+                                            .map(|route| route.as_str())
+                                            .collect::<Vec<_>>()
+                                            .join("|"),
+                                        deterministic_route.as_str()
+                                    );
+                                }
+                            } else {
+                                println!(
+                                    "[sa] {stage_name} iter{iter}: transition reply has no \
+                                     parseable ACTION line; keeping {}",
+                                    deterministic_route.as_str()
+                                );
+                            }
+                        }
+                        if !note.is_empty() {
+                            println!(
+                                "[sa] {stage_name} iter{iter}: sa note: {}",
+                                truncate_chars(&note.replace('\n', " "), 200)
+                            );
+                            if route != SaRoute::Rework {
+                                sa_handoff = Some(note.clone());
+                            }
+                            sa_note = Some(note);
+                        }
+                    }
+                    Err(error) => {
+                        println!(
+                            "[sa] {stage_name} iter{iter}: transition review failed: {error} \
+                             — continuing with the deterministic route"
+                        );
+                        sa_transitions_enabled = false;
+                    }
+                }
             }
-            // FAIL 之后「派给谁」是路由问题，不是判定强度：验证类 stage 说不达标，
-            // 说的是**被验证的产物**，而验证者没有写范围，再给它一颗铃只会得到同一份
-            // FAIL。返工要有额度（`max_reworks`），额度用尽就把它说成显式失败。
-            // 归因是判定那一刻就写进 `verdict.attribution` 的字段（§9.41），路由只是读它——
-            // 不在这里重新解释 issue 的措辞，否则改一句文案就会悄悄改掉路由。
-            if rework_target(stage) == Some(Stage::Dev)
-                && verdict.attribution == Attribution::Artifact
-            {
-                if reworks_left == 0 {
+            journal.append(&JournalRecord::RoutingDecided {
+                task: args.task_id.clone(),
+                stage,
+                iteration: iter,
+                deterministic: deterministic_route.as_str().into(),
+                chosen: route.as_str().into(),
+                source: route_source.into(),
+                note: sa_note.clone().unwrap_or_default(),
+            })?;
+            println!(
+                "[sa] {stage_name} iter{iter}: route {} (source={route_source}, deterministic={})",
+                route.as_str(),
+                deterministic_route.as_str()
+            );
+            match route {
+                SaRoute::Advance => {
+                    if !verdict.pass {
+                        anyhow::bail!(
+                            "[sa] {stage_name} iter{iter}: model chose advance on a FAIL verdict"
+                        );
+                    }
+                    println!("[sa] {stage_name} iter{iter}: pass");
+                    break StageOutcome::Pass;
+                }
+                SaRoute::Stop => {
                     anyhow::bail!(
-                        "[sa] {stage_name} iter{iter}: fail ({}) and the rework budget is spent \
-                         — re-dispatching the verifier would only repeat this verdict",
-                        verdict.issues.join(", ")
+                        "[sa] {stage_name} iter{iter}: stopped by {route_source}: {}",
+                        sa_note.as_deref().unwrap_or("no SA note")
                     );
                 }
-                reworks_left -= 1;
-                // 返工铃除了「上一关为什么没过」，还带上写者那一关**账上**的测试结论
-                // （§9.35：结论成为状态之后，这里就是它的读者之一）。省掉一轮「我到底
-                // 哪儿没过」的试探；`null` 说的是「你上关什么都没数出来」，不是「没问题」。
-                rework = Some(rework_payload(
-                    &journal,
-                    &args.task_id,
-                    stage,
-                    iter,
-                    &verdict.issues,
-                    &artifact,
-                ));
-                println!(
-                    "[sa] {stage_name} iter{iter}: fail ({}) -> rework by {} ({} credit(s) left)",
-                    verdict.issues.join(", "),
-                    args.peer_for(Stage::Dev),
-                    reworks_left
-                );
-                iter += 1;
-                break StageOutcome::Rework;
+                // FAIL 之后「派给谁」是路由问题，不是判定强度：验证类 stage 说不达标，
+                // 说的是**被验证的产物**，而验证者没有写范围，再给它一颗铃只会得到同一份
+                // FAIL。返工要有额度（`max_reworks`），额度用尽就把它说成显式失败。
+                // 归因是判定那一刻就写进 `verdict.attribution` 的字段（§9.41），路由只是读它——
+                // 不在这里重新解释 issue 的措辞，否则改一句文案就会悄悄改掉路由。
+                SaRoute::Rework => {
+                    if rework_target(stage) != Some(Stage::Dev)
+                        || verdict.attribution != Attribution::Artifact
+                    {
+                        anyhow::bail!(
+                            "[sa] {stage_name} iter{iter}: route rework is not valid for \
+                             attribution {:?}",
+                            verdict.attribution
+                        );
+                    }
+                    if reworks_left == 0 {
+                        anyhow::bail!(
+                            "[sa] {stage_name} iter{iter}: fail ({}) and the rework budget is spent \
+                             — re-dispatching the verifier would only repeat this verdict",
+                            verdict.issues.join(", ")
+                        );
+                    }
+                    reworks_left -= 1;
+                    // 返工铃除了「上一关为什么没过」，还带上写者那一关**账上**的测试结论
+                    // （§9.35：结论成为状态之后，这里就是它的读者之一）。省掉一轮「我到底
+                    // 哪儿没过」的试探；`null` 说的是「你上关什么都没数出来」，不是「没问题」。
+                    rework = Some(rework_payload(
+                        &journal,
+                        &args.task_id,
+                        stage,
+                        iter,
+                        &verdict.issues,
+                        &artifact,
+                        sa_note.as_deref(),
+                    ));
+                    println!(
+                        "[sa] {stage_name} iter{iter}: fail ({}) -> rework by {} \
+                         ({} credit(s) left)",
+                        verdict.issues.join(", "),
+                        args.peer_for(Stage::Dev),
+                        reworks_left
+                    );
+                    iter += 1;
+                    break StageOutcome::Rework;
+                }
+                // 走到这里有两种：Dev 自己的 FAIL（「你还没做成」），或验证者那一回合坏了
+                // （空结果 / abort / stop=error）。后者的产物**还没被可信地看过**，重派验证者、
+                // 不扣返工额度——把 QA 的哑火算到 RD 头上，只会换来两轮辩护。
+                SaRoute::Redispatch => {
+                    let why = match verdict.attribution {
+                        Attribution::Turn => {
+                            "this turn broke, so the artifact was never credibly seen"
+                        }
+                        Attribution::Artifact => "the writer did not finish the job",
+                    };
+                    println!(
+                        "[sa] {stage_name} iter{iter}: fail ({}) -> re-dispatch {target} ({why})",
+                        verdict.issues.join(", ")
+                    );
+                    iter += 1;
+                    continue;
+                }
             }
-            // 走到这里有两种：Dev 自己的 FAIL（「你还没做成」），或验证者那一回合坏了
-            // （空结果 / abort / stop=error）。后者的产物**还没被可信地看过**，重派验证者、
-            // 不扣返工额度——把 QA 的哑火算到 RD 头上，只会换来两轮辩护。
-            let why = match verdict.attribution {
-                Attribution::Turn => "this turn broke, so the artifact was never credibly seen",
-                Attribution::Artifact => "the writer did not finish the job",
-            };
-            println!(
-                "[sa] {stage_name} iter{iter}: fail ({}) -> re-dispatch {target} ({why})",
-                verdict.issues.join(", ")
-            );
-            iter += 1;
-            continue;
         };
         iters[idx] = iter;
         match outcome {
@@ -1087,6 +1694,31 @@ fn money(amount: f64) -> String {
     } else {
         format!("{amount:.4}")
     }
+}
+
+/// The stop-loss line is shown before the first dispatch too, when both sums are
+/// the empty iterator's unit (`-0.0`). Route every amount through `money()` so
+/// that "nothing spent yet" never renders as `-0.0000`.
+fn budget_stop_loss_message(
+    total: f64,
+    nominal: f64,
+    reserve: f64,
+    priced: bool,
+    max: f64,
+    unit: &str,
+) -> String {
+    format!(
+        "[sa] budget stop-loss: spent {} (nominal {}) + next reservation {}{} > max {} {unit}",
+        money(total),
+        money(nominal),
+        money(reserve),
+        if priced {
+            " = priced upper bound"
+        } else {
+            " (nominal)"
+        },
+        money(max)
+    )
 }
 
 /// 收尾报账：花了多少、其中多少仍是名义值、换出了多少 token。`--max-cost` 到底是
@@ -1824,6 +2456,10 @@ mod tests {
         assert!(preflight.issues.is_empty(), "{:?}", preflight.issues);
         let evidence = preflight.evidence;
         assert_eq!(evidence.kind, EvidenceKind::BuildLog);
+        assert!(
+            evidence.path.ends_with("build-preflight.log"),
+            "the preflight must not share the verifier's build.log"
+        );
 
         let artifact = write_artifact(
             "trusted-build.json",
@@ -1912,6 +2548,9 @@ mod tests {
             roles_dir: None,
             prices: None,
             evidence_spec: None,
+            sa_role: None,
+            sa_transitions: false,
+            sa_routing: false,
         };
         assert_eq!(args.peer_for(Stage::Dev), "harness-rd");
         assert_eq!(args.peer_for(Stage::Build), "harness-qa");
@@ -2294,6 +2933,129 @@ mod tests {
         assert_eq!(money(-1e-9), "0.0000");
         assert_eq!(money(0.1806), "0.1806");
         assert_eq!(money(-0.0001), "-0.0001", "真负数照印，不钳位");
+    }
+
+    /// 2026-11-18 真实 demo 在第一次派发前撞预算预检，现场打出
+    /// `spent -0.0000 (nominal -0.0000)`：金额本身是 `-0.0`，但停损行绕过了
+    /// `money()`。这条测试钉住预检行与收尾报账行用同一套零值渲染。
+    #[test]
+    fn an_empty_ledger_stop_loss_line_does_not_read_as_a_debt() {
+        let line = budget_stop_loss_message(-0.0, -0.0, 5.072, true, 5.0, "cny");
+        assert!(
+            line.contains("spent 0.0000 (nominal 0.0000)"),
+            "unexpected line: {line}"
+        );
+        assert!(
+            !line.contains("-0.0000"),
+            "unexpected negative zero: {line}"
+        );
+        assert!(
+            line.contains("reservation 5.0720 = priced upper bound > max 5.0000 cny"),
+            "unexpected line: {line}"
+        );
+    }
+
+    #[test]
+    fn spec_prompt_carries_the_task_and_the_round_estimate_contract() {
+        let prompt = spec_prompt("实现一个 LRU cache");
+        assert!(prompt.contains("实现一个 LRU cache"));
+        assert!(prompt.contains("estimate_rounds: N"));
+        assert!(prompt.contains("验收标准"));
+    }
+
+    #[test]
+    fn markdown_fence_is_stripped_from_the_spec() {
+        let fenced = "```markdown\n# Spec\n\n目标：demo\n```";
+        assert_eq!(strip_markdown_fence(fenced), "# Spec\n\n目标：demo");
+        assert_eq!(strip_markdown_fence("  # Spec  "), "# Spec");
+        assert_eq!(strip_markdown_fence(""), "");
+    }
+
+    #[test]
+    fn a_late_result_bell_cannot_satisfy_a_new_iteration() {
+        let payload = serde_json::json!({
+            "task_id": "demo",
+            "stage": "review",
+            "iteration": 1,
+            "result_ref": "/artifacts/review-1.json"
+        });
+        assert!(result_bell_matches(&payload, "demo", "review", 1));
+        assert!(!result_bell_matches(&payload, "demo", "review", 2));
+        assert!(!result_bell_matches(&payload, "demo", "test", 1));
+        assert!(!result_bell_matches(&payload, "t2", "review", 1));
+        assert!(result_bell_matches(
+            &serde_json::json!({"error": "task cap"}),
+            "demo",
+            "review",
+            2
+        ));
+    }
+
+    #[test]
+    fn transition_prompt_carries_the_verdict_but_forbids_changing_it() {
+        let verdict = Verdict::new(
+            false,
+            vec![JudgmentIssue::artifact("missing test_log")],
+            vec![],
+            vec![],
+        );
+        let (deterministic, allowed) = route_choices(&verdict, Stage::Review, 2);
+        let prompt = transition_prompt(Stage::Review, 2, &verdict, None, deterministic, &allowed);
+        assert!(prompt.contains("Review iter2"));
+        assert!(prompt.contains("当前 stage 之后是: test"));
+        assert!(prompt.contains("不要建议 pytest"));
+        assert!(prompt.contains("estimate_rounds` 是规划估计，不是硬停损"));
+        assert!(prompt.contains("判定: FAIL"));
+        assert!(prompt.contains("missing test_log"));
+        assert!(prompt.contains("不能改变 PASS/FAIL"));
+        assert!(prompt.contains("确定性建议: rework"));
+        assert_eq!(truncate_chars("abcdef", 3), "abc\n...");
+        assert_eq!(truncate_chars("abc", 3), "abc");
+    }
+
+    #[test]
+    fn routing_allowlist_never_lets_a_fail_advance() {
+        let fail_artifact = Verdict::new(
+            false,
+            vec![JudgmentIssue::artifact("missing test_log")],
+            vec![],
+            vec![],
+        );
+        let (deterministic, allowed) = route_choices(&fail_artifact, Stage::Review, 2);
+        assert_eq!(deterministic, SaRoute::Rework);
+        assert!(allowed.contains(&SaRoute::Rework));
+        assert!(allowed.contains(&SaRoute::Stop));
+        assert!(!allowed.contains(&SaRoute::Advance));
+
+        let (deterministic, allowed) = route_choices(&fail_artifact, Stage::Review, 0);
+        assert_eq!(deterministic, SaRoute::Stop);
+        assert_eq!(allowed, vec![SaRoute::Stop]);
+
+        let fail_turn = Verdict::new(
+            false,
+            vec![JudgmentIssue::turn("worker aborted")],
+            vec![],
+            vec![],
+        );
+        let (deterministic, allowed) = route_choices(&fail_turn, Stage::Review, 2);
+        assert_eq!(deterministic, SaRoute::Redispatch);
+        assert!(allowed.contains(&SaRoute::Redispatch));
+        assert!(!allowed.contains(&SaRoute::Rework));
+
+        let pass = Verdict::new(true, vec![], vec![], vec![]);
+        let (deterministic, allowed) = route_choices(&pass, Stage::Dev, 0);
+        assert_eq!(deterministic, SaRoute::Advance);
+        assert_eq!(allowed, vec![SaRoute::Advance]);
+    }
+
+    #[test]
+    fn transition_action_is_parsed_from_the_first_action_line() {
+        let (action, note) = parse_sa_route("ACTION: stop\n\n先停下来，等人工确认。\n");
+        assert_eq!(action, Some(SaRoute::Stop));
+        assert_eq!(note, "先停下来，等人工确认。");
+        let (action, note) = parse_sa_route("没有动作行\n只有说明");
+        assert_eq!(action, None);
+        assert_eq!(note, "没有动作行\n只有说明");
     }
 
     /// 真端点联跑抓到的一格（2026-11-05）：投递是 at-least-once，所以同一颗 `req`

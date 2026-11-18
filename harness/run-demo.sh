@@ -2,7 +2,7 @@
 # harness demo: SA + RD + QA 星型拓扑的最小可跑闭环（design §2）。
 #
 # 拓扑：hub（唯一总线进程）+ RD/QA 两个 worker（各按自己 role 的 [llm] 接后端）
-#       + demo-sa（脚本化 SA 状态机，无 LLM 派发智能）。
+#       + demo-sa（脚本化 SA 状态机；设 `KESTREL_DEMO_SA_ROLE` 时先由 SA 模型起草 Spec）。
 #
 # 前置：~/.kestrel/providers.toml 已配置 harness/roles/*.toml 里 [llm] 引用的 provider。
 # 环境变量：
@@ -39,6 +39,13 @@
 #   KESTREL_DEMO_SUPERVISE_MAX_RESTARTS / _BACKOFF_SECS
 #                             监督重启次数与退避（默认 3 / 2 秒）。
 #   KESTREL_DEMO_TRUSTED_BUILD_PREFIXES  额外受信构建命令前缀，每行一个。
+#   KESTREL_DEMO_SA_ROLE      设了才给 demo-sa 传 --sa-role；该角色的后端会先起草
+#                             Spec.md，再进入确定性派发状态机。不设 = 沿用脚本化 SA。
+#   KESTREL_DEMO_SA_TRANSITIONS  置 1 时每个 stage 判定后再问 SA 一次，把执行提示
+#                             广播成 `ref.handoff` / `ref.rework.sa_note`（只作提示，
+#                             不改变判定与路由）。
+#   KESTREL_DEMO_SA_ROUTING   置 1 时让 SA 在确定性允许集内选择
+#                             advance / rework / redispatch / stop；非法选择退回确定性路线。
 #
 # 用法：./run-demo.sh
 set -euo pipefail
@@ -181,16 +188,29 @@ fi
 PRICE_ARGS=()
 [ -z "${KESTREL_DEMO_PRICES+set}" ] || PRICE_ARGS+=(--prices "$KESTREL_DEMO_PRICES")
 
-BUILD_COMMAND="${KESTREL_DEMO_BUILD_COMMAND:-python3 -m py_compile '$WORKTREE/lru_cache.py' '$WORKTREE/test_lru_cache.py'}"
+if [ -f "$WORKTREE/test_lru_cache.py" ]; then
+  DEFAULT_BUILD_COMMAND="python3 -m py_compile '$WORKTREE/lru_cache.py' '$WORKTREE/test_lru_cache.py'"
+else
+  DEFAULT_BUILD_COMMAND="python3 -m py_compile '$WORKTREE/lru_cache.py'"
+fi
+BUILD_COMMAND="${KESTREL_DEMO_BUILD_COMMAND:-$DEFAULT_BUILD_COMMAND}"
 TRUSTED_BUILD_ARGS=()
 while IFS= read -r prefix; do
   [ -z "$prefix" ] || TRUSTED_BUILD_ARGS+=(--trusted-build-prefix "$prefix")
 done <<< "${KESTREL_DEMO_TRUSTED_BUILD_PREFIXES:-}"
 
+SA_ARGS=()
+[ -z "${KESTREL_DEMO_SA_ROLE+set}" ] || SA_ARGS+=(--sa-role "$KESTREL_DEMO_SA_ROLE")
+SA_TRANSITION_ARGS=()
+[ "${KESTREL_DEMO_SA_TRANSITIONS:-0}" != "1" ] || SA_TRANSITION_ARGS+=(--sa-transitions)
+[ "${KESTREL_DEMO_SA_ROUTING:-0}" != "1" ] || SA_TRANSITION_ARGS+=(--sa-routing)
+
 KESTREL_TEST_KILL_AFTER="${KESTREL_TEST_KILL_AFTER:-}" \
   "$BIN" demo-sa --bus-socket "$SOCKET" --task "${KESTREL_DEMO_TASK:-demo: 实现一个 LRU cache}" \
   --journal "$HERE/journal.jsonl" --artifacts-dir "$ARTIFACTS" \
   --worktree "$WORKTREE" \
+  ${SA_ARGS[@]+"${SA_ARGS[@]}"} \
+  ${SA_TRANSITION_ARGS[@]+"${SA_TRANSITION_ARGS[@]}"} \
   --build-command "$BUILD_COMMAND" \
   ${TRUSTED_BUILD_ARGS[@]+"${TRUSTED_BUILD_ARGS[@]}"} \
   --approvals "$HERE/roles/sa.approvals.json" \

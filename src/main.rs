@@ -289,6 +289,24 @@ struct DemoSaCmd {
     /// Peer the review/test/build stages are dispatched to.
     #[arg(long, default_value = "harness-qa")]
     qa_peer: String,
+
+    /// SA role file. When set, `demo-sa` first asks that role's backend to draft
+    /// a `Spec.md`, then broadcasts it to every stage bell as `ref.spec`. The
+    /// deterministic executor keeps the budget, evidence and rework rules.
+    #[arg(long)]
+    sa_role: Option<PathBuf>,
+
+    /// After every stage verdict, ask the SA model for a short handoff/rework
+    /// note and put it on the next bell as `ref.handoff` / `ref.rework.sa_note`.
+    /// The note is advisory; pass/fail and routing stay deterministic.
+    #[arg(long)]
+    sa_transitions: bool,
+
+    /// Let the SA choose among the routes allowed for the current verdict:
+    /// advance / rework / redispatch / stop. The allowlist and the deterministic
+    /// fallback stay in the kernel; an illegal choice is ignored.
+    #[arg(long)]
+    sa_routing: bool,
 }
 
 #[derive(Args, Debug)]
@@ -619,6 +637,9 @@ async fn main() -> anyhow::Result<()> {
                 roles_dir: d.roles_dir,
                 prices: d.prices,
                 evidence_spec: d.evidence_spec,
+                sa_role: d.sa_role,
+                sa_transitions: d.sa_transitions,
+                sa_routing: d.sa_routing,
             })
             .await;
         }

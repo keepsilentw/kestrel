@@ -352,6 +352,25 @@ pub enum JournalRecord {
         peer: String,
         usage: crate::provider::wire::Usage,
     },
+    /// SA 规划的 Spec 工件落盘。审计记录，不参与状态折叠；Spec 路径也会进
+    /// 每颗门铃的 `ref.spec`，worker 用它作为验收标准的第一来源。
+    SpecDrafted {
+        task: TaskId,
+        path: String,
+        provider: String,
+        model: String,
+    },
+    /// SA 的路由决定：确定性建议、模型选择与来源都落账。审计记录，不参与折叠；
+    /// 事后能分清「模型选了 rework」和「模型给了不允许的动作，退回确定路线」。
+    RoutingDecided {
+        task: TaskId,
+        stage: Stage,
+        iteration: u64,
+        deterministic: String,
+        chosen: String,
+        source: String,
+        note: String,
+    },
     /// Checkpoint written by a rotation (design §10 快照/截断语义): it summarizes
     /// the raw records that rotations archived out of the live file. `covers` is
     /// CUMULATIVE from the beginning of the journal, not just this rotation's
@@ -421,6 +440,66 @@ impl JournalRecord {
             task: task.into(),
             peer: peer.to_string(),
             stage: Some(stage),
+            iteration,
+            usage,
+            cost,
+            priced: false,
+            nominal_reason: Some(reason),
+        }
+    }
+
+    /// SA 规划回合的预留：没有 stage，`iteration` 是该 peer 的规划回合序号
+    /// （Spec 是 1，之后每次过渡复核 +1）。预算折叠与派发预留共用同一套坐标，
+    /// 区别只在 `stage = None`；序号保证连续多次规划不会覆盖同一笔预留。
+    pub fn reserved_planning(
+        task: impl Into<TaskId>,
+        peer: &str,
+        iteration: u64,
+        cost: f64,
+        priced: bool,
+    ) -> Self {
+        JournalRecord::BudgetSpent {
+            task: task.into(),
+            peer: peer.to_string(),
+            stage: None,
+            iteration,
+            cost,
+            priced,
+        }
+    }
+
+    pub fn settled_planning(
+        task: impl Into<TaskId>,
+        peer: &str,
+        iteration: u64,
+        usage: crate::provider::wire::Usage,
+        cost: f64,
+        priced: bool,
+    ) -> Self {
+        JournalRecord::BudgetSettled {
+            task: task.into(),
+            peer: peer.to_string(),
+            stage: None,
+            iteration,
+            usage,
+            cost,
+            priced,
+            nominal_reason: None,
+        }
+    }
+
+    pub fn settled_planning_as_nominal(
+        task: impl Into<TaskId>,
+        peer: &str,
+        iteration: u64,
+        usage: crate::provider::wire::Usage,
+        cost: f64,
+        reason: NominalReason,
+    ) -> Self {
+        JournalRecord::BudgetSettled {
+            task: task.into(),
+            peer: peer.to_string(),
+            stage: None,
             iteration,
             usage,
             cost,
@@ -754,7 +833,9 @@ impl Folder {
             // and a replay must not count them as bells.
             JournalRecord::ApprovalRequested { .. }
             | JournalRecord::ApprovalDecided { .. }
-            | JournalRecord::ApprovalAcked { .. } => {}
+            | JournalRecord::ApprovalAcked { .. }
+            | JournalRecord::SpecDrafted { .. }
+            | JournalRecord::RoutingDecided { .. } => {}
             // 用量读数是**用量**的真相，不是钱的真相。没有费率时结算根本不会发生，
             // 所以这一格必须自己把 token 记进投影——否则收尾那行会印出
             // `tokens in 0 / out 0`，把一次烧掉两万多 token 的运行说成什么都没花。
@@ -900,6 +981,42 @@ mod tests {
         let rep = reconcile(&records);
         assert!(rep.in_flight.is_empty());
         assert_eq!(rep.state.stage, Some(Stage::Dev));
+    }
+
+    #[test]
+    fn planning_settlement_keeps_the_stage_machine_still() {
+        let records = vec![
+            JournalRecord::reserved_planning("t", "harness-sa", 1, 0.5, true),
+            JournalRecord::settled_planning(
+                "t",
+                "harness-sa",
+                1,
+                crate::provider::wire::Usage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    ..Default::default()
+                },
+                0.01,
+                true,
+            ),
+            JournalRecord::SpecDrafted {
+                task: "t".into(),
+                path: "/artifacts/t-SPEC.md".into(),
+                provider: "mimo".into(),
+                model: "mimo-v2.6-flash".into(),
+            },
+        ];
+        let rep = reconcile(&records);
+        assert_eq!(rep.state.stage, None);
+        let spent = rep
+            .state
+            .spent
+            .get("harness-sa")
+            .copied()
+            .unwrap_or_default();
+        assert!((spent - 0.01).abs() < 1e-12, "spent = {spent}");
+        assert_eq!(rep.state.nominal.get("harness-sa"), None);
+        assert!(rep.in_flight.is_empty());
     }
 
     #[test]
