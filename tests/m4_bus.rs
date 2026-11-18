@@ -714,6 +714,37 @@ async fn parked_bells_and_session_ownership_survive_a_hub_restart() {
     let _ = hub2;
 }
 
+/// The persisted session table has a TTL: a worker that has not re-Helloed for
+/// a week is not "known but offline" forever. A stale entry must fall back to
+/// `unknown session` on the wire.
+#[tokio::test]
+async fn stale_sessions_are_pruned_from_the_persisted_table() {
+    let path = temp_bus("stale-session");
+    let state = std::path::PathBuf::from(format!("{}.state.json", path.display()));
+    std::fs::write(
+        &state,
+        serde_json::to_vec_pretty(&json!({
+            "version": 2,
+            "sessions": {
+                "rd-old": { "peer": "harness-rd", "seen_at": 1 }
+            },
+            "parked": {}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let _hub = BusHub::bind_at(&path, &state).unwrap();
+    let sa = BusClient::connect(&path, "harness-sa", None).await.unwrap();
+    sa.notify("rd-old", json!({ "task": "too-late" }));
+    let err = tokio::time::timeout(Duration::from_secs(2), sa.recv_notify())
+        .await
+        .expect("no error frame for a stale session")
+        .unwrap();
+    assert_eq!(err.kind, FrameKind::Error);
+    assert_eq!(err.payload["error"], "unknown session");
+    std::fs::remove_file(&state).ok();
+}
+
 /// 从未注册过的地址仍然立刻回 Error 帧：静默停车会把拼错的 session 名变成
 /// 「谁都不会收到的铃」。
 #[tokio::test]

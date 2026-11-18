@@ -9,11 +9,11 @@
 //! 因为把拼错的 session 名静默停车等于让铃永远没人听见。RPC 不跨重连：
 //! Response 的路由属于那条已死的连接，客户端会 fail fast 而不是等到超期。
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -33,14 +33,27 @@ use super::identity::{IdentityCheck, IdentityGuard};
 const PARK_SESSION_CAP: usize = 32;
 /// Global ceiling across sessions — the hub is a router, not a maildir.
 const PARK_TOTAL_CAP: usize = 256;
-const HUB_STATE_VERSION: u32 = 1;
+const HUB_STATE_VERSION: u32 = 2;
+/// Sessions nobody has re-Helloed for this long are stale. Seven days is long
+/// enough for a multi-day outage and short enough that a renamed session does
+/// not live forever in the persisted table.
+const SESSION_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+/// Parking is bounded by frames AND bytes: 256 frames of up to 4 MiB each could
+/// otherwise put ~1 GiB into the state file.
+const PARK_TOTAL_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedSession {
+    peer: PeerId,
+    seen_at: u64,
+}
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct PersistedHubState {
     #[serde(default)]
     version: u32,
     #[serde(default)]
-    sessions: BTreeMap<SessionId, PeerId>,
+    sessions: BTreeMap<SessionId, PersistedSession>,
     #[serde(default)]
     parked: BTreeMap<SessionId, Vec<Envelope>>,
 }
@@ -49,6 +62,13 @@ fn default_state_path(socket: &Path) -> PathBuf {
     let mut name = socket.as_os_str().to_os_string();
     name.push(".state.json");
     PathBuf::from(name)
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
 }
 
 fn load_state(path: &Path) -> anyhow::Result<PersistedHubState> {
@@ -60,16 +80,39 @@ fn load_state(path: &Path) -> anyhow::Result<PersistedHubState> {
     }
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("read hub state {}", path.display()))?;
-    let state: PersistedHubState = serde_json::from_str(&text)
+    let value: serde_json::Value = serde_json::from_str(&text)
         .with_context(|| format!("parse hub state {}", path.display()))?;
-    if state.version != HUB_STATE_VERSION {
-        anyhow::bail!(
-            "hub state {} has unsupported version {}",
-            path.display(),
-            state.version
-        );
+    match value["version"].as_u64().unwrap_or(0) {
+        version if version == u64::from(HUB_STATE_VERSION) => serde_json::from_value(value)
+            .with_context(|| format!("decode hub state {}", path.display())),
+        // v1 stored `sessions: {session: peer}` with no timestamp. Keep those
+        // sessions alive for one TTL window starting at migration time.
+        0 | 1 => {
+            #[derive(Deserialize)]
+            struct V1 {
+                #[serde(default)]
+                sessions: BTreeMap<SessionId, PeerId>,
+                #[serde(default)]
+                parked: BTreeMap<SessionId, Vec<Envelope>>,
+            }
+            let old: V1 = serde_json::from_value(value)
+                .with_context(|| format!("decode v1 hub state {}", path.display()))?;
+            let now = now_unix();
+            Ok(PersistedHubState {
+                version: HUB_STATE_VERSION,
+                sessions: old
+                    .sessions
+                    .into_iter()
+                    .map(|(session, peer)| (session, PersistedSession { peer, seen_at: now }))
+                    .collect(),
+                parked: old.parked,
+            })
+        }
+        version => anyhow::bail!(
+            "hub state {} has unsupported version {version}",
+            path.display()
+        ),
     }
-    Ok(state)
 }
 
 fn write_state(path: &Path, state: &PersistedHubState) -> anyhow::Result<()> {
@@ -95,6 +138,81 @@ fn write_state(path: &Path, state: &PersistedHubState) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn envelope_bytes(env: &Envelope) -> usize {
+    serde_json::to_vec(env)
+        .map(|body| body.len())
+        .unwrap_or_default()
+}
+
+fn parked_bytes(parked: &HashMap<SessionId, VecDeque<Envelope>>) -> usize {
+    parked
+        .values()
+        .flat_map(|queue| queue.iter())
+        .map(envelope_bytes)
+        .sum()
+}
+
+/// Bound the parked table by frames and bytes, dropping the oldest frame when
+/// either ceiling would be crossed. A single frame larger than the byte ceiling
+/// is not parked at all; letting it in would defeat the bound immediately.
+fn park_envelope(
+    parked: &mut HashMap<SessionId, VecDeque<Envelope>>,
+    session: &str,
+    env: Envelope,
+    byte_cap: usize,
+) -> bool {
+    let frame_bytes = envelope_bytes(&env);
+    if frame_bytes > byte_cap {
+        tracing::warn!(
+            "bus parking byte cap ({byte_cap}): dropping oversized notify for {session} \
+             ({frame_bytes} bytes)"
+        );
+        return false;
+    }
+    let total_frames: usize = parked.values().map(VecDeque::len).sum();
+    if total_frames >= PARK_TOTAL_CAP {
+        tracing::warn!("bus parking full ({PARK_TOTAL_CAP}): dropping notify for {session}");
+        return false;
+    }
+
+    let mut total_bytes = parked_bytes(parked);
+    if let Some(queue) = parked.get_mut(session)
+        && queue.len() >= PARK_SESSION_CAP
+    {
+        let dropped = queue.pop_front();
+        if let Some(frame) = &dropped {
+            total_bytes = total_bytes.saturating_sub(envelope_bytes(frame));
+        }
+        tracing::warn!(
+            "bus parking overflow for {session}: dropping the oldest bell ({:?})",
+            dropped.map(|frame| frame.route.req)
+        );
+    }
+    while total_bytes.saturating_add(frame_bytes) > byte_cap {
+        let mut dropped = parked.get_mut(session).and_then(VecDeque::pop_front);
+        if dropped.is_none() {
+            dropped = parked.iter_mut().find_map(|(_, queue)| queue.pop_front());
+        }
+        let Some(frame) = dropped else {
+            break;
+        };
+        total_bytes = total_bytes.saturating_sub(envelope_bytes(&frame));
+        tracing::warn!(
+            "bus parking byte cap ({byte_cap}): dropping oldest bell ({:?}) for {session}",
+            frame.route.req
+        );
+    }
+    if total_bytes.saturating_add(frame_bytes) > byte_cap {
+        tracing::warn!("bus parking byte cap ({byte_cap}): dropping notify for {session}");
+        return false;
+    }
+    parked
+        .entry(session.to_string())
+        .or_default()
+        .push_back(env);
+    true
+}
+
 pub struct BusHub {
     peers: Mutex<HashMap<PeerId, mpsc::UnboundedSender<Envelope>>>,
     /// session id (and every peer id) → peer that owns it. Entries SURVIVE the
@@ -108,6 +226,8 @@ pub struct BusHub {
     requests: Mutex<HashMap<ReqId, mpsc::UnboundedSender<Envelope>>>,
     /// Notify frames waiting for an offline session to come back.
     parked: Mutex<HashMap<SessionId, VecDeque<Envelope>>>,
+    /// Last Hello time per session key; drives the persisted-table TTL.
+    session_seen: Mutex<HashMap<SessionId, u64>>,
     path: PathBuf,
     state_path: PathBuf,
     persist_lock: Mutex<()>,
@@ -140,7 +260,16 @@ impl BusHub {
                 }
             }
         };
-        let sessions = persisted.sessions.into_iter().collect();
+        let sessions = persisted
+            .sessions
+            .iter()
+            .map(|(session, record)| (session.clone(), record.peer.clone()))
+            .collect();
+        let session_seen = persisted
+            .sessions
+            .iter()
+            .map(|(session, record)| (session.clone(), record.seen_at))
+            .collect();
         let parked = persisted
             .parked
             .into_iter()
@@ -151,10 +280,14 @@ impl BusHub {
             sessions: Mutex::new(sessions),
             requests: Mutex::new(HashMap::new()),
             parked: Mutex::new(parked),
+            session_seen: Mutex::new(session_seen),
             path: path.to_path_buf(),
             state_path: state_path.to_path_buf(),
             persist_lock: Mutex::new(()),
         });
+        if let Err(error) = hub.prune_stale_sessions(now_unix()) {
+            tracing::warn!("prune stale hub sessions on bind: {error}");
+        }
         let hub2 = Arc::clone(&hub);
         tokio::spawn(async move {
             let listener = listener;
@@ -184,12 +317,23 @@ impl BusHub {
     /// keep serving even when the state file cannot be written.
     pub fn persist_now(&self) -> anyhow::Result<()> {
         let _guard = self.persist_lock.lock().unwrap();
+        let now = now_unix();
+        self.prune_stale_sessions(now)?;
+        let seen = self.session_seen.lock().unwrap();
         let sessions = self
             .sessions
             .lock()
             .unwrap()
             .iter()
-            .map(|(session, peer)| (session.clone(), peer.clone()))
+            .map(|(session, peer)| {
+                (
+                    session.clone(),
+                    PersistedSession {
+                        peer: peer.clone(),
+                        seen_at: seen.get(session).copied().unwrap_or(now),
+                    },
+                )
+            })
             .collect();
         let parked = self
             .parked
@@ -206,6 +350,41 @@ impl BusHub {
                 parked,
             },
         )
+    }
+
+    /// Drop sessions whose last Hello is older than `SESSION_TTL_SECS`, then
+    /// drop parked queues whose session key no longer exists. The TTL prevents
+    /// a renamed/retired worker from being remembered forever; orphan pruning
+    /// keeps a hand-edited or partially migrated state file self-consistent.
+    fn prune_stale_sessions(&self, now: u64) -> anyhow::Result<usize> {
+        let stale: Vec<SessionId> = {
+            let seen = self.session_seen.lock().unwrap();
+            seen.iter()
+                .filter(|(_, at)| now.saturating_sub(**at) > SESSION_TTL_SECS)
+                .map(|(session, _)| session.clone())
+                .collect()
+        };
+        let known: HashSet<SessionId> = {
+            let mut sessions = self.sessions.lock().unwrap();
+            for session in &stale {
+                sessions.remove(session);
+            }
+            sessions.keys().cloned().collect()
+        };
+        {
+            let mut parked = self.parked.lock().unwrap();
+            for session in &stale {
+                parked.remove(session);
+            }
+            parked.retain(|session, _| known.contains(session));
+        }
+        {
+            let mut seen = self.session_seen.lock().unwrap();
+            for session in &stale {
+                seen.remove(session);
+            }
+        }
+        Ok(stale.len())
     }
 
     fn spawn_conn(self: &Arc<Self>, stream: tokio::net::UnixStream) {
@@ -283,6 +462,13 @@ impl BusHub {
                             sessions.insert(key.clone(), peer.clone());
                         }
                     }
+                    {
+                        let now = now_unix();
+                        let mut seen = hub.session_seen.lock().unwrap();
+                        for key in &keys {
+                            seen.insert(key.clone(), now);
+                        }
+                    }
                     // 补投离线期间停下的铃，先进先出，顺序即派发顺序
                     for key in &keys {
                         for frame in hub.take_parked(key) {
@@ -311,26 +497,11 @@ impl BusHub {
 
     /// Park one Notify for a known-but-offline session (bounded, drop-oldest).
     fn park(&self, session: &str, env: Envelope) {
-        {
+        let accepted = {
             let mut parked = self.parked.lock().unwrap();
-            let total: usize = parked.values().map(|q| q.len()).sum();
-            if total >= PARK_TOTAL_CAP {
-                tracing::warn!(
-                    "bus parking full ({PARK_TOTAL_CAP}): dropping notify for {session}"
-                );
-                return;
-            }
-            let queue = parked.entry(session.to_string()).or_default();
-            if queue.len() >= PARK_SESSION_CAP {
-                let dropped = queue.pop_front();
-                tracing::warn!(
-                    "bus parking overflow for {session}: dropping the oldest bell ({:?})",
-                    dropped.map(|d| d.route.req)
-                );
-            }
-            queue.push_back(env);
-        }
-        if let Err(error) = self.persist_now() {
+            park_envelope(&mut parked, session, env, PARK_TOTAL_BYTES)
+        };
+        if accepted && let Err(error) = self.persist_now() {
             tracing::warn!("persist bus state after parking a notify: {error}");
         }
     }
@@ -793,5 +964,44 @@ impl BusClient {
 impl Drop for BusClient {
     fn drop(&mut self) {
         self.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn env(req: &str, payload_bytes: usize) -> Envelope {
+        Envelope {
+            v: 1,
+            sender: "harness-sa".into(),
+            route: Route {
+                session: "rd-1".into(),
+                req: req.into(),
+            },
+            kind: FrameKind::Notify,
+            payload: serde_json::json!({
+                "task": req,
+                "pad": "x".repeat(payload_bytes),
+            }),
+        }
+    }
+
+    #[test]
+    fn parking_byte_cap_drops_the_oldest_frame() {
+        let cap = 1200;
+        let mut parked = HashMap::new();
+        assert!(park_envelope(&mut parked, "rd-1", env("first", 500), cap));
+        assert!(park_envelope(&mut parked, "rd-1", env("second", 500), cap));
+        let queue = parked.get("rd-1").expect("queue");
+        assert_eq!(queue.len(), 1, "the first frame must be evicted");
+        assert_eq!(queue[0].route.req, "second");
+    }
+
+    #[test]
+    fn a_frame_larger_than_the_byte_cap_is_not_parked() {
+        let mut parked = HashMap::new();
+        assert!(!park_envelope(&mut parked, "rd-1", env("huge", 5000), 1200));
+        assert!(!parked.contains_key("rd-1"));
     }
 }
