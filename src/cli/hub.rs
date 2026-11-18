@@ -13,5 +13,8 @@ pub async fn run_hub(socket: PathBuf) -> anyhow::Result<()> {
     eprintln!("[hub] listening on {}", hub.path().display());
     tokio::signal::ctrl_c().await?;
     eprintln!("[hub] shutting down");
+    if let Err(error) = hub.persist_now() {
+        tracing::warn!("persist hub state on shutdown: {error}");
+    }
     Ok(())
 }

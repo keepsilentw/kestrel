@@ -655,6 +655,65 @@ async fn bells_for_an_offline_session_are_parked_and_redelivered_in_order() {
     assert_eq!(a.sender, "harness-sa", "identity survives parking");
 }
 
+/// Hub process restart: session ownership and parked bells live on disk, so a
+/// replacement hub (different socket, same state file) still knows `rd-1` and
+/// redelivers the old bell before the new one.
+#[tokio::test]
+async fn parked_bells_and_session_ownership_survive_a_hub_restart() {
+    let path1 = temp_bus("restart-1");
+    let path2 = temp_bus("restart-2");
+    let hub1 = BusHub::bind(&path1).unwrap();
+    let state = hub1.state_path().to_path_buf();
+
+    let rd = BusClient::connect(&path1, "harness-rd", Some("rd-1"))
+        .await
+        .unwrap();
+    let sa1 = BusClient::connect(&path1, "harness-sa", None)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    drop(rd);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Parked on hub1 and persisted.
+    sa1.notify("rd-1", json!({ "task": "before-restart" }));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&state).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "hub state must be private");
+    }
+
+    // A replacement hub at a different socket loads the same state file.
+    let hub2 = BusHub::bind_at(&path2, &state).unwrap();
+    let sa2 = BusClient::connect(&path2, "harness-sa-2", None)
+        .await
+        .unwrap();
+    // rd-1 was offline and known only from the persisted session table.
+    sa2.notify("rd-1", json!({ "task": "after-restart" }));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let back = BusClient::connect(&path2, "harness-rd", Some("rd-1"))
+        .await
+        .unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(2), back.recv_notify())
+        .await
+        .expect("pre-restart bell not delivered")
+        .unwrap();
+    let second = tokio::time::timeout(Duration::from_secs(2), back.recv_notify())
+        .await
+        .expect("post-restart bell not delivered")
+        .unwrap();
+    assert_eq!(first.payload["task"], "before-restart");
+    assert_eq!(second.payload["task"], "after-restart");
+    assert_eq!(first.sender, "harness-sa");
+
+    std::fs::remove_file(&state).ok();
+    let _ = hub1;
+    let _ = hub2;
+}
+
 /// 从未注册过的地址仍然立刻回 Error 帧：静默停车会把拼错的 session 名变成
 /// 「谁都不会收到的铃」。
 #[tokio::test]

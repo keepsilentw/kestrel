@@ -9,13 +9,14 @@
 //! 因为把拼错的 session 名静默停车等于让铃永远没人听见。RPC 不跨重连：
 //! Response 的路由属于那条已死的连接，客户端会 fail fast 而不是等到超期。
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Context;
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio_util::task::AbortOnDropHandle;
@@ -32,6 +33,67 @@ use super::identity::{IdentityCheck, IdentityGuard};
 const PARK_SESSION_CAP: usize = 32;
 /// Global ceiling across sessions — the hub is a router, not a maildir.
 const PARK_TOTAL_CAP: usize = 256;
+const HUB_STATE_VERSION: u32 = 1;
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct PersistedHubState {
+    #[serde(default)]
+    version: u32,
+    #[serde(default)]
+    sessions: BTreeMap<SessionId, PeerId>,
+    #[serde(default)]
+    parked: BTreeMap<SessionId, Vec<Envelope>>,
+}
+
+fn default_state_path(socket: &Path) -> PathBuf {
+    let mut name = socket.as_os_str().to_os_string();
+    name.push(".state.json");
+    PathBuf::from(name)
+}
+
+fn load_state(path: &Path) -> anyhow::Result<PersistedHubState> {
+    if !path.exists() {
+        return Ok(PersistedHubState {
+            version: HUB_STATE_VERSION,
+            ..Default::default()
+        });
+    }
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("read hub state {}", path.display()))?;
+    let state: PersistedHubState = serde_json::from_str(&text)
+        .with_context(|| format!("parse hub state {}", path.display()))?;
+    if state.version != HUB_STATE_VERSION {
+        anyhow::bail!(
+            "hub state {} has unsupported version {}",
+            path.display(),
+            state.version
+        );
+    }
+    Ok(state)
+}
+
+fn write_state(path: &Path, state: &PersistedHubState) -> anyhow::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let body = serde_json::to_vec_pretty(state)?;
+    let staged = path.with_extension("new");
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&staged)
+        .with_context(|| format!("open hub state staging file {}", staged.display()))?;
+    std::io::Write::write_all(&mut file, &body)?;
+    file.sync_all()?;
+    std::fs::rename(&staged, path)
+        .with_context(|| format!("publish hub state {}", path.display()))?;
+    Ok(())
+}
 
 pub struct BusHub {
     peers: Mutex<HashMap<PeerId, mpsc::UnboundedSender<Envelope>>>,
@@ -47,22 +109,51 @@ pub struct BusHub {
     /// Notify frames waiting for an offline session to come back.
     parked: Mutex<HashMap<SessionId, VecDeque<Envelope>>>,
     path: PathBuf,
+    state_path: PathBuf,
+    persist_lock: Mutex<()>,
 }
 
 impl BusHub {
     /// Bind + spawn the accept loop. Stale socket from a killed run is removed.
     pub fn bind(path: &Path) -> anyhow::Result<Arc<Self>> {
+        Self::bind_at(path, &default_state_path(path))
+    }
+
+    /// Bind with an explicit state file. Tests use a second socket to simulate
+    /// a hub process restart without giving up the persisted parking table.
+    pub fn bind_at(path: &Path, state_path: &Path) -> anyhow::Result<Arc<Self>> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
         let _ = std::fs::remove_file(path);
         let listener = tokio::net::UnixListener::bind(path)?;
+        let persisted = match load_state(state_path) {
+            Ok(state) => state,
+            Err(error) => {
+                tracing::error!(
+                    "load hub state {}: {error}; starting with an empty parking table",
+                    state_path.display()
+                );
+                PersistedHubState {
+                    version: HUB_STATE_VERSION,
+                    ..Default::default()
+                }
+            }
+        };
+        let sessions = persisted.sessions.into_iter().collect();
+        let parked = persisted
+            .parked
+            .into_iter()
+            .map(|(session, frames)| (session, frames.into()))
+            .collect();
         let hub = Arc::new(Self {
             peers: Mutex::new(HashMap::new()),
-            sessions: Mutex::new(HashMap::new()),
+            sessions: Mutex::new(sessions),
             requests: Mutex::new(HashMap::new()),
-            parked: Mutex::new(HashMap::new()),
+            parked: Mutex::new(parked),
             path: path.to_path_buf(),
+            state_path: state_path.to_path_buf(),
+            persist_lock: Mutex::new(()),
         });
         let hub2 = Arc::clone(&hub);
         tokio::spawn(async move {
@@ -82,6 +173,39 @@ impl BusHub {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn state_path(&self) -> &Path {
+        &self.state_path
+    }
+
+    /// Flush the current session/parking table. Called after Hello, park and
+    /// replay; failures are logged by callers because the in-memory router must
+    /// keep serving even when the state file cannot be written.
+    pub fn persist_now(&self) -> anyhow::Result<()> {
+        let _guard = self.persist_lock.lock().unwrap();
+        let sessions = self
+            .sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(session, peer)| (session.clone(), peer.clone()))
+            .collect();
+        let parked = self
+            .parked
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(session, frames)| (session.clone(), frames.iter().cloned().collect()))
+            .collect();
+        write_state(
+            &self.state_path,
+            &PersistedHubState {
+                version: HUB_STATE_VERSION,
+                sessions,
+                parked,
+            },
+        )
     }
 
     fn spawn_conn(self: &Arc<Self>, stream: tokio::net::UnixStream) {
@@ -165,6 +289,9 @@ impl BusHub {
                             let _ = tx.send(frame);
                         }
                     }
+                    if let Err(error) = hub.persist_now() {
+                        tracing::warn!("persist bus state after Hello: {error}");
+                    }
                     continue;
                 }
                 hub.route_frame(env, &tx).await;
@@ -184,21 +311,28 @@ impl BusHub {
 
     /// Park one Notify for a known-but-offline session (bounded, drop-oldest).
     fn park(&self, session: &str, env: Envelope) {
-        let mut parked = self.parked.lock().unwrap();
-        let total: usize = parked.values().map(|q| q.len()).sum();
-        if total >= PARK_TOTAL_CAP {
-            tracing::warn!("bus parking full ({PARK_TOTAL_CAP}): dropping notify for {session}");
-            return;
+        {
+            let mut parked = self.parked.lock().unwrap();
+            let total: usize = parked.values().map(|q| q.len()).sum();
+            if total >= PARK_TOTAL_CAP {
+                tracing::warn!(
+                    "bus parking full ({PARK_TOTAL_CAP}): dropping notify for {session}"
+                );
+                return;
+            }
+            let queue = parked.entry(session.to_string()).or_default();
+            if queue.len() >= PARK_SESSION_CAP {
+                let dropped = queue.pop_front();
+                tracing::warn!(
+                    "bus parking overflow for {session}: dropping the oldest bell ({:?})",
+                    dropped.map(|d| d.route.req)
+                );
+            }
+            queue.push_back(env);
         }
-        let queue = parked.entry(session.to_string()).or_default();
-        if queue.len() >= PARK_SESSION_CAP {
-            let dropped = queue.pop_front();
-            tracing::warn!(
-                "bus parking overflow for {session}: dropping the oldest bell ({:?})",
-                dropped.map(|d| d.route.req)
-            );
+        if let Err(error) = self.persist_now() {
+            tracing::warn!("persist bus state after parking a notify: {error}");
         }
-        queue.push_back(env);
     }
 
     fn take_parked(&self, session: &str) -> VecDeque<Envelope> {
