@@ -27,14 +27,14 @@
 > 归档链的断口与重复段的隔离出口（§9.56）、记录层的深度校验 `--verify`（§9.57）；
 > 代码部分都过了 fmt / clippy / test；
 > **真端点联跑未重跑**，demo 的接法只到语法与 flag 解析这一层。
-> 2026-11-18：11-14/16 的改动在当前 HEAD 复跑 fmt / clippy / test，297 项全绿；
+> 2026-11-18：11-14/16 的改动在当前 HEAD 复跑 fmt / clippy / test，298 项全绿；
 > 同日真实端点 demo 用 `--sa-role --sa-routing` 跑通 Spec 起草、每关受控路由与
 > 四阶段执行（每关 11 passed / 0 failed，账本 1.3451 cny，`harness-sa: 0.0102 cny`；
 > Build iter1 超时后迟到铃被忽略，iter2 通过）；
 > supervisor 与状态文件同时启用，模拟子进程验证了 exit 1 / exit 70 的重启分支；
 > Linux 真机与真实 worker 的 RSS 压力阈值仍未实测。
-> **Metrics** — src 52 files / 22544 lines · tests 9 files / 3951 lines · 297 tests (lib 235 + bin 6 + integration 56)
-> **Integration** — core_loop 6 / discipline 2 / m1_tools 13 / m2_session 6 / m4_bus 15 / m5_pool 8 / sandbox_e2e 4 / wire_anthropic 2
+> **Metrics** — src 52 files / 22681 lines · tests 9 files / 4010 lines · 298 tests (lib 235 + bin 6 + integration 57)
+> **Integration** — core_loop 6 / discipline 2 / m1_tools 13 / m2_session 6 / m4_bus 16 / m5_pool 8 / sandbox_e2e 4 / wire_anthropic 2
 > 规模已过 plan 预算（10-13k）的上沿：多出来的部分几乎都花在「取消安全」与「对账」这两条纪律上。
 > 上面两行数字由 `tests/discipline.rs::metrics_lines_match_the_tree` 对照源码树重算校验——
 > 这些计数此前在三处文档里手抄过三次、漂移过三次（§9.19），现在它是闸门不是仪式。
@@ -189,7 +189,8 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
     ① hub 断线只清连接表，**保留 session 归属**，于是「注册过但不在线」与「从未注册」可区分：前者的 Notify 进停车队列（每 session 32 帧、全局 256 帧，drop-oldest 并 warn），重新 Hello 时按序补投；后者仍立刻回 `unknown session` Error——把拼错的 session 名静默停车等于让铃永远没人听见。
     ② 客户端 `recv_notify` 自动重连（100ms 起指数退避，单窗口 10s），`Drop` 显式 abort 两个 pump 任务，让 hub 立即看到 EOF 并开始停车；worker 不再因 hub 重启而退出。
     ③ **RPC 不跨重连**：Response 的路由属于那条死连接，所以 `request` 在无连接时 fail fast，Request 帧也不进重放队列。同理，已经写进「随后死掉的 socket」的帧不重放——hub 可能已经处理过它，重复铃由 SA 侧 write-ahead 对账消化（§5 不变式 5），而不是靠总线猜「大概没送到」。审批批复因此可能因重连而迟到并被 worker 丢弃（`open` 已在回合结束时清空）——语义仍是超时 deny，不会变成静默放行。
-    未做：跨 hub 进程重启的停车表恢复（停车只在一个 hub 生命周期内有效）、按 peer 的可靠投递确认。`run-demo.sh` 里等注册的那一拍仍然需要。
+    跨 hub 进程重启的停车表恢复已由 §9.74 落地（session 归属 + parked Notify 持久化）；
+    未做：按 peer 的可靠投递确认。`run-demo.sh` 里等注册的那一拍仍然需要。
 
 22. **journal 快照/截断语义（2026-10-28）**：不变式 3 原话是「journal 永不截断」，实现上等于把一个只增不减的文件当成真相本体。现在拆开三件事：
     ① `JournalRecord::Snapshot { covers, checkpoint }`——检查点折的是「到此刻为止的投影」：stage / iteration / 每 peer 花费 / **未结算的铃清单**。最后这项是关键：截断若丢掉 in_flight，一次「worker 写完工件但死在拉铃前」就会被 SA 误读成「从没派发过」而重烧一轮预算，正是 journal 要防的事。
@@ -762,7 +763,7 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
 
 70. **真实端点四进程 demo 复核，以及预算预检的负零（2026-11-18）**：
     ① 当前 HEAD 复跑 `cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、
-       `cargo test`：297 项全绿。
+       `cargo test`：298 项全绿。
     ② 真实端点四进程 demo 再次 `pipeline complete`：`dev` / `review` / `test` / `build`
        四关均 pass，每关 `22 passed / 0 failed`，账本 `0.1250 cny, of which 0.0000 nominal`；
        2 组审批请求/裁决/回执全部 `applied=true`。本轮启用了外部 supervisor 与 worker
@@ -845,6 +846,22 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
        核对，不重跑 unittest，不因 Spec 提到 pytest 就安装/重试」。边界：模型仍不能改变
        PASS/FAIL，也不能选择 Allowlist 外的动作；本轮模型选择与确定性建议全部一致
        （前一轮的 stop 是唯一一次偏离）。
+
+74. **hub 重启后的停车表持久化（2026-11-18）**：
+    ① 此前 session 归属与 parked Notify 只活在 hub 进程内，hub 重启等于把「已知但离线」
+       的历史一起丢掉。现在 `BusHub` 把 `sessions` 与 `parked` 原子写入
+       `<socket>.state.json`（同目录 `.new` + fsync + rename，Unix 0600）。
+    ② `BusHub::bind` 启动时读取该文件；文件缺失视为空表；损坏或版本不认识时记录 error
+       并从空表开始，绝不猜测或伪造帧。RPC 在途请求仍然不持久化——Response 的归属连接
+       已经死了，跨重启重放会造成第二种真相。
+    ③ 写入点：Hello 注册后、Notify 停车后、以及补投发送后。补投顺序是「先发、后清」：
+       若在两者之间崩溃，重启后可能重复投递，但不会静默丢帧；重复铃由 SA 的 write-ahead
+       对账消化（§5 不变式 5）。`run_hub` 在 Ctrl-C 退出前再 flush 一次。
+    ④ 测试 `parked_bells_and_session_ownership_survive_a_hub_restart` 用两个不同 socket
+       共用同一 state 文件模拟 hub 进程重启：重启前的铃先补投，重启后发给同一离线
+       session 的新铃继续停车，证明 session 归属也一起恢复。
+    ⑤ 边界：state 文件仍按 `32/会话 + 256 全局` 的帧数上限，不按字节封顶；单帧最大
+       4 MiB 时文件理论可到 1 GiB。session 表也只增不减，尚无 TTL/淘汰。这是下一层治理。
 
 ## 10 二期清单
 

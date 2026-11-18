@@ -7,8 +7,8 @@
 
 ## 1. 自动化测试基线（cargo test）
 
-**Metrics** — src 52 files / 22544 lines · tests 9 files / 3951 lines · 297 tests (lib 235 + bin 6 + integration 56)
-**Integration** — core_loop 6 / discipline 2 / m1_tools 13 / m2_session 6 / m4_bus 15 / m5_pool 8 / sandbox_e2e 4 / wire_anthropic 2
+**Metrics** — src 52 files / 22681 lines · tests 9 files / 4010 lines · 298 tests (lib 235 + bin 6 + integration 57)
+**Integration** — core_loop 6 / discipline 2 / m1_tools 13 / m2_session 6 / m4_bus 16 / m5_pool 8 / sandbox_e2e 4 / wire_anthropic 2
 
 | 组 | 覆盖 |
 |---|---|
@@ -1341,7 +1341,7 @@ Unix 权限 0600；槽位仍绑定完整 tool + args、原 req、决定和绝对
 |---|---|
 | `cargo fmt --check` | 通过，无输出 |
 | `cargo clippy --all-targets -- -D warnings` | 通过，0 warning |
-| `cargo test` | 297 passed / 0 failed（lib 235 + bin 6 + integration 56） |
+| `cargo test` | 298 passed / 0 failed（lib 235 + bin 6 + integration 57） |
 | doc-tests | 0 项，通过 |
 
 这组结果证明当前树可以编译、clippy 干净，且包含 RSS 准入/回收、deferred 审批、bubblewrap
@@ -1476,3 +1476,24 @@ PASS 进 `ref.handoff`，FAIL 进 `ref.rework.sa_note`。提示是 advisory；�
 Build 超时说明 QA 在有受信预检时仍做了过多检查；QA 提示词已收紧为「最多 1 条源码核对，
 不重跑 unittest，不因 Spec 提到 pytest 就安装/重试」。模型仍不能覆盖 PASS/FAIL，也不能
 选择 Allowlist 外的动作。
+
+## 64. 2026-11-18 hub 停车表持久化
+
+`BusHub` 现在把 session 归属与 parked Notify 写入 `<socket>.state.json`，写入采用
+同目录 `.new`、fsync、rename，Unix 权限 0600。启动时恢复；缺失视为空表，损坏或版本不
+认识时记录 error 并从空表开始。RPC 在途请求不持久化。
+
+写入点：Hello 注册后、Notify 停车后、补投发送后，以及 `run_hub` 收到 Ctrl-C 时。
+补投是「先发、后清」，崩溃可能造成重复投递，但不会静默丢帧。
+
+测试 `parked_bells_and_session_ownership_survive_a_hub_restart` 用两个不同 socket
+共用同一 state 文件模拟 hub 重启：
+
+| 场景 | 结果 |
+|---|---|
+| 重启前停车 | 重启后按序补投 |
+| 重启后发给同一离线 session | 从恢复的 session 表识别为已知，继续停车 |
+| 顺序 | `before-restart` 先于 `after-restart` |
+
+边界：state 文件按帧数封顶（每 session 32、全局 256），没有字节上限；session 表也尚无
+TTL/淘汰，长时间运行仍需治理。
