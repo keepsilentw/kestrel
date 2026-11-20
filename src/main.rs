@@ -56,6 +56,12 @@ struct Cli {
     #[arg(long, default_value_t = 300)]
     timeout_secs: u64,
 
+    /// Sampling rounds allowed per turn (tool call -> answer cycles). The
+    /// demo's long edits were hitting the old hardcoded 8; raising this is a
+    /// policy decision, so it is explicit.
+    #[arg(long, default_value_t = 8)]
+    max_rounds: u32,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -157,6 +163,12 @@ struct ServeCmd {
     /// gateway or tool cannot pin a task slot forever. 0 = no ceiling.
     #[arg(long, default_value_t = 3600)]
     turn_timeout_secs: u64,
+
+    /// Sampling rounds allowed per turn. A stage that keeps calling tools past
+    /// this budget ends with `round budget exhausted` and is re-dispatched;
+    /// raise it for stages that legitimately need more edit/test cycles.
+    #[arg(long, default_value_t = 8)]
+    max_rounds: u32,
 
     /// Atomically write a machine-readable worker status document.
     #[arg(long)]
@@ -390,6 +402,9 @@ struct JournalStatusCmd {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    if cli.max_rounds == 0 {
+        anyhow::bail!("--max-rounds must be at least 1");
+    }
     let approve = cli.approve.as_deref().map(parse_approve).transpose()?;
 
     // Project-layer discipline: providers may never be defined there (codex 纪律 1).
@@ -606,6 +621,7 @@ async fn main() -> anyhow::Result<()> {
                 rss_exit_mb: s.rss_exit_mb,
                 task_idle_timeout: Duration::from_secs(s.task_idle_timeout_secs),
                 turn_timeout: Duration::from_secs(s.turn_timeout_secs),
+                max_rounds: s.max_rounds,
                 status_file: s.status_file,
                 status_interval: Duration::from_secs(s.status_interval_secs),
                 approve: approve.map(|mode| with_role_deadline(mode, Some(&role))),
@@ -684,6 +700,7 @@ async fn main() -> anyhow::Result<()> {
         api_key,
         system: cli.system,
         timeout: Duration::from_secs(cli.timeout_secs),
+        max_rounds: cli.max_rounds,
         role_file: cli.role,
         approve,
         tools_enabled: cli.tools,

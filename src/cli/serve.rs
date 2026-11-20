@@ -72,6 +72,8 @@ pub struct ServeArgs {
     /// Wall-clock ceiling for one turn (0 = none). On expiry the engine is
     /// interrupted and the turn is booked as aborted/failed.
     pub turn_timeout: Duration,
+    /// Sampling rounds allowed per turn (tool call -> answer cycles).
+    pub max_rounds: u32,
 }
 
 /// task -> the session tree it was first given.
@@ -232,7 +234,7 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
                 Arc::new(Write),
                 Arc::new(Edit),
             ],
-            max_rounds: 8,
+            max_rounds: args.max_rounds.max(1),
             max_parallel_tools: args.max_parallel_tools,
             worker_tool_slots: worker_tool_slots.clone(),
             cwd: cwd.clone(),

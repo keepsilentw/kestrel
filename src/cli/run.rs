@@ -34,6 +34,8 @@ pub struct RunArgs {
     pub api_key: String,
     pub system: String,
     pub timeout: Duration,
+    /// Sampling rounds allowed per turn (tool call -> answer cycles).
+    pub max_rounds: u32,
     pub role_file: Option<PathBuf>,
     pub approve: ApproveMode,
     pub tools_enabled: bool,
@@ -127,7 +129,7 @@ pub async fn run_once(args: RunArgs) -> anyhow::Result<i32> {
         transport: Arc::new(RetryTransport::new(Arc::new(HttpTransport::new()))),
         system,
         tools,
-        max_rounds: 8,
+        max_rounds: args.max_rounds.max(1),
         max_parallel_tools: crate::tools::DEFAULT_MAX_PARALLEL_TOOLS,
         worker_tool_slots: None,
         cwd: std::env::current_dir()?,
