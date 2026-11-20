@@ -33,8 +33,8 @@
 > Build iter1 超时后迟到铃被忽略，iter2 通过）；
 > supervisor 与状态文件同时启用，模拟子进程验证了 exit 1 / exit 70 的重启分支；
 > Linux 真机与真实 worker 的 RSS 压力阈值仍未实测。
-> **Metrics** — src 52 files / 24052 lines · tests 9 files / 4379 lines · 316 tests (lib 247 + bin 6 + integration 63)
-> **Integration** — core_loop 7 / discipline 2 / m1_tools 14 / m2_session 6 / m4_bus 17 / m5_pool 11 / sandbox_e2e 4 / wire_anthropic 2
+> **Metrics** — src 52 files / 24085 lines · tests 9 files / 4469 lines · 317 tests (lib 247 + bin 6 + integration 64)
+> **Integration** — core_loop 8 / discipline 2 / m1_tools 14 / m2_session 6 / m4_bus 17 / m5_pool 11 / sandbox_e2e 4 / wire_anthropic 2
 > 规模已过 plan 预算（10-13k）的上沿：多出来的部分几乎都花在「取消安全」与「对账」这两条纪律上。
 > 上面两行数字由 `tests/discipline.rs::metrics_lines_match_the_tree` 对照源码树重算校验——
 > 这些计数此前在三处文档里手抄过三次、漂移过三次（§9.19），现在它是闸门不是仪式。
@@ -973,6 +973,17 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
     回归。本轮没有触发 `turn_timeout` 或 HTTP 空闲超时——它们是边界，不是常态路径；
     能证明的是默认路径没有被这些护栏改坏。日志与工件在 `harness/artifacts/`
     （gitignored），journal 40 条记录。
+
+82. **panic 也必须是可见的终态（2026-11-20）**：工具或 wire 的 panic 会结束回合任务
+    （tokio 捕获），但 `Fatal` 永远不会发出；worker 于是等一个不会来的事件，今天只被
+    `--turn-timeout-secs`（缺省 1h）兜住。现在 `start_turn` 用 `catch_unwind` 包住
+    `run_turn`：panic 时以**同一个 turn id** 发 `Fatal` + `TurnComplete(error)`（换成新
+    id 会被 worker 的陈旧事件过滤丢掉），并 `drop_pending()` 清掉在途审批；原因从 panic
+    payload 取 `&str`/`String`。测试
+    `a_panicking_tool_ends_the_turn_with_fatal_and_the_engine_survives` 用 `execute` 里
+    `panic!` 的工具断言 Fatal 带原因、下一回合仍能正常完成。边界：panic 时已持有的 std
+    锁仍可能中毒，后续回合会以同样的 Fatal 形式再次失败——这里承诺的是「不再静默挂住」，
+    不是「panic 安全」。
 
 ## 10 二期清单
 

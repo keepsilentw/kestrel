@@ -7,8 +7,8 @@
 
 ## 1. 自动化测试基线（cargo test）
 
-**Metrics** — src 52 files / 24052 lines · tests 9 files / 4379 lines · 316 tests (lib 247 + bin 6 + integration 63)
-**Integration** — core_loop 7 / discipline 2 / m1_tools 14 / m2_session 6 / m4_bus 17 / m5_pool 11 / sandbox_e2e 4 / wire_anthropic 2
+**Metrics** — src 52 files / 24085 lines · tests 9 files / 4469 lines · 317 tests (lib 247 + bin 6 + integration 64)
+**Integration** — core_loop 8 / discipline 2 / m1_tools 14 / m2_session 6 / m4_bus 17 / m5_pool 11 / sandbox_e2e 4 / wire_anthropic 2
 
 | 组 | 覆盖 |
 |---|---|
@@ -1608,3 +1608,18 @@ Parking 新增 8 MiB 总字节上限：
 没有触发 `--turn-timeout-secs` 或 HTTP 空闲超时：这两条是卡死边界，不是常态路径；
 本轮证明的是默认路径未被新护栏改坏。dev iter1 的失败是模型收敛行为（与历史运行一致），
 不是通路回归。
+
+## 72. 2026-11-20 panic 变成可见终态
+
+工具或 wire 在回合任务里 panic 时，tokio 会结束该任务，但 `Fatal` 不会发出；worker 只能
+等一个不会来的事件（原来只被 1h 的 turn deadline 兜住）。现在 `run_turn` 被
+`catch_unwind` 包住，panic 以同一 turn id 发出 `Fatal` + `TurnComplete(error)`，并清掉
+在途审批等待者。
+
+| 断言 | 结果 |
+|---|---|
+| `execute` 里 `panic!("tool exploded")` | 回合收到 `Fatal`，原因含 `tool exploded` |
+| Fatal 的 turn id | 与 `TurnStarted` 相同（不会被陈旧事件过滤丢掉） |
+| 同一引擎下一回合 | 正常完成（`Stop`） |
+
+边界：std 锁可能已被毒化；后续回合会再次以 Fatal 失败。承诺是「可见」，不是「panic 安全」。
