@@ -409,6 +409,15 @@ pub trait Transport: Send + Sync + 'static {
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const GATEWAY_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// True when a path segment is a version marker (`v1`, `v4`, ...). Both OpenAI
+/// wires use this to decide whether `base_url` already carries the version
+/// segment or whether the wire must insert `/v1` itself.
+pub(crate) fn is_version_segment(segment: &str) -> bool {
+    segment
+        .strip_prefix('v')
+        .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
+}
+
 /// Real HTTP transport (reqwest, SSE response body as bytes).
 pub struct HttpTransport {
     client: reqwest::Client,

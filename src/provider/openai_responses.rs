@@ -21,8 +21,20 @@ use super::wire::{
 
 pub struct OpenAiResponsesWire;
 
+/// Same two-spellings convention as `chat_url`: a product root gets `/v1`
+/// inserted, a root whose last segment already is the version gets only
+/// `/responses`, and a full endpoint path is used as written. The previous
+/// implementation always appended `/v1/responses`, so the conventional
+/// `base_url = ".../v1"` became the 404 shape `/v1/v1/responses`.
 fn responses_url(base_url: &str) -> String {
     let base = base_url.trim_end_matches('/');
+    if base.ends_with("/responses") {
+        return base.to_string();
+    }
+    let last = base.rsplit('/').next().unwrap_or_default();
+    if super::wire::is_version_segment(last) {
+        return format!("{base}/responses");
+    }
     format!("{base}/v1/responses")
 }
 
@@ -492,6 +504,33 @@ mod tests {
         format!("data: {}\n\n", serde_json::to_string(&v).unwrap())
     }
 
+    /// Both spellings of an OpenAI-compatible root, plus a full endpoint path.
+    /// `base_url = ".../v1"` must NOT become `/v1/v1/responses` (that shape was
+    /// never reachable on a real gateway); it is the conventional spelling.
+    #[test]
+    fn responses_url_accepts_a_versioned_root_and_a_full_path() {
+        assert_eq!(
+            responses_url("https://api.deepseek.com"),
+            "https://api.deepseek.com/v1/responses"
+        );
+        assert_eq!(
+            responses_url("https://api.deepseek.com/v1"),
+            "https://api.deepseek.com/v1/responses"
+        );
+        assert_eq!(
+            responses_url("https://api.deepseek.com/v1/"),
+            "https://api.deepseek.com/v1/responses"
+        );
+        assert_eq!(
+            responses_url("https://open.bigmodel.cn/api/paas/v4"),
+            "https://open.bigmodel.cn/api/paas/v4/responses"
+        );
+        assert_eq!(
+            responses_url("https://gw.example.com/v1/responses"),
+            "https://gw.example.com/v1/responses"
+        );
+    }
+
     #[test]
     fn request_shape_is_the_responses_api() {
         let ctx = TurnContext {
@@ -531,8 +570,8 @@ mod tests {
             None,
             &ResolvedAuth::key("secret"),
         );
-        // base_url + /v1/responses, and the api key is a bearer header
-        assert_eq!(spec.url, "https://gw.example/v1/v1/responses");
+        // base_url already carries the version segment; only /responses is added
+        assert_eq!(spec.url, "https://gw.example/v1/responses");
         assert_eq!(
             spec.headers[0],
             ("authorization".into(), "Bearer secret".into())

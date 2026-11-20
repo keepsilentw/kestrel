@@ -28,11 +28,7 @@ fn chat_url(base_url: &str) -> String {
         return base.to_string();
     }
     let last = base.rsplit('/').next().unwrap_or_default();
-    if last.len() >= 2
-        && let Some(rest) = last.strip_prefix('v')
-        && !rest.is_empty()
-        && rest.chars().all(|c| c.is_ascii_digit())
-    {
+    if super::wire::is_version_segment(last) {
         return format!("{base}/chat/completions");
     }
     format!("{base}/v1/chat/completions")
