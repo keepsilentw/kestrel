@@ -39,8 +39,9 @@
 #   KESTREL_DEMO_SUPERVISE_MAX_RESTARTS / _BACKOFF_SECS
 #                             监督重启次数与退避（默认 3 / 2 秒）。
 #   KESTREL_DEMO_TRUSTED_BUILD_PREFIXES  额外受信构建命令前缀，每行一个。
-#   KESTREL_DEMO_SA_ROLE      设了才给 demo-sa 传 --sa-role；该角色的后端会先起草
-#                             Spec.md，再进入确定性派发状态机。不设 = 沿用脚本化 SA。
+#   KESTREL_DEMO_SA_ROLE      设成 **role 文件路径**（如 harness/roles/sa.toml）才给
+#                             demo-sa 传 --sa-role；该角色的后端会先起草 Spec.md，再进入
+#                             确定性派发状态机。不设 = 沿用脚本化 SA。
 #   KESTREL_DEMO_SA_TRANSITIONS  置 1 时每个 stage 判定后再问 SA 一次，把执行提示
 #                             广播成 `ref.handoff` / `ref.rework.sa_note`（只作提示，
 #                             不改变判定与路由）。

@@ -1036,8 +1036,17 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
        与换行压平；`bell_prompt` 断言 focus 真的进了 worker 提示。
     ④ 边界：模型仍不能改 PASS/FAIL、证据要求、预算或路由允许集；`--sa-plan` 只决定
        「跑哪几关 + 每关重点」。默认关闭；开启时多一次规划调用（单独预留/结算，坐标
-       `stage=None` + 规划序号）。本轮没有在开启该 flag 的情况下重跑真实端点，验证是
-       单测级。
+       `stage=None` + 规划序号）。
+    ⑤ 2026-11-20 真端点验证（`KESTREL_DEMO_SA_ROLE=harness/roles/sa.toml`、
+       `KESTREL_DEMO_SA_PLAN=1`、`KESTREL_DEMO_SA_ROUTING=1`）：Spec 2285 字节；规划
+       一次通过 `dev -> review -> test -> build (source=model)`，四关 focus 全部非空
+       （dev 实现要点、review 的 grep 核对、test 的四条断言、build 的编译检查），计划文件
+       `demo-PLAN.json`，每颗铃的 `ref.focus` / `ref.plan` / `ref.plan_source` 都已落
+       journal；Dev iter1/2 因回合预算耗尽重派、iter3 pass；Review iter1/2 等回铃超时
+       （迟到铃按 §9.71④ 忽略）、iter3 pass；Test/Build iter1 pass；账本
+       `2.5592 cny, of which 0.0000 nominal`（`harness-sa: 0.0145 cny`），`pipeline
+       complete`。代价是比无规划那轮（0.1894 cny）贵，主要来自 Review 的两次 300s 等待
+       与重派，不是规划本身。
 
 ## 10 二期清单
 

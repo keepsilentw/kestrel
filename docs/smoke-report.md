@@ -1672,5 +1672,18 @@ task 的 `EngineConfig`，`-p` 送进 `RunArgs`。调大放宽的是「回合内
 
 focus 随铃的 `ref.focus` 下发到 worker prompt；计划文件为 `<task>-PLAN.json`，
 `ref.plan` / `ref.plan_source` 进 `BellSent`。过渡复核的下一关从实际计划取，
-不再从固定顺序猜。判定、证据、预算与允许集不变。默认关闭；单测级验证，未在开启该
-flag 下重跑真实端点。
+不再从固定顺序猜。判定、证据、预算与允许集不变。
+
+2026-11-20 真端点（`--sa-role --sa-plan --sa-routing`）：
+
+| 项 | 结果 |
+|---|---|
+| Spec | 2285 bytes |
+| Plan | `dev -> review -> test -> build`，source=model，四关 focus 非空 |
+| Dev | iter1/2 回合预算耗尽 → 重派；iter3 pass |
+| Review | iter1/2 等铃超时（迟到铃被忽略）；iter3 pass |
+| Test / Build | iter1 pass |
+| 账本 | `2.5592 cny, of which 0.0000 nominal`（SA 0.0145） |
+| 最终 | `pipeline complete` |
+
+代价高于无规划那轮（0.1894 cny），主要来自 Review 的两次 300s 等待与重派。
