@@ -33,8 +33,8 @@
 > Build iter1 超时后迟到铃被忽略，iter2 通过）；
 > supervisor 与状态文件同时启用，模拟子进程验证了 exit 1 / exit 70 的重启分支；
 > Linux 真机与真实 worker 的 RSS 压力阈值仍未实测。
-> **Metrics** — src 52 files / 22891 lines · tests 9 files / 4041 lines · 301 tests (lib 237 + bin 6 + integration 58)
-> **Integration** — core_loop 6 / discipline 2 / m1_tools 13 / m2_session 6 / m4_bus 17 / m5_pool 8 / sandbox_e2e 4 / wire_anthropic 2
+> **Metrics** — src 52 files / 23719 lines · tests 9 files / 4291 lines · 312 tests (lib 244 + bin 6 + integration 62)
+> **Integration** — core_loop 7 / discipline 2 / m1_tools 14 / m2_session 6 / m4_bus 17 / m5_pool 10 / sandbox_e2e 4 / wire_anthropic 2
 > 规模已过 plan 预算（10-13k）的上沿：多出来的部分几乎都花在「取消安全」与「对账」这两条纪律上。
 > 上面两行数字由 `tests/discipline.rs::metrics_lines_match_the_tree` 对照源码树重算校验——
 > 这些计数此前在三处文档里手抄过三次、漂移过三次（§9.19），现在它是闸门不是仪式。
@@ -879,6 +879,47 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
        的 session/parked 往返。
     ⑤ 边界：TTL 与字节上限目前是常量，不是 CLI 配置；drop-oldest 会丢帧（parked 本来就是
        有界、非 durable maildir），SA 的 write-ahead 对账仍是投递语义的兜底。
+
+76. **五个 P0 可靠性边界（2026-11-20）**：
+    ① `bash` 抓取有界：每路流保留前 1 MiB，其余继续读空但不存（子进程不会因管道满而卡死），
+       并在输出尾部写明 `[output truncated: kept … of … bytes]`。此前 `read_to_end` 无上限，
+       一条 `yes` 会把工具结果、session 行与下一轮请求一起放大，而 RSS 护栏只能在分配之后
+       反应；`read` 早有 256 KiB 上限，`bash` 没有。
+    ② 网关等待有界且可取消：`HttpTransport` 加 10s 连接超时、120s 空闲读超时（含等响应头），
+       **不设**总时长上限（384K 输出的生成可以合法地流很久）；`turn.rs` 的 `transport.send`
+       现在与 cancel token 竞争，补上不变式 1 的漏项——此前 `interrupt` 取消 token 后，
+       回合任务在 100ms 被硬 abort，`TurnComplete` 永远不发，worker 就等一颗不会来的事件。
+       `serve --turn-timeout-secs`（缺省 3600，0=关闭）给整回合一条墙钟上限：到点先
+       `interrupt`，若 5s 内引擎仍不收敛，worker 自己把该回合记为 failed/aborted 并释放
+       slot；工件新增 `turn_timeout` 字段。
+    ③ 失败可见化：factory 返错只让**那一个 task** 收到 error 铃并释放 slot，不再用 `?`
+       掀翻整个 worker；worker task 无论正常结束还是 panic 都会经 `WorkerExitNotice` 的
+       `Drop` 报 `WorkerExited`，pump 据此把在途铃（pump 侧 `inflight` 表）以 error 铃回给
+       SA；发送失败与审批批复送不到同样回 error 铃/回执。此前这些路径都是 `let _ =`，
+       SA 只能等 300s 后重派（§9.53②「silence is the bug」的同类问题）。
+    ④ journal/session 重放区分「尾部半写」与「中途损坏」：只有最后一个非空行允许解析失败；
+       其后的坏行被报成 corruption，带上行号与「多少行会被静默忘记」。`Journal::reseed`
+       与 `SessionStore::open` 对损坏直接拒绝，`verify()` 把活文件也纳入检查，`replay_all`
+       会 error 日志。此前两者都在第一行解析失败处 `break`：预算/结算/审批链与
+       read-before-edit 台账会被静默截短，而 `journal-status --check` 仍报健康。
+       另外，**第一次 append 之前**在持锁状态下修复尾部半写（截掉不完整的最后一行，
+       或缺换行时补一个分隔符）：不这么做，崩溃后的下一次追加会把「可容忍的尾部」变成
+       「不可容忍的中途损坏」。修复放在 append 而不是 open，是为了让 `journal-status`
+       这类只读命令不偷偷改文件。
+    ⑤ 测试：`bash_caps_captured_output_and_says_it_did`、
+       `a_gateway_that_never_answers_is_bounded_by_the_idle_timeout`、
+       `cancelling_a_turn_blocked_on_the_gateway_ends_it_as_aborted`、
+       `a_turn_past_its_deadline_is_aborted_and_the_slot_is_reusable`、
+       `a_failed_engine_start_fails_only_that_task`、
+       `worker_exit_notice_says_whether_it_finished`、
+       `mid_file_corruption_is_reported_instead_of_read_as_a_torn_tail`、
+       `mid_file_corruption_refuses_to_open`、
+       `a_restart_after_a_torn_tail_does_not_create_mid_file_corruption`（journal 与
+       session 各一条）。
+    ⑥ 边界：worker 侧 5s 硬停假设引擎被 abort 后不再发事件；一个在同步阻塞调用里永不让步
+       的工具仍可能越过它（此时 pump 已释放 slot，迟到事件按新一轮处理）。工作全部通过
+       fmt / clippy -D warnings / 全量测试；真实端点联跑本轮未重跑，因此这些改动是单测与
+       组件级（m5 走真 UDS + faux wire）验证，不是又一次真网关实测。
 
 ## 10 二期清单
 

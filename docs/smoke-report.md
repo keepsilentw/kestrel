@@ -7,8 +7,8 @@
 
 ## 1. 自动化测试基线（cargo test）
 
-**Metrics** — src 52 files / 22891 lines · tests 9 files / 4041 lines · 301 tests (lib 237 + bin 6 + integration 58)
-**Integration** — core_loop 6 / discipline 2 / m1_tools 13 / m2_session 6 / m4_bus 17 / m5_pool 8 / sandbox_e2e 4 / wire_anthropic 2
+**Metrics** — src 52 files / 23719 lines · tests 9 files / 4291 lines · 312 tests (lib 244 + bin 6 + integration 62)
+**Integration** — core_loop 7 / discipline 2 / m1_tools 14 / m2_session 6 / m4_bus 17 / m5_pool 10 / sandbox_e2e 4 / wire_anthropic 2
 
 | 组 | 覆盖 |
 |---|---|
@@ -1520,3 +1520,20 @@ Parking 新增 8 MiB 总字节上限：
 
 边界：TTL 与字节上限目前是常量，不是 CLI 配置；drop-oldest 会丢帧，parked 本来就是有界、
 非 durable maildir，投递语义仍由 SA 的 write-ahead 对账兜底。
+
+## 66. 2026-11-20 五个 P0 可靠性边界
+
+静态审计发现、当天修掉的五处「不会报错但会卡住或静默少读」的边界。全部是单测/组件级
+验证（m5 走真 UDS + faux wire），本轮没有重跑真实网关。
+
+| 边界 | 之前 | 现在 | 测试 |
+|---|---|---|---|
+| `bash` 输出 | `read_to_end` 无上限，一条 `yes` 同时放大工具结果、session 行与下一轮请求 | 每路保留前 1 MiB，继续读空避免子进程卡管道，尾部写明截断 | `bash_caps_captured_output_and_says_it_did` |
+| 网关等待 | `reqwest` 无超时；`send` 不参与取消，`interrupt` 后回合被硬 abort 且不发 `TurnComplete` | 10s 连接超时、120s 空闲读超时（含响应头）；send 与 cancel token 竞争 | `a_gateway_that_never_answers_is_bounded_by_the_idle_timeout`、`cancelling_a_turn_blocked_on_the_gateway_ends_it_as_aborted` |
+| 回合墙钟 | 一个卡死的回合永久占住 task 与预算预留 | `serve --turn-timeout-secs`（缺省 3600，0=关闭）：到点 interrupt，5s 不收敛则由 worker 记为 aborted/failed | `a_turn_past_its_deadline_is_aborted_and_the_slot_is_reusable` |
+| worker 失败 | factory 返错 `?` 掀翻整个 worker；worker 死亡/发送失败被 `let _ =` 吞掉 | 只失败该 task；`WorkerExitNotice`（含 panic 路径）报 `WorkerExited`；在途铃以 error 铃回给 SA | `a_failed_engine_start_fails_only_that_task`、`worker_exit_notice_says_whether_it_finished` |
+| 损坏识别 | journal/session 在第一行解析失败处 `break`，中途损坏被当成尾部半写 | 只有最后一行可容忍；其余报 corruption（带行号与受影响行数），`reseed`/`open` 拒绝，`verify` 检查活文件；首次 append 前持锁修复尾部半写，避免下一次追加把它变成中途损坏 | `mid_file_corruption_is_reported_instead_of_read_as_a_torn_tail`、`mid_file_corruption_refuses_to_open`、`a_restart_after_a_torn_tail_does_not_create_mid_file_corruption` |
+
+边界：worker 侧 5s 硬停假设引擎被 abort 后不再发事件；同步阻塞、永不让步的工具仍可能
+越过它（此时 pump 已释放 slot，迟到事件按新一轮处理）。`--turn-timeout-secs` 的缺省
+1 小时是「卡死」与「慢」的分界，不是任务节拍。
