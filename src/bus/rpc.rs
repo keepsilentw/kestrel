@@ -11,7 +11,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -160,6 +160,7 @@ fn park_envelope(
     session: &str,
     env: Envelope,
     byte_cap: usize,
+    total_bytes: &mut usize,
 ) -> bool {
     let frame_bytes = envelope_bytes(&env);
     if frame_bytes > byte_cap {
@@ -175,20 +176,20 @@ fn park_envelope(
         return false;
     }
 
-    let mut total_bytes = parked_bytes(parked);
+    let mut bytes = *total_bytes;
     if let Some(queue) = parked.get_mut(session)
         && queue.len() >= PARK_SESSION_CAP
     {
         let dropped = queue.pop_front();
         if let Some(frame) = &dropped {
-            total_bytes = total_bytes.saturating_sub(envelope_bytes(frame));
+            bytes = bytes.saturating_sub(envelope_bytes(frame));
         }
         tracing::warn!(
             "bus parking overflow for {session}: dropping the oldest bell ({:?})",
             dropped.map(|frame| frame.route.req)
         );
     }
-    while total_bytes.saturating_add(frame_bytes) > byte_cap {
+    while bytes.saturating_add(frame_bytes) > byte_cap {
         let mut dropped = parked.get_mut(session).and_then(VecDeque::pop_front);
         if dropped.is_none() {
             dropped = parked.iter_mut().find_map(|(_, queue)| queue.pop_front());
@@ -196,13 +197,14 @@ fn park_envelope(
         let Some(frame) = dropped else {
             break;
         };
-        total_bytes = total_bytes.saturating_sub(envelope_bytes(&frame));
+        bytes = bytes.saturating_sub(envelope_bytes(&frame));
         tracing::warn!(
             "bus parking byte cap ({byte_cap}): dropping oldest bell ({:?}) for {session}",
             frame.route.req
         );
     }
-    if total_bytes.saturating_add(frame_bytes) > byte_cap {
+    if bytes.saturating_add(frame_bytes) > byte_cap {
+        *total_bytes = bytes;
         tracing::warn!("bus parking byte cap ({byte_cap}): dropping notify for {session}");
         return false;
     }
@@ -210,6 +212,7 @@ fn park_envelope(
         .entry(session.to_string())
         .or_default()
         .push_back(env);
+    *total_bytes = bytes.saturating_add(frame_bytes);
     true
 }
 
@@ -228,6 +231,10 @@ pub struct BusHub {
     parked: Mutex<HashMap<SessionId, VecDeque<Envelope>>>,
     /// Last Hello time per session key; drives the persisted-table TTL.
     session_seen: Mutex<HashMap<SessionId, u64>>,
+    /// Cached total parked bytes, kept in step with `parked` under that lock.
+    /// Recomputing it per frame meant re-serializing every queued envelope
+    /// (up to the 8 MiB cap) on every offline bell — quadratic over a burst.
+    parked_bytes_cached: AtomicUsize,
     path: PathBuf,
     state_path: PathBuf,
     persist_lock: Mutex<()>,
@@ -270,17 +277,19 @@ impl BusHub {
             .iter()
             .map(|(session, record)| (session.clone(), record.seen_at))
             .collect();
-        let parked = persisted
+        let parked: HashMap<SessionId, VecDeque<Envelope>> = persisted
             .parked
             .into_iter()
             .map(|(session, frames)| (session, frames.into()))
             .collect();
+        let parked_bytes_cached = AtomicUsize::new(parked_bytes(&parked));
         let hub = Arc::new(Self {
             peers: Mutex::new(HashMap::new()),
             sessions: Mutex::new(sessions),
             requests: Mutex::new(HashMap::new()),
             parked: Mutex::new(parked),
             session_seen: Mutex::new(session_seen),
+            parked_bytes_cached,
             path: path.to_path_buf(),
             state_path: state_path.to_path_buf(),
             persist_lock: Mutex::new(()),
@@ -377,6 +386,8 @@ impl BusHub {
                 parked.remove(session);
             }
             parked.retain(|session, _| known.contains(session));
+            let bytes = parked_bytes(&parked);
+            self.parked_bytes_cached.store(bytes, Ordering::Relaxed);
         }
         {
             let mut seen = self.session_seen.lock().unwrap();
@@ -499,7 +510,10 @@ impl BusHub {
     fn park(&self, session: &str, env: Envelope) {
         let accepted = {
             let mut parked = self.parked.lock().unwrap();
-            park_envelope(&mut parked, session, env, PARK_TOTAL_BYTES)
+            let mut total = self.parked_bytes_cached.load(Ordering::Relaxed);
+            let accepted = park_envelope(&mut parked, session, env, PARK_TOTAL_BYTES, &mut total);
+            self.parked_bytes_cached.store(total, Ordering::Relaxed);
+            accepted
         };
         if accepted && let Err(error) = self.persist_now() {
             tracing::warn!("persist bus state after parking a notify: {error}");
@@ -507,11 +521,15 @@ impl BusHub {
     }
 
     fn take_parked(&self, session: &str) -> VecDeque<Envelope> {
-        self.parked
-            .lock()
-            .unwrap()
-            .remove(session)
-            .unwrap_or_default()
+        let mut parked = self.parked.lock().unwrap();
+        let taken = parked.remove(session).unwrap_or_default();
+        let freed: usize = taken.iter().map(envelope_bytes).sum();
+        if freed > 0 {
+            let current = self.parked_bytes_cached.load(Ordering::Relaxed);
+            self.parked_bytes_cached
+                .store(current.saturating_sub(freed), Ordering::Relaxed);
+        }
+        taken
     }
 
     /// Route one validated frame (Notify/Request/Response/Cancel).
@@ -987,12 +1005,56 @@ mod tests {
         }
     }
 
+    /// The cached total must equal a fresh walk after every push and take.
+    /// Without the cache each parked frame re-serialized the whole table.
+    #[tokio::test]
+    async fn the_parked_byte_cache_matches_the_table_on_push_and_take() {
+        let dir = std::env::temp_dir().join(format!("kestrel-bus-bytes-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let hub = BusHub::bind(&dir.join("bus.sock")).unwrap();
+        let relaxed = std::sync::atomic::Ordering::Relaxed;
+        // Parking only applies to a KNOWN session; unknown keys are pruned.
+        hub.sessions
+            .lock()
+            .unwrap()
+            .insert("rd-1".into(), "harness-rd".into());
+
+        hub.park("rd-1", env("first", 100));
+        hub.park("rd-1", env("second", 100));
+        let table = parked_bytes(&hub.parked.lock().unwrap());
+        assert!(table > 0);
+        assert_eq!(
+            hub.parked_bytes_cached.load(relaxed),
+            table,
+            "the cached total must match the table it describes"
+        );
+
+        let taken = hub.take_parked("rd-1");
+        assert_eq!(taken.len(), 2);
+        assert_eq!(hub.parked_bytes_cached.load(relaxed), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn parking_byte_cap_drops_the_oldest_frame() {
         let cap = 1200;
         let mut parked = HashMap::new();
-        assert!(park_envelope(&mut parked, "rd-1", env("first", 500), cap));
-        assert!(park_envelope(&mut parked, "rd-1", env("second", 500), cap));
+        let mut total = 0;
+        assert!(park_envelope(
+            &mut parked,
+            "rd-1",
+            env("first", 500),
+            cap,
+            &mut total
+        ));
+        assert!(park_envelope(
+            &mut parked,
+            "rd-1",
+            env("second", 500),
+            cap,
+            &mut total
+        ));
         let queue = parked.get("rd-1").expect("queue");
         assert_eq!(queue.len(), 1, "the first frame must be evicted");
         assert_eq!(queue[0].route.req, "second");
@@ -1001,7 +1063,14 @@ mod tests {
     #[test]
     fn a_frame_larger_than_the_byte_cap_is_not_parked() {
         let mut parked = HashMap::new();
-        assert!(!park_envelope(&mut parked, "rd-1", env("huge", 5000), 1200));
+        let mut total = 0;
+        assert!(!park_envelope(
+            &mut parked,
+            "rd-1",
+            env("huge", 5000),
+            1200,
+            &mut total
+        ));
         assert!(!parked.contains_key("rd-1"));
     }
 }
