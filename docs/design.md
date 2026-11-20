@@ -957,6 +957,12 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
     重新计算字节数。测试 `the_parked_byte_cache_matches_the_table_on_push_and_take` 断言
     缓存与全表重算逐次相等，取空后归零。
 
+80. **本地闸门一键化（2026-11-20）**：仓库按决定不挂 CI（§8 / §9.19⑥），闸门是
+    「每次改动人工跑 fmt/clippy/test」。`scripts/gate.sh` 把三条命令串成一条并在任一步
+    非零退出；它不替代判断（总线测试在严格沙箱里仍会因 UDS bind 的 EPERM 失败，沙箱 e2e
+    仍只在 macOS 真实 `sandbox-exec` 下有意义），只是把「记得跑」的摩擦降到一次回车。
+    README 的 Build & test 段改为先写它。
+
 ## 10 二期清单
 
 > 2026-11-13 更新：三期 RD/QA 在严格 `build_log` 下完成了真实端点联跑；构建日志由 SA

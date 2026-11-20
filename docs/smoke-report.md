@@ -1584,3 +1584,9 @@ Parking 新增 8 MiB 总字节上限：
 | `take_parked` 后缓存 | 归零 |
 
 边界：缓存与 `parked` 表同锁更新；`persist_now` 不改变座位表，因此不需要额外同步。
+
+## 70. 2026-11-20 本地闸门一键化
+
+`scripts/gate.sh` 串起 `cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、
+`cargo test`，任一步失败即非零退出。它不替代人工判断（严格沙箱里的 UDS `EPERM` 与
+非 macOS 的沙箱 e2e 仍属环境限制），只是把「记得跑」变成一条命令。本仓库仍不挂 CI。

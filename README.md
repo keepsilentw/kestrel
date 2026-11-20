@@ -34,11 +34,12 @@ cargo run -p kestrel -- -p "continue the previous task" \
 ## Build & test
 
 ```bash
+./scripts/gate.sh   # fmt --check + clippy -D warnings + cargo test，一条命令跑完
 cargo test          # 数量见上方 Metrics 行；沙箱 e2e 需 macOS（真实 /usr/bin/sandbox-exec）
-cargo fmt --check && cargo clippy --all-targets -- -D warnings   # 质量闸门
 ```
 
 > 总线测试要在真 UDS 上 bind socket：容器/严格沙箱里会以 `EPERM` 失败，不是回归。
+> 本仓库不挂 CI（design §8），`scripts/gate.sh` 就是那道人工闸门的一键版。
 
 ## Demo（星型三角色联跑）
 
