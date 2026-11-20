@@ -173,7 +173,13 @@ pub(crate) async fn run_compact(
     drop(ids);
     let tokens_before = shared.ctx_tokens.load(Ordering::Relaxed);
     let store = shared.session.get().expect("checked in should_compact");
-    store.append_compaction(first_kept.clone(), tokens_before, summary.clone(), seed);
+    if let Err(error) =
+        store.append_compaction(first_kept.clone(), tokens_before, summary.clone(), seed)
+    {
+        // The in-memory compaction still applies this turn; the checkpoint is
+        // what is missing, and resume would re-derive a weaker summary. Say so.
+        tracing::error!("compaction checkpoint not persisted: {error:#}");
+    }
 
     // Rewrite in-memory state: summary message + kept tail.
     let kept_items: Vec<MessageItem> = history[keep_from..].to_vec();

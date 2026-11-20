@@ -9,6 +9,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use anyhow::Context;
+
 use super::SUMMARY_PREFIX;
 use super::entries::{Entry, EntryId};
 use crate::core::events::MessageItem;
@@ -21,6 +23,9 @@ pub struct SessionStore {
     head: Mutex<Option<EntryId>>,
     idgen: Arc<dyn IdGen>,
     clock: Arc<dyn Clock>,
+    /// Test-only fault injection: a real ENOSPC is not portable to reproduce.
+    #[cfg(test)]
+    fail_writes: std::sync::atomic::AtomicBool,
 }
 
 fn encode_cwd(cwd: &Path) -> String {
@@ -67,6 +72,8 @@ impl SessionStore {
             head: Mutex::new(None),
             idgen,
             clock,
+            #[cfg(test)]
+            fail_writes: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -87,6 +94,8 @@ impl SessionStore {
             head: Mutex::new(head),
             idgen,
             clock,
+            #[cfg(test)]
+            fail_writes: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -95,7 +104,26 @@ impl SessionStore {
     }
 
     /// Append one conversation item as a Message entry (parent = head).
+    ///
+    /// Compatibility wrapper: production commits go through `try_append_item`
+    /// (via `Shared::commit`) so a failed write aborts the turn instead of
+    /// silently losing a line. This one never panics; it logs and returns the
+    /// id for ad-hoc callers that cannot surface an error.
     pub fn append_item(&self, item: MessageItem, usage: Option<Usage>) -> EntryId {
+        match self.try_append_item(item, usage) {
+            Ok(id) => id,
+            Err(error) => {
+                tracing::error!("session tree append failed: {error:#}");
+                self.idgen.next_id()
+            }
+        }
+    }
+
+    pub(crate) fn try_append_item(
+        &self,
+        item: MessageItem,
+        usage: Option<Usage>,
+    ) -> anyhow::Result<EntryId> {
         let id = self.idgen.next_id();
         let parent = self.head.lock().unwrap().clone();
         let ms = self.clock.now_ms();
@@ -106,19 +134,19 @@ impl SessionStore {
             usage,
             ms,
         };
-        self.write(&entry);
-        id
+        self.write(&entry)?;
+        Ok(id)
     }
 
     /// Append a raw entry with an explicit parent (fork/branch primitive).
-    pub fn append_entry(&self, entry: Entry) -> EntryId {
+    pub fn append_entry(&self, entry: Entry) -> anyhow::Result<EntryId> {
         let id = entry.id().cloned().unwrap_or_else(|| self.idgen.next_id());
-        self.write(&entry);
-        id
+        self.write(&entry)?;
+        Ok(id)
     }
 
     /// Fork: append a Message under `parent` and move the head there.
-    pub fn fork_from(&self, parent: &EntryId, item: MessageItem) -> EntryId {
+    pub fn fork_from(&self, parent: &EntryId, item: MessageItem) -> anyhow::Result<EntryId> {
         let id = self.idgen.next_id();
         let ms = self.clock.now_ms();
         let entry = Entry::Message {
@@ -128,11 +156,11 @@ impl SessionStore {
             usage: None,
             ms,
         };
-        self.write(&entry);
-        id
+        self.write(&entry)?;
+        Ok(id)
     }
 
-    pub fn append_model_change(&self, provider: &str, model: &str) -> EntryId {
+    pub fn append_model_change(&self, provider: &str, model: &str) -> anyhow::Result<EntryId> {
         let id = self.idgen.next_id();
         let parent = self.head.lock().unwrap().clone();
         let ms = self.clock.now_ms();
@@ -143,8 +171,8 @@ impl SessionStore {
             model: model.into(),
             ms,
         };
-        self.write(&entry);
-        id
+        self.write(&entry)?;
+        Ok(id)
     }
 
     pub fn append_compaction(
@@ -153,7 +181,7 @@ impl SessionStore {
         tokens_before: u64,
         summary: String,
         seed: Option<String>,
-    ) -> EntryId {
+    ) -> anyhow::Result<EntryId> {
         let id = self.idgen.next_id();
         let parent = self.head.lock().unwrap().clone();
         let ms = self.clock.now_ms();
@@ -166,23 +194,38 @@ impl SessionStore {
             seed,
             ms,
         };
-        self.write(&entry);
-        id
+        self.write(&entry)?;
+        Ok(id)
     }
 
-    fn write(&self, entry: &Entry) {
+    /// Arm one injected write failure (tests only). The engine's reaction to a
+    /// real ENOSPC is what matters, and a full disk is not portable to stage.
+    #[cfg(test)]
+    pub(crate) fn fail_next_write(&self) {
+        self.fail_writes
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn write(&self, entry: &Entry) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if self
+            .fail_writes
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("injected session write failure");
+        }
         let id = entry.id().cloned();
-        let mut file = self.file.lock().unwrap();
-        writeln!(
-            file,
-            "{}",
-            serde_json::to_string(entry).expect("entry serializes")
-        )
-        .expect("session write");
-        file.flush().expect("session flush");
+        let line = serde_json::to_string(entry).context("serialize a session entry")?;
+        {
+            let mut file = self.file.lock().unwrap();
+            writeln!(file, "{line}")
+                .and_then(|()| file.flush())
+                .with_context(|| format!("append to session tree {}", self.path.display()))?;
+        }
         if let Some(id) = id {
             *self.head.lock().unwrap() = Some(id);
         }
+        Ok(())
     }
 
     /// Load all entries; a torn last line is skipped (half-write tolerance).
@@ -570,7 +613,7 @@ mod tests {
             None,
         );
         // fork from the first message
-        let e3 = st.fork_from(&e1, MessageItem::user_text("branch"));
+        let e3 = st.fork_from(&e1, MessageItem::user_text("branch")).unwrap();
         let path_entries = st.head_path_entries();
         assert_eq!(
             path_entries.len(),
@@ -602,7 +645,8 @@ mod tests {
         );
         let first_kept = st.append_item(MessageItem::user_text("kept-1"), None);
         st.append_item(MessageItem::user_text("kept-2"), None);
-        st.append_compaction(first_kept.clone(), 9_999, "summary of old".into(), None);
+        st.append_compaction(first_kept.clone(), 9_999, "summary of old".into(), None)
+            .unwrap();
         let items = st.prompt_items();
         assert_eq!(items.len(), 3, "summary + kept-1 + kept-2");
         match &items[0] {

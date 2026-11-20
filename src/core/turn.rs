@@ -36,6 +36,22 @@ pub(crate) async fn run_turn(shared: &Arc<Shared>, token: &CancellationToken) ->
     let emit = |msg: EventMsg| {
         let _ = shared.events.send(Event::new(turn_req.clone(), msg));
     };
+    // A session write that cannot be persisted must end the turn with a fatal
+    // event, not panic or silently drop the record: the worker records the
+    // failure and the SA re-dispatches instead of reading a half-written tree.
+    let commit_or_abort = |items: Vec<MessageItem>, usage: &Usage| -> Result<(), String> {
+        shared.commit(items).map_err(|error| {
+            let message = format!("session tree write failed: {error:#}");
+            emit(EventMsg::Fatal {
+                error: message.clone(),
+            });
+            emit(EventMsg::TurnComplete {
+                usage: *usage,
+                stop: StopReason::error(message.clone(), true),
+            });
+            message
+        })
+    };
     emit(EventMsg::TurnStarted { turn: 1 });
 
     let mut round: u32 = 0;
@@ -70,8 +86,10 @@ pub(crate) async fn run_turn(shared: &Arc<Shared>, token: &CancellationToken) ->
                 auth: spec.auth.clone(),
             };
             drop(active);
-            if let Some(store) = shared.session.get() {
-                store.append_model_change(&spec.provider_name, &spec.model.id);
+            if let Some(store) = shared.session.get()
+                && let Err(error) = store.append_model_change(&spec.provider_name, &spec.model.id)
+            {
+                tracing::error!("model switch not persisted: {error:#}");
             }
             emit(EventMsg::ModelSwitched {
                 provider: spec.provider_name.clone(),
@@ -220,7 +238,9 @@ pub(crate) async fn run_turn(shared: &Arc<Shared>, token: &CancellationToken) ->
             commit_items.push(MessageItem::AssistantText { text: text.clone() });
         }
         if !commit_items.is_empty() {
-            shared.commit(commit_items);
+            if let Err(message) = commit_or_abort(commit_items, &total_usage) {
+                break TurnEnd::Error(message);
+            }
             // A thinking-only round commits the reasoning cookie (replayed next
             // request) but has no user-visible text: emitting MessageDone with
             // an empty body would just be noise in the event stream.
@@ -248,7 +268,9 @@ pub(crate) async fn run_turn(shared: &Arc<Shared>, token: &CancellationToken) ->
                     )
                 })
                 .collect();
-            shared.commit(outcomes_to_history(&batch));
+            if let Err(message) = commit_or_abort(outcomes_to_history(&batch), &total_usage) {
+                break TurnEnd::Error(message);
+            }
             for (call, outcome) in &batch {
                 emit(EventMsg::ToolEnd {
                     call_id: call.call_id.clone(),
@@ -323,7 +345,9 @@ pub(crate) async fn run_turn(shared: &Arc<Shared>, token: &CancellationToken) ->
             )
             .await;
             // One batch, one history commit: see outcomes_to_history.
-            shared.commit(outcomes_to_history(&results));
+            if let Err(message) = commit_or_abort(outcomes_to_history(&results), &total_usage) {
+                break TurnEnd::Error(message);
+            }
             for (call, outcome) in results {
                 executed_any = true;
                 if outcome.terminate {
@@ -348,7 +372,9 @@ pub(crate) async fn run_turn(shared: &Arc<Shared>, token: &CancellationToken) ->
             });
             break TurnEnd::Complete;
         }
-        shared.commit(steered);
+        if let Err(message) = commit_or_abort(steered, &total_usage) {
+            break TurnEnd::Error(message);
+        }
     };
 
     shared.approvals.drop_pending();

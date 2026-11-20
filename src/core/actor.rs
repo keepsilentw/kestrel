@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 
 use super::approvals::ApprovalBoard;
-use super::events::{Event, MessageItem};
+use super::events::{Event, EventMsg, MessageItem};
 use super::id::IdGen;
 use super::ops::{ApprovalCompletion, Op, Submission};
 use super::steering::Steering;
@@ -261,21 +261,40 @@ impl AgentHandle {
 impl Shared {
     /// Push items into history AND the session tree (entry ids stay aligned
     /// with history positions as Option<EntryId>).
-    pub(crate) fn commit(&self, items: Vec<MessageItem>) {
+    /// Push items into history AND the session tree. A failed write does not
+    /// panic (that used to poison `history_ids` and kill the engine for the
+    /// life of the process): the already-attempted items keep a `None` id so
+    /// memory and ids stay aligned, and the error is returned so the caller can
+    /// abort the turn loudly.
+    pub(crate) fn commit(&self, items: Vec<MessageItem>) -> anyhow::Result<()> {
         if items.is_empty() {
-            return;
+            return Ok(());
         }
         self.history.lock().unwrap().extend(items.iter().cloned());
         let mut ids = self.history_ids.lock().unwrap();
-        match self.session.get() {
-            Some(store) => {
-                for it in &items {
-                    ids.push(Some(store.append_item(it.clone(), None)));
+        let Some(store) = self.session.get() else {
+            ids.extend(std::iter::repeat_n(None, items.len()));
+            return Ok(());
+        };
+        let mut failed: Option<anyhow::Error> = None;
+        for it in &items {
+            if failed.is_some() {
+                // Unpersisted by definition: never hand compaction a dangling
+                // `first_kept` id that points at a line the tree does not hold.
+                ids.push(None);
+                continue;
+            }
+            match store.try_append_item(it.clone(), None) {
+                Ok(id) => ids.push(Some(id)),
+                Err(error) => {
+                    ids.push(None);
+                    failed = Some(error);
                 }
             }
-            None => {
-                ids.extend(std::iter::repeat_n(None, items.len()));
-            }
+        }
+        match failed {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
     }
 }
@@ -341,7 +360,14 @@ fn start_turn(
         shared.history.lock().unwrap().clear();
         shared.history_ids.lock().unwrap().clear();
     }
-    shared.commit(input);
+    if let Err(error) = shared.commit(input) {
+        let message = format!("session tree write failed: {error:#}");
+        let _ = shared.events.send(Event::new(
+            shared.idgen.next_id(),
+            EventMsg::Fatal { error: message },
+        ));
+        return;
+    }
     let token = shared.root.child_token();
     let sh = Arc::clone(shared);
     let task_token = token.clone();
@@ -353,3 +379,96 @@ fn start_turn(
 
 /// Convenience for callers that keep a map of named switch specs (M0 CLI/tests).
 pub type SwitchMap = HashMap<String, SwitchSpec>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::id::{SeqGen, SystemClock};
+    use crate::provider::faux::{FauxWire, stop_script};
+    use crate::provider::wire::{ModelMeta, NullTransport, ResolvedAuth, StopReason, WireId};
+    use std::path::Path;
+
+    fn engine_config(
+        wire: Arc<FauxWire>,
+        session: Arc<crate::session::SessionStore>,
+    ) -> EngineConfig {
+        EngineConfig {
+            provider: wire,
+            model: ModelMeta::minimal("faux-model", WireId::AnthropicMessages, "faux://unused"),
+            auth: ResolvedAuth::key("test"),
+            transport: Arc::new(NullTransport),
+            system: "test".into(),
+            tools: vec![],
+            max_rounds: 8,
+            max_parallel_tools: 4,
+            worker_tool_slots: None,
+            cwd: std::env::temp_dir(),
+            role: "rd".into(),
+            idgen: Arc::new(SeqGen::new()),
+            fs: Default::default(),
+            sandbox: Arc::new(crate::sandbox::Unsandboxed),
+            engine: Arc::new(crate::permissions::PermissionEngine::new(Default::default())),
+            approve: crate::tools::ApproveMode::HeadlessDeny,
+            approval_store: None,
+            session: Some(session),
+        }
+    }
+
+    /// A session write that fails must end the turn with `Fatal` and leave the
+    /// engine usable. It used to panic while holding `history_ids`, poisoning
+    /// that lock and killing every later turn for the life of the process.
+    #[tokio::test]
+    async fn a_failed_session_write_is_fatal_but_not_terminal_for_the_engine() {
+        let dir =
+            std::env::temp_dir().join(format!("kestrel-actor-writefail-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(
+            crate::session::SessionStore::create(
+                &dir,
+                Path::new("/ws"),
+                "rd",
+                "prov",
+                "model-x",
+                Arc::new(SeqGen::new()),
+                Arc::new(SystemClock),
+            )
+            .unwrap(),
+        );
+        store.fail_next_write();
+
+        let wire = Arc::new(FauxWire::new());
+        wire.push_turn_script(stop_script("after the failure"));
+        let handle = AgentHandle::spawn(engine_config(wire, Arc::clone(&store)));
+        let mut rx = handle.take_event_rx().expect("single event consumer");
+        handle.turn(vec![MessageItem::user_text("hi")]);
+
+        let fatal = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let event = rx.recv().await.expect("event stream");
+                if let EventMsg::Fatal { error } = event.msg {
+                    return error;
+                }
+            }
+        })
+        .await
+        .expect("a failed session write must be fatal, not silence");
+        assert!(fatal.contains("session tree write failed"), "{fatal}");
+        assert!(fatal.contains("injected session write failure"), "{fatal}");
+
+        // No poisoned mutex: the next turn commits and completes.
+        handle.turn(vec![MessageItem::user_text("again")]);
+        let stop = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let event = rx.recv().await.expect("event stream");
+                if let EventMsg::TurnComplete { stop, .. } = event.msg {
+                    return stop;
+                }
+            }
+        })
+        .await
+        .expect("the engine must survive a failed write");
+        assert_eq!(stop, StopReason::Stop);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
