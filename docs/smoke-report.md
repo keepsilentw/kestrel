@@ -1590,3 +1590,21 @@ Parking 新增 8 MiB 总字节上限：
 `scripts/gate.sh` 串起 `cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、
 `cargo test`，任一步失败即非零退出。它不替代人工判断（严格沙箱里的 UDS `EPERM` 与
 非 macOS 的沙箱 e2e 仍属环境限制），只是把「记得跑」变成一条命令。本仓库仍不挂 CI。
+
+## 71. 2026-11-20 HEAD 真端点复验
+
+五条 P0 与两轮 P1 落地后，用当前 HEAD 重跑确定性 SA 的四角色 demo：
+
+| 项目 | 结果 |
+|---|---|
+| Dev | iter1 `round budget exhausted` → 回派；iter2 `pass`（32 tests） |
+| Review | iter1 `pass`（32 tests） |
+| Test | iter1 `pass`（32 tests） |
+| Build | 确定性预检 + iter1 `pass` |
+| 账本 | `0.1894 cny, of which 0.0000 nominal` |
+| QA 缓存读数 | `cache read 15424`（服务端自动缓存） |
+| 最终状态 | `pipeline complete`（exit 0） |
+
+没有触发 `--turn-timeout-secs` 或 HTTP 空闲超时：这两条是卡死边界，不是常态路径；
+本轮证明的是默认路径未被新护栏改坏。dev iter1 的失败是模型收敛行为（与历史运行一致），
+不是通路回归。

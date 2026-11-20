@@ -963,6 +963,17 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
     仍只在 macOS 真实 `sandbox-exec` 下有意义），只是把「记得跑」的摩擦降到一次回车。
     README 的 Build & test 段改为先写它。
 
+81. **HEAD 真端点复验（2026-11-20）**：五条 P0（§9.76）与两轮 P1（§9.78 / §9.79）之后，
+    用当前 HEAD 重跑 `harness/run-demo.sh`（确定性 SA；RD = DeepSeek v4 flash，QA =
+    GLM-5.3-Flash 走 OpenAI 兼容面）。结果 `pipeline complete`：四关测试各
+    `32 passed / 0 failed`，账本 `0.1894 cny, of which 0.0000 nominal`，QA 读数里
+    `cache read 15424`——服务端自动缓存本来就在工作，这也正是「显式 cache_control」
+    对当前两个 provider 收益存疑的现场证据。dev iter1 以
+    `round budget exhausted` fail 并回派、iter2 收敛：这是模型的收敛行为，不是通路
+    回归。本轮没有触发 `turn_timeout` 或 HTTP 空闲超时——它们是边界，不是常态路径；
+    能证明的是默认路径没有被这些护栏改坏。日志与工件在 `harness/artifacts/`
+    （gitignored），journal 40 条记录。
+
 ## 10 二期清单
 
 > 2026-11-13 更新：三期 RD/QA 在严格 `build_log` 下完成了真实端点联跑；构建日志由 SA
