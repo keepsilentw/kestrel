@@ -7,7 +7,7 @@
 
 ## 1. 自动化测试基线（cargo test）
 
-**Metrics** — src 52 files / 24150 lines · tests 9 files / 4469 lines · 318 tests (lib 248 + bin 6 + integration 64)
+**Metrics** — src 52 files / 24223 lines · tests 9 files / 4469 lines · 319 tests (lib 249 + bin 6 + integration 64)
 **Integration** — core_loop 8 / discipline 2 / m1_tools 14 / m2_session 6 / m4_bus 17 / m5_pool 11 / sandbox_e2e 4 / wire_anthropic 2
 
 | 组 | 覆盖 |
@@ -1649,3 +1649,12 @@ Parking 新增 8 MiB 总字节上限：
 现在 `--max-rounds N` 在两个入口都可用（缺省 8，`0` 启动即拒绝）：`serve` 把它送进每个
 task 的 `EngineConfig`，`-p` 送进 `RunArgs`。调大放宽的是「回合内工具循环」，不放宽证据、
 判定或预算；最坏 token 成本随之上升，需与 `--max-cost` 一起看。
+
+## 75. 2026-11-20 错误响应体上限与 partial-json 文档
+
+| 项 | 之前 | 现在 |
+|---|---|---|
+| 非 2xx 正文 | `resp.text()` 无上限 | 最多 64 KiB，截断写 `[error body truncated]` |
+| `partial_json` 文档 | 声称引擎逐 delta 重解析 | 如实说明只在流结束严格解析，模块保留但未接线 |
+
+测试 `a_huge_error_body_is_capped_and_marked`：200 KB 的 500 正文被截到上限内且带标记。

@@ -33,7 +33,7 @@
 > Build iter1 超时后迟到铃被忽略，iter2 通过）；
 > supervisor 与状态文件同时启用，模拟子进程验证了 exit 1 / exit 70 的重启分支；
 > Linux 真机与真实 worker 的 RSS 压力阈值仍未实测。
-> **Metrics** — src 52 files / 24150 lines · tests 9 files / 4469 lines · 318 tests (lib 248 + bin 6 + integration 64)
+> **Metrics** — src 52 files / 24223 lines · tests 9 files / 4469 lines · 319 tests (lib 249 + bin 6 + integration 64)
 > **Integration** — core_loop 8 / discipline 2 / m1_tools 14 / m2_session 6 / m4_bus 17 / m5_pool 11 / sandbox_e2e 4 / wire_anthropic 2
 > 规模已过 plan 预算（10-13k）的上沿：多出来的部分几乎都花在「取消安全」与「对账」这两条纪律上。
 > 上面两行数字由 `tests/discipline.rs::metrics_lines_match_the_tree` 对照源码树重算校验——
@@ -1011,6 +1011,14 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
     显式策略；`serve` 侧进入每个 task 的 `EngineConfig`，`-p` 侧进入 `RunArgs`。
     边界：调大只放宽「回合内循环」，不放宽证据、判定或预算；`max_rounds` 越大，一次
     派发的最坏 token 成本越高（预留仍按最坏情况算），所以它和 `--max-cost` 要一起看。
+
+85. **响应体上限与 partial-json 文档收口（2026-11-20）**：① 非 2xx 响应原先
+    `resp.text().await` 无上限——一个用 500 + 千兆正文回应的网关能把这颗重试变成内存尖峰。
+    现在 `read_error_body` 最多读 64 KiB 并在截断时写明；状态码与开头足够决定重不重试。
+    测试 `a_huge_error_body_is_capped_and_marked` 用 200 KB 的 500 正文断言上限与标记。
+    ② `partial_json` 的模块文档声称「引擎每个 delta 重解析累积前缀」，实际引擎只在流结束时
+    用 `parse_args_or_null` 严格解析一次；该模块有测试、保留给「流式展示 / 截断残留」的
+    下一步，但文档不再替一条不存在的热路径背书。
 
 ## 10 二期清单
 
