@@ -7,7 +7,7 @@
 
 ## 1. 自动化测试基线（cargo test）
 
-**Metrics** — src 52 files / 24223 lines · tests 9 files / 4469 lines · 319 tests (lib 249 + bin 6 + integration 64)
+**Metrics** — src 52 files / 24627 lines · tests 9 files / 4469 lines · 322 tests (lib 252 + bin 6 + integration 64)
 **Integration** — core_loop 8 / discipline 2 / m1_tools 14 / m2_session 6 / m4_bus 17 / m5_pool 11 / sandbox_e2e 4 / wire_anthropic 2
 
 | 组 | 覆盖 |
@@ -1658,3 +1658,19 @@ task 的 `EngineConfig`，`-p` 送进 `RunArgs`。调大放宽的是「回合内
 | `partial_json` 文档 | 声称引擎逐 delta 重解析 | 如实说明只在流结束严格解析，模块保留但未接线 |
 
 测试 `a_huge_error_body_is_capped_and_marked`：200 KB 的 500 正文被截到上限内且带标记。
+
+## 76. 2026-11-20 受控规划：模型选关卡集与每关重点
+
+`demo-sa --sa-plan` 在 Spec 之后增加一个规划回合，模型只输出关卡集与每关 focus：
+
+| 回复 | 执行器 |
+|---|---|
+| dev → review → test → build | 接受 |
+| dev → review → build（跳过 test） | 接受 |
+| dev → test → build（跳过 review） | 接受 |
+| 缺 dev / 缺 build / 删光验证关 / 重复 / 未知 stage / 顺序颠倒 / 非 JSON | 整份退回标准四关 |
+
+focus 随铃的 `ref.focus` 下发到 worker prompt；计划文件为 `<task>-PLAN.json`，
+`ref.plan` / `ref.plan_source` 进 `BellSent`。过渡复核的下一关从实际计划取，
+不再从固定顺序猜。判定、证据、预算与允许集不变。默认关闭；单测级验证，未在开启该
+flag 下重跑真实端点。

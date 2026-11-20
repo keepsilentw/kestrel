@@ -33,7 +33,7 @@
 > Build iter1 超时后迟到铃被忽略，iter2 通过）；
 > supervisor 与状态文件同时启用，模拟子进程验证了 exit 1 / exit 70 的重启分支；
 > Linux 真机与真实 worker 的 RSS 压力阈值仍未实测。
-> **Metrics** — src 52 files / 24223 lines · tests 9 files / 4469 lines · 319 tests (lib 249 + bin 6 + integration 64)
+> **Metrics** — src 52 files / 24627 lines · tests 9 files / 4469 lines · 322 tests (lib 252 + bin 6 + integration 64)
 > **Integration** — core_loop 8 / discipline 2 / m1_tools 14 / m2_session 6 / m4_bus 17 / m5_pool 11 / sandbox_e2e 4 / wire_anthropic 2
 > 规模已过 plan 预算（10-13k）的上沿：多出来的部分几乎都花在「取消安全」与「对账」这两条纪律上。
 > 上面两行数字由 `tests/discipline.rs::metrics_lines_match_the_tree` 对照源码树重算校验——
@@ -1019,6 +1019,25 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
     ② `partial_json` 的模块文档声称「引擎每个 delta 重解析累积前缀」，实际引擎只在流结束时
     用 `parse_args_or_null` 严格解析一次；该模块有测试、保留给「流式展示 / 截断残留」的
     下一步，但文档不再替一条不存在的热路径背书。
+
+86. **受控规划：模型选关卡集与每关重点（2026-11-20）**：
+    ① 新增 `demo-sa --sa-plan`（需要 `--sa-role`）。Spec 之后多一个规划回合：模型输出
+       `{"stages":[{"stage":"dev|review|test|build","focus":"..."}]}`。执行器保留硬地板——
+       dev 第一、build 最后、review/test 至少留一个、存活关卡保持
+       dev→review→test→build 的相对顺序。缺 dev/build、删光验证关、重复、未知 stage、
+       顺序颠倒或不是 JSON 的回复**整份退回**标准四关，不做部分接受（部分接受等于第二套
+       没写下来的策略）。
+    ② 每关的 `focus` 随铃的 `ref.focus` 下发，worker prompt 里显示
+       `acceptance focus for this stage: ...`；计划落 `<artifacts>/<task>-PLAN.json`，
+       `ref.plan` / `ref.plan_source` 进 `BellSent`，所以 journal 能复现每颗铃当时用的是
+       哪份计划。过渡复核的「下一关」改为从实际计划取（`StagePlan::next_after`），不再从
+       固定顺序猜——§9.72③ 修过的提示错误在可变计划下会复发。
+    ③ 测试：三种合法形状（四关、只留 review、只留 test）、七类违反地板被拒、focus 截断
+       与换行压平；`bell_prompt` 断言 focus 真的进了 worker 提示。
+    ④ 边界：模型仍不能改 PASS/FAIL、证据要求、预算或路由允许集；`--sa-plan` 只决定
+       「跑哪几关 + 每关重点」。默认关闭；开启时多一次规划调用（单独预留/结算，坐标
+       `stage=None` + 规划序号）。本轮没有在开启该 flag 的情况下重跑真实端点，验证是
+       单测级。
 
 ## 10 二期清单
 
