@@ -28,6 +28,9 @@ pub struct EngineSpec {
     /// 策略表：默认是空表（`deny`/`ask` 走 PermissionEngine 的缺省），审批测试会
     /// 换成「default: ask」以便真的走到反向请求那条路。
     pub policy: Arc<PermissionEngine>,
+    /// Transport override (defaults to `NullTransport`). Tests that need a
+    /// gateway-level failure supply their own.
+    pub transport: Option<Arc<dyn kestrel::provider::wire::Transport>>,
 }
 
 impl Default for EngineSpec {
@@ -38,6 +41,7 @@ impl Default for EngineSpec {
             fs: FsPolicy::default(),
             approve: ApproveMode::HeadlessDeny,
             policy: Arc::new(PermissionEngine::new(Default::default())),
+            transport: None,
         }
     }
 }
@@ -52,6 +56,7 @@ pub fn spawn_engine(
         fs,
         approve,
         policy,
+        transport,
     } = spec;
     let sandbox: Arc<dyn kestrel::sandbox::Sandbox> = Arc::new(Unsandboxed);
     let handle = AgentHandle::spawn(EngineConfig {
@@ -62,7 +67,7 @@ pub fn spawn_engine(
             "faux://unused",
         ),
         auth: ResolvedAuth::key("test"),
-        transport: Arc::new(NullTransport),
+        transport: transport.unwrap_or_else(|| Arc::new(NullTransport)),
         system: "test system".into(),
         tools,
         max_rounds,

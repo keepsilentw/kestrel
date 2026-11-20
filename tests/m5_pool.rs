@@ -9,6 +9,7 @@
 mod common;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -16,7 +17,9 @@ use kestrel::bus::rpc::{BusClient, BusHub};
 use kestrel::cli::pool::{EngineFactory, PoolConfig, PooledEngine, run_pool};
 use kestrel::permissions::{Decision, PermissionEngine, PolicyTable};
 use kestrel::provider::faux::{FauxWire, ScriptedEvent, stop_script, tool_use_script};
-use kestrel::provider::wire::{StopReason, WireEvent};
+use kestrel::provider::wire::{
+    ByteStream, RequestSpec, StopReason, Transport, WireError, WireEvent,
+};
 use kestrel::tools::ApproveMode;
 use serde_json::{Value, json};
 
@@ -833,5 +836,85 @@ async fn a_failed_engine_start_fails_only_that_task() {
         .unwrap();
     assert_eq!(done.payload["task_id"], "good");
     assert!(done.payload["result_ref"].is_string(), "{}", done.payload);
+    h.pool.abort();
+}
+
+/// The engine emits `Fatal` and then `TurnComplete` for one failed sample. The
+/// worker stops reading on `Fatal`, so that `TurnComplete` stays queued; without
+/// the turn-id filter the NEXT turn would read it first and finish immediately
+/// with the previous turn's error.
+struct FailsOnce {
+    failed: AtomicBool,
+}
+
+impl Transport for FailsOnce {
+    fn send(
+        &self,
+        _spec: RequestSpec,
+    ) -> futures::future::BoxFuture<'static, Result<ByteStream, WireError>> {
+        if !self.failed.swap(true, Ordering::SeqCst) {
+            Box::pin(async { Err(WireError::Transport("simulated gateway failure".into())) })
+        } else {
+            Box::pin(async { Ok(Box::pin(futures::stream::empty()) as ByteStream) })
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_stale_terminal_event_does_not_end_the_next_turn() {
+    let wires: Wires = Arc::new(Mutex::new(HashMap::new()));
+    let seen = Arc::clone(&wires);
+    let factory: EngineFactory = Arc::new(move |task: &str| {
+        let wire = Arc::new(FauxWire::new());
+        wire.push_turn_script(stop_script("answer after the failure"));
+        seen.lock()
+            .unwrap()
+            .insert(task.to_string(), Arc::clone(&wire));
+        let (handle, events) = common::spawn_engine(
+            wire,
+            common::EngineSpec {
+                transport: Some(Arc::new(FailsOnce {
+                    failed: AtomicBool::new(false),
+                })),
+                ..Default::default()
+            },
+        );
+        Ok(PooledEngine { handle, events })
+    });
+    let h = harness_with(
+        "stale-terminal",
+        factory,
+        wires,
+        Limits {
+            max_tasks: 1,
+            ..Limits::standard()
+        },
+    )
+    .await;
+
+    h.sa.notify("harness-rd", bell("t1", "dev", "first bell"));
+    let first = tokio::time::timeout(Duration::from_secs(5), h.sa.recv_notify())
+        .await
+        .expect("the failed sample must still produce a result")
+        .unwrap();
+    assert!(first.payload["result_ref"].is_string(), "{}", first.payload);
+    let a1 = read_artifact(&h.artifacts, "harness-rd-t1-dev-iter1.json").await;
+    assert_eq!(a1["stop"]["type"], "error", "{a1}");
+
+    // The second bell must run a fresh turn, not consume the queued TurnComplete.
+    let mut second_bell = bell("t1", "dev", "second bell");
+    second_bell["iteration"] = json!(2);
+    h.sa.notify("harness-rd", second_bell);
+    let second = tokio::time::timeout(Duration::from_secs(5), h.sa.recv_notify())
+        .await
+        .expect("the second bell must be served")
+        .unwrap();
+    assert!(
+        second.payload["result_ref"].is_string(),
+        "{}",
+        second.payload
+    );
+    let a2 = read_artifact(&h.artifacts, "harness-rd-t1-dev-iter2.json").await;
+    assert_eq!(a2["result"], "answer after the failure", "{a2}");
     h.pool.abort();
 }

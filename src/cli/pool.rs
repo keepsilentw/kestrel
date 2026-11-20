@@ -1130,6 +1130,10 @@ fn spawn_worker(
             };
             let mut hard_stop_at: Option<tokio::time::Instant> = None;
             let mut turn_timed_out = false;
+            // Events carry their turn's request id. A turn that ended on `Fatal`
+            // can leave its `TurnComplete` queued; without this filter the next
+            // turn reads that stale terminal event first and ends immediately.
+            let mut turn_id: Option<String> = None;
             let far_future = || tokio::time::Instant::now() + Duration::from_secs(86_400);
             let stop_seen: Option<StopReason>;
             loop {
@@ -1142,6 +1146,15 @@ fn spawn_worker(
                                 break;
                             }
                         };
+                        if matches!(ev.msg, EventMsg::TurnStarted { .. }) {
+                            turn_id = Some(ev.id.clone());
+                        } else if turn_id.as_deref() != Some(ev.id.as_str()) {
+                            tracing::warn!(
+                                "task {task}: ignoring event {} from a previous turn",
+                                ev.id
+                            );
+                            continue;
+                        }
                         match ev.msg {
                             EventMsg::TurnComplete { stop, usage: seen } => {
                                 aborted = matches!(stop, StopReason::Aborted);
