@@ -31,8 +31,11 @@ struct ToolCallAcc {
     args: String,
 }
 
-pub(crate) async fn run_turn(shared: &Arc<Shared>, token: &CancellationToken) -> TurnEnd {
-    let turn_req: ReqId = shared.idgen.next_id();
+pub(crate) async fn run_turn(
+    shared: &Arc<Shared>,
+    token: &CancellationToken,
+    turn_req: ReqId,
+) -> TurnEnd {
     let emit = |msg: EventMsg| {
         let _ = shared.events.send(Event::new(turn_req.clone(), msg));
     };

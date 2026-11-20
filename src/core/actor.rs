@@ -371,8 +371,38 @@ fn start_turn(
     let token = shared.root.child_token();
     let sh = Arc::clone(shared);
     let task_token = token.clone();
+    let turn_req = shared.idgen.next_id();
     let handle = AbortOnDropHandle::new(tokio::spawn(async move {
-        super::turn::run_turn(&sh, &task_token).await;
+        use futures::FutureExt as _;
+        // A panicking tool or wire implementation must become a visible Fatal,
+        // not a task that dies silently while the worker waits for an event
+        // that will never come (bounded today only by --turn-timeout-secs).
+        let outcome =
+            std::panic::AssertUnwindSafe(super::turn::run_turn(&sh, &task_token, turn_req.clone()))
+                .catch_unwind()
+                .await;
+        if let Err(payload) = outcome {
+            let reason = payload
+                .downcast_ref::<&str>()
+                .map(|text| text.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".into());
+            let message = format!("turn task panicked: {reason}");
+            sh.approvals.drop_pending();
+            let _ = sh.events.send(Event::new(
+                turn_req.clone(),
+                EventMsg::Fatal {
+                    error: message.clone(),
+                },
+            ));
+            let _ = sh.events.send(Event::new(
+                turn_req,
+                EventMsg::TurnComplete {
+                    usage: crate::provider::wire::Usage::default(),
+                    stop: crate::provider::wire::StopReason::error(message, false),
+                },
+            ));
+        }
     }));
     *active = Some(ActiveTask { token, handle });
 }

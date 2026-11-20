@@ -28,6 +28,15 @@ fn spawn_engine_on(
     max_rounds: u32,
     transport: Arc<dyn kestrel::provider::wire::Transport>,
 ) -> (AgentHandle, tokio::sync::mpsc::UnboundedReceiver<Event>) {
+    spawn_engine_full(wire, max_rounds, transport, vec![])
+}
+
+fn spawn_engine_full(
+    wire: Arc<FauxWire>,
+    max_rounds: u32,
+    transport: Arc<dyn kestrel::provider::wire::Transport>,
+    tools: Vec<Arc<dyn kestrel::tools::Tool>>,
+) -> (AgentHandle, tokio::sync::mpsc::UnboundedReceiver<Event>) {
     let handle = AgentHandle::spawn(EngineConfig {
         provider: wire,
         model: kestrel::provider::wire::ModelMeta::minimal(
@@ -38,7 +47,7 @@ fn spawn_engine_on(
         auth: ResolvedAuth::key("test"),
         transport,
         system: "test system".into(),
-        tools: vec![],
+        tools,
         max_rounds,
         max_parallel_tools: kestrel::tools::DEFAULT_MAX_PARALLEL_TOOLS,
         worker_tool_slots: None,
@@ -325,4 +334,85 @@ async fn cancelling_a_turn_blocked_on_the_gateway_ends_it_as_aborted() {
     .await
     .expect("a cancelled gateway wait must end the turn, not hang the worker");
     assert_eq!(stop, StopReason::Aborted);
+}
+
+/// A panicking tool unwinds the turn task. Without a guard the worker waits for
+/// a terminal event that cannot come (today bounded only by the 1h turn
+/// deadline); the engine must instead surface `Fatal` and stay usable.
+struct PanicTool;
+
+#[async_trait::async_trait]
+impl kestrel::tools::Tool for PanicTool {
+    fn name(&self) -> &str {
+        "panic-tool"
+    }
+
+    fn schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {}})
+    }
+
+    async fn prepare(
+        &self,
+        _call: &kestrel::tools::ToolCall,
+        _ctx: &kestrel::tools::ToolCtx,
+    ) -> Result<kestrel::tools::Prepared, kestrel::tools::Reject> {
+        Ok(kestrel::tools::Prepared(serde_json::json!({})))
+    }
+
+    async fn execute(
+        &self,
+        _prep: kestrel::tools::Prepared,
+        _ctx: &kestrel::tools::ToolCtx,
+        _cancel: tokio_util::sync::CancellationToken,
+        _update: tokio::sync::mpsc::UnboundedSender<kestrel::tools::ToolUpdate>,
+    ) -> Result<kestrel::tools::ToolOutcome, kestrel::tools::ToolError> {
+        panic!("tool exploded");
+    }
+}
+
+#[tokio::test]
+async fn a_panicking_tool_ends_the_turn_with_fatal_and_the_engine_survives() {
+    let wire = Arc::new(FauxWire::new());
+    wire.push_turn_script(kestrel::provider::faux::tool_use_script(
+        "go",
+        "c1",
+        "panic-tool",
+        serde_json::json!({}),
+    ));
+    wire.push_turn_script(kestrel::provider::faux::stop_script("recovered"));
+    let (handle, mut rx) =
+        spawn_engine_full(wire, 8, Arc::new(NullTransport), vec![Arc::new(PanicTool)]);
+    handle.turn(vec![MessageItem::user_text("do it")]);
+
+    let (fatal, first_stop) = tokio::time::timeout(Duration::from_secs(2), async {
+        let mut fatal = None;
+        loop {
+            let event = rx.recv().await.expect("event stream");
+            match event.msg {
+                EventMsg::Fatal { error } => fatal = Some(error),
+                EventMsg::TurnComplete { stop, .. } => return (fatal, Some(stop)),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("a panicking tool must not leave the worker waiting");
+    let fatal = fatal.expect("a panic must be reported as Fatal");
+    assert!(fatal.contains("panicked"), "{fatal}");
+    assert!(fatal.contains("tool exploded"), "{fatal}");
+    assert!(matches!(first_stop, Some(StopReason::Error { .. })));
+
+    // No poisoned engine state: the next turn completes normally.
+    handle.turn(vec![MessageItem::user_text("again")]);
+    let stop = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let event = rx.recv().await.expect("event stream");
+            if let EventMsg::TurnComplete { stop, .. } = event.msg {
+                return stop;
+            }
+        }
+    })
+    .await
+    .expect("the engine must survive a panicking tool");
+    assert_eq!(stop, StopReason::Stop);
 }
