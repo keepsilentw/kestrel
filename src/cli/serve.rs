@@ -69,6 +69,9 @@ pub struct ServeArgs {
     /// Idle time before a task's engine is released (0 = keep it forever). The
     /// session tree survives a release and is reopened by the next bell.
     pub task_idle_timeout: Duration,
+    /// Wall-clock ceiling for one turn (0 = none). On expiry the engine is
+    /// interrupted and the turn is booked as aborted/failed.
+    pub turn_timeout: Duration,
 }
 
 /// task -> the session tree it was first given.
@@ -170,6 +173,7 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         approval_retry: approve.approval_retry_period(),
         status_file: args.status_file.clone(),
         status_interval: args.status_interval,
+        turn_timeout: args.turn_timeout,
     });
 
     let model = args.model.clone();

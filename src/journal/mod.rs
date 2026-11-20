@@ -17,7 +17,7 @@ pub use records::{
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Cursor, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -32,6 +32,11 @@ pub struct Journal {
     /// instead of re-reading the whole journal (design §5 不变式 5: state is
     /// DEFINED by the replay, so both must come out of ONE fold).
     projection: Mutex<Folder>,
+    /// Whether the tail was already inspected before appending. Repairing on
+    /// open would make read-only commands (`journal-status`) mutate the file;
+    /// repairing on the first append keeps status read-only and still prevents
+    /// a torn tail from becoming mid-file corruption.
+    tail_checked: std::sync::atomic::AtomicBool,
 }
 
 /// Result of one successful rotation.
@@ -176,6 +181,7 @@ impl Journal {
             file: Mutex::new(file),
             path: path.to_path_buf(),
             projection: Mutex::new(Folder::default()),
+            tail_checked: std::sync::atomic::AtomicBool::new(false),
         };
         // A "created" journal may already hold yesterday's records (`create`
         // opens in append mode and `KESTREL_DEMO_KEEP_JOURNAL=1` relies on it):
@@ -191,14 +197,55 @@ impl Journal {
             file: Mutex::new(file),
             path: path.to_path_buf(),
             projection: Mutex::new(Folder::default()),
+            tail_checked: std::sync::atomic::AtomicBool::new(false),
         };
         journal.reseed()?;
         Ok(journal)
     }
 
+    /// A crash can leave an incomplete last line. Drop it (a partial line is not
+    /// a record) or finish the missing separator, BEFORE the next append — a
+    /// torn tail that gets appended past becomes mid-file corruption, which is
+    /// exactly the shape `scan_records` refuses to read.
+    fn repair_torn_tail(&self) -> anyhow::Result<()> {
+        let bytes = std::fs::read(&self.path)?;
+        match torn_tail_repair(&bytes) {
+            TailRepair::None => Ok(()),
+            TailRepair::AddNewline => {
+                let mut file = OpenOptions::new().append(true).open(&self.path)?;
+                file.write_all(b"\n")?;
+                file.sync_all()?;
+                tracing::warn!(
+                    "journal {}: last record had no trailing newline; separator added",
+                    self.path.display()
+                );
+                Ok(())
+            }
+            TailRepair::Truncate(at) => {
+                let file = OpenOptions::new().write(true).open(&self.path)?;
+                file.set_len(at as u64)?;
+                file.sync_all()?;
+                tracing::warn!(
+                    "journal {}: dropped an incomplete last line ({} byte(s)); a torn tail is \
+                     not history",
+                    self.path.display(),
+                    bytes.len().saturating_sub(at)
+                );
+                Ok(())
+            }
+        }
+    }
+
     /// Append one record and fsync — the ONLY way records enter the journal.
     pub fn append(&self, record: &JournalRecord) -> anyhow::Result<()> {
         let mut file = self.file.lock().unwrap();
+        // Under the append lock, so two writers cannot race a repair against a
+        // write. Only the first append pays for the inspection.
+        if !self.tail_checked.load(std::sync::atomic::Ordering::Relaxed) {
+            self.repair_torn_tail()?;
+            self.tail_checked
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         writeln!(file, "{}", serde_json::to_string(record)?)?;
         file.flush()?;
         file.sync_all()?;
@@ -210,9 +257,13 @@ impl Journal {
     /// Rebuild the online projection by replaying the live file. Called at open
     /// (history may pre-exist) and after a rotation swapped the file.
     pub fn reseed(&self) -> anyhow::Result<()> {
+        let outcome = self.replay_outcome();
+        if let Some(problem) = outcome.problem {
+            anyhow::bail!("refusing to rebuild the journal projection: {problem}");
+        }
         let mut folder = Folder::default();
-        for record in self.replay() {
-            folder.apply(&record);
+        for record in &outcome.records {
+            folder.apply(record);
         }
         *self.projection.lock().unwrap() = folder;
         Ok(())
@@ -228,22 +279,24 @@ impl Journal {
         std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0)
     }
 
-    /// Replay all records; a torn tail (crash mid-write) is skipped.
+    /// Replay all records; a torn tail (crash mid-write) is skipped. A bad line
+    /// with records after it is different — see `replay_outcome`.
     pub fn replay(&self) -> Vec<JournalRecord> {
-        let Ok(f) = File::open(&self.path) else {
-            return vec![];
-        };
-        let mut out = Vec::new();
-        for line in BufReader::new(f).lines().map_while(Result::ok) {
-            if line.trim().is_empty() {
-                continue;
-            }
-            match serde_json::from_str::<JournalRecord>(&line) {
-                Ok(r) => out.push(r),
-                Err(_) => break, // torn tail
-            }
+        let outcome = self.replay_outcome();
+        if let Some(problem) = &outcome.problem {
+            tracing::error!("journal replay: {problem}");
         }
-        out
+        outcome.records
+    }
+
+    /// The replay with its corruption verdict kept separate. A mid-file bad line
+    /// is NOT a torn tail: stopping silently there forgets every later budget,
+    /// settlement and approval record, and `--check` would still say clean.
+    pub(crate) fn replay_outcome(&self) -> ReplayOutcome {
+        match std::fs::read(&self.path) {
+            Ok(bytes) => scan_records(&bytes, &self.path),
+            Err(_) => ReplayOutcome::default(),
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -335,7 +388,11 @@ impl Journal {
         let mut chain_end = 0u64;
         for (from, to, path) in self.authoritative_segments() {
             let promised = to.saturating_sub(from);
-            let records = replay_path(&path).len() as u64;
+            let outcome = scan_path(&path);
+            if let Some(problem) = &outcome.problem {
+                problems.push(problem.clone());
+            }
+            let records = outcome.records.len() as u64;
             if records != promised {
                 problems.push(format!(
                     "segment seg{from}-{to} holds {records} record(s), its name promises {promised}"
@@ -350,7 +407,11 @@ impl Journal {
                 path,
             });
         }
-        let checkpoint_covers = self.replay().iter().find_map(|record| match record {
+        let live = self.replay_outcome();
+        if let Some(problem) = &live.problem {
+            problems.push(problem.clone());
+        }
+        let checkpoint_covers = live.records.iter().find_map(|record| match record {
             JournalRecord::Snapshot { covers, .. } => Some(*covers),
             _ => None,
         });
@@ -426,9 +487,17 @@ impl Journal {
     pub fn replay_all(&self) -> Vec<JournalRecord> {
         let mut out = Vec::new();
         for segment in self.segments() {
-            out.extend(replay_path(&segment));
+            let outcome = scan_path(&segment);
+            if let Some(problem) = &outcome.problem {
+                tracing::error!("journal segment replay: {problem}");
+            }
+            out.extend(outcome.records);
         }
-        out.extend(self.replay());
+        let live = self.replay_outcome();
+        if let Some(problem) = &live.problem {
+            tracing::error!("journal replay: {problem}");
+        }
+        out.extend(live.records);
         out
     }
 
@@ -775,7 +844,12 @@ impl Journal {
     /// 是新文件（前缀已在段文件里）。
     pub fn rotate(&self, keep: usize) -> anyhow::Result<Option<Rotation>> {
         let mut file = self.file.lock().unwrap();
-        let records = self.replay();
+        let ReplayOutcome { records, problem } = self.replay_outcome();
+        if let Some(problem) = problem {
+            // Archiving a prefix that stops at a corrupt line would freeze the
+            // truncation into a segment and keep it forever.
+            anyhow::bail!("refusing to rotate a corrupt journal: {problem}");
+        }
         if records.len() <= keep {
             return Ok(None);
         }
@@ -851,24 +925,101 @@ impl Journal {
 }
 
 /// Replay one journal file; a torn tail is skipped (same rule as `replay`).
+/// Test-only: production paths report through `ReplayOutcome` instead.
+#[cfg(test)]
 fn replay_path(path: &Path) -> Vec<JournalRecord> {
-    let Ok(bytes) = read_journal_bytes(path) else {
-        return vec![];
-    };
-    let mut out = Vec::new();
-    for line in BufReader::new(Cursor::new(bytes))
+    scan_path(path).records
+}
+
+/// One replay attempt plus its verdict. `problem` is set only when an
+/// unparsable line is followed by more non-empty lines — the crash-truncated
+/// tail is the only failure a reader may absorb.
+#[derive(Default)]
+pub(crate) struct ReplayOutcome {
+    pub records: Vec<JournalRecord>,
+    pub problem: Option<String>,
+}
+
+fn scan_path(path: &Path) -> ReplayOutcome {
+    match read_journal_bytes(path) {
+        Ok(bytes) => scan_records(&bytes, path),
+        Err(_) => ReplayOutcome::default(),
+    }
+}
+
+fn scan_records(bytes: &[u8], label: &Path) -> ReplayOutcome {
+    let text = String::from_utf8_lossy(bytes);
+    let lines: Vec<&str> = text
         .lines()
-        .map_while(Result::ok)
-    {
-        if line.trim().is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<JournalRecord>(&line) {
-            Ok(r) => out.push(r),
-            Err(_) => break,
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    let mut records = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        match serde_json::from_str::<JournalRecord>(line) {
+            Ok(record) => records.push(record),
+            Err(error) => {
+                let remaining = lines.len().saturating_sub(index + 1);
+                if remaining == 0 {
+                    break; // torn tail: the crash truncated the write
+                }
+                return ReplayOutcome {
+                    records,
+                    problem: Some(format!(
+                        "{}: line {} is not a journal record ({error}); {} later line(s) \
+                         would be silently forgotten",
+                        label.display(),
+                        index + 1,
+                        remaining
+                    )),
+                };
+            }
         }
     }
-    out
+    ReplayOutcome {
+        records,
+        problem: None,
+    }
+}
+
+enum TailRepair {
+    None,
+    AddNewline,
+    Truncate(usize),
+}
+
+/// Decide what to do with the last line without touching the file.
+fn torn_tail_repair(bytes: &[u8]) -> TailRepair {
+    torn_tail_repair_with::<JournalRecord>(bytes)
+}
+
+fn torn_tail_repair_with<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> TailRepair {
+    if bytes.is_empty() {
+        return TailRepair::None;
+    }
+    let newline_terminated = bytes.ends_with(b"\n");
+    let end = if newline_terminated {
+        bytes.len() - 1
+    } else {
+        bytes.len()
+    };
+    let last_start = bytes[..end]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    let last = &bytes[last_start..end];
+    if last.iter().all(|byte| byte.is_ascii_whitespace()) {
+        return TailRepair::None;
+    }
+    if serde_json::from_slice::<T>(last).is_ok() {
+        // A complete record whose newline never made it: keep it, add the gap.
+        return if newline_terminated {
+            TailRepair::None
+        } else {
+            TailRepair::AddNewline
+        };
+    }
+    TailRepair::Truncate(last_start)
 }
 
 fn read_journal_bytes(path: &Path) -> anyhow::Result<Vec<u8>> {
@@ -1103,7 +1254,117 @@ mod tests {
         let j2 = Journal::open(&path).unwrap();
         let records = j2.replay();
         assert_eq!(records.len(), 2);
+        assert!(
+            j2.replay_outcome().problem.is_none(),
+            "the last line may be torn; that is not corruption"
+        );
         std::fs::remove_file(&path).ok();
+    }
+
+    /// A crash leaves a partial last line; the next process opens, then appends.
+    /// Without repairing the tail first, the partial line stops being a tail and
+    /// the journal would be refused on the following start (or silently
+    /// undercount before this change).
+    #[test]
+    fn a_restart_after_a_torn_tail_does_not_create_mid_file_corruption() {
+        use std::io::Write as _;
+        let dir = scratch("torn-restart");
+        let path = dir.join("journal.jsonl");
+        let journal = Journal::create(&path).unwrap();
+        journal
+            .append(&JournalRecord::StageWritten {
+                task: "t".into(),
+                stage: Stage::Dev,
+                iteration: 1,
+            })
+            .unwrap();
+        drop(journal);
+        {
+            let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+            write!(file, "{{\"type\":\"bell_sent\"").unwrap();
+        }
+
+        let reopened = Journal::open(&path).unwrap();
+        assert_eq!(
+            reopened.replay().len(),
+            1,
+            "the partial line is not a record"
+        );
+        reopened
+            .append(&JournalRecord::StageWritten {
+                task: "t".into(),
+                stage: Stage::Dev,
+                iteration: 2,
+            })
+            .unwrap();
+        drop(reopened);
+
+        let again = Journal::open(&path).unwrap();
+        assert_eq!(
+            again.replay().len(),
+            2,
+            "the next append survives a restart"
+        );
+        assert!(again.replay_outcome().problem.is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A bad line with records after it is corruption, not a crash-truncated
+    /// tail. Reading it as a tail silently forgets every later budget,
+    /// settlement and approval record — and `--check` used to call that clean.
+    #[test]
+    fn mid_file_corruption_is_reported_instead_of_read_as_a_torn_tail() {
+        let dir = scratch("corrupt-mid");
+        let path = dir.join("journal.jsonl");
+        let journal = Journal::create(&path).unwrap();
+        journal
+            .append(&JournalRecord::StageWritten {
+                task: "t".into(),
+                stage: Stage::Dev,
+                iteration: 1,
+            })
+            .unwrap();
+        journal
+            .append(&JournalRecord::StageWritten {
+                task: "t".into(),
+                stage: Stage::Dev,
+                iteration: 2,
+            })
+            .unwrap();
+        journal
+            .append(&JournalRecord::StageWritten {
+                task: "t".into(),
+                stage: Stage::Dev,
+                iteration: 3,
+            })
+            .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+        lines[1] = "{ this is not a record".to_string();
+        std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let outcome = journal.replay_outcome();
+        assert!(
+            outcome
+                .problem
+                .as_deref()
+                .unwrap_or_default()
+                .contains("line 2"),
+            "{:?}",
+            outcome.problem
+        );
+        assert_eq!(
+            outcome.records.len(),
+            1,
+            "the readable prefix is still returned, but named as a prefix"
+        );
+        assert!(
+            journal.reseed().is_err(),
+            "a projection rebuilt from a prefix is a second truth"
+        );
+        assert!(Journal::open(&path).is_err(), "reopening refuses loudly");
+        assert!(!journal.verify().is_consistent(), "verify must see it too");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

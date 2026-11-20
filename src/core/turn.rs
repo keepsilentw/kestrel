@@ -103,11 +103,26 @@ pub(crate) async fn run_turn(shared: &Arc<Shared>, token: &CancellationToken) ->
             serde_json::to_string(&ctx.items).unwrap_or_default()
         ));
 
-        // --- sample.
+        // --- sample. The request is an await like any other (design §4
+        // invariant 1): without the cancel race, `interrupt` cancels the token,
+        // the actor hard-aborts the turn task 100ms later, and no TurnComplete
+        // is ever emitted — the worker then waits on an event that cannot come.
         let spec = provider.render_request(&model, &ctx, model.max_out, None, &auth);
-        let bytes = match shared.transport.send(spec).await {
-            Ok(b) => b,
-            Err(e) => {
+        let sent = tokio::select! {
+            biased;
+            _ = token.cancelled() => None,
+            result = shared.transport.send(spec) => Some(result),
+        };
+        let bytes = match sent {
+            None => {
+                emit(EventMsg::TurnComplete {
+                    usage: total_usage,
+                    stop: StopReason::Aborted,
+                });
+                break TurnEnd::Aborted;
+            }
+            Some(Ok(b)) => b,
+            Some(Err(e)) => {
                 emit(EventMsg::Fatal {
                     error: e.to_string(),
                 });

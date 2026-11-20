@@ -152,6 +152,12 @@ struct ServeCmd {
     #[arg(long, default_value_t = 1800)]
     task_idle_timeout_secs: u64,
 
+    /// Wall-clock ceiling for one worker turn, in seconds. On expiry the engine
+    /// is interrupted and the turn is recorded as aborted/failed, so one stuck
+    /// gateway or tool cannot pin a task slot forever. 0 = no ceiling.
+    #[arg(long, default_value_t = 3600)]
+    turn_timeout_secs: u64,
+
     /// Atomically write a machine-readable worker status document.
     #[arg(long)]
     status_file: Option<PathBuf>,
@@ -599,6 +605,7 @@ async fn main() -> anyhow::Result<()> {
                 rss_abort_mb: s.rss_abort_mb,
                 rss_exit_mb: s.rss_exit_mb,
                 task_idle_timeout: Duration::from_secs(s.task_idle_timeout_secs),
+                turn_timeout: Duration::from_secs(s.turn_timeout_secs),
                 status_file: s.status_file,
                 status_interval: Duration::from_secs(s.status_interval_secs),
                 approve: approve.map(|mode| with_role_deadline(mode, Some(&role))),

@@ -15,7 +15,8 @@ use std::time::Duration;
 use kestrel::bus::rpc::{BusClient, BusHub};
 use kestrel::cli::pool::{EngineFactory, PoolConfig, PooledEngine, run_pool};
 use kestrel::permissions::{Decision, PermissionEngine, PolicyTable};
-use kestrel::provider::faux::{FauxWire, stop_script, tool_use_script};
+use kestrel::provider::faux::{FauxWire, ScriptedEvent, stop_script, tool_use_script};
+use kestrel::provider::wire::{StopReason, WireEvent};
 use kestrel::tools::ApproveMode;
 use serde_json::{Value, json};
 
@@ -53,6 +54,8 @@ struct Limits {
     rss_ceiling: u64,
     /// Idle timeout before a task's engine proposes retirement; ZERO = never.
     task_idle_timeout: Duration,
+    /// Wall-clock ceiling for one turn; ZERO = none.
+    turn_timeout: Duration,
 }
 
 impl Limits {
@@ -66,6 +69,7 @@ impl Limits {
             approver: None,
             rss_ceiling: 0,
             task_idle_timeout: Duration::ZERO,
+            turn_timeout: Duration::ZERO,
         }
     }
 }
@@ -99,6 +103,7 @@ async fn harness_with(tag: &str, factory: EngineFactory, wires: Wires, limits: L
         abort_rss_bytes: 0,
         exit_rss_bytes: 0,
         task_idle_timeout: limits.task_idle_timeout,
+        turn_timeout: limits.turn_timeout,
         approval_retry: limits.approval_retry,
         status_file: None,
         status_interval: Duration::from_secs(5),
@@ -691,5 +696,142 @@ async fn an_idle_task_frees_its_slot_for_the_next_pipeline() {
     );
     read_artifact(&h.artifacts, "harness-rd-t1-dev-iter1.json").await;
     read_artifact(&h.artifacts, "harness-rd-t2-dev-iter1.json").await;
+    h.pool.abort();
+}
+
+/// A turn that outlives its wall-clock ceiling must end as an aborted/failed
+/// turn and free its slot: before `--turn-timeout-secs`, a gateway that never
+/// answered pinned the task (and its budget reservation) for the life of the
+/// process, and only the SA's much larger bell timeout noticed.
+#[tokio::test]
+async fn a_turn_past_its_deadline_is_aborted_and_the_slot_is_reusable() {
+    let wires: Wires = Arc::new(Mutex::new(HashMap::new()));
+    let seen = Arc::clone(&wires);
+    let factory: EngineFactory = Arc::new(move |task: &str| {
+        let wire = Arc::new(FauxWire::new());
+        if task == "slow" {
+            wire.push_scripted_turn(vec![
+                ScriptedEvent {
+                    delay_ms: 0,
+                    event: WireEvent::Start,
+                },
+                ScriptedEvent {
+                    delay_ms: 10_000,
+                    event: WireEvent::Done {
+                        stop: StopReason::Stop,
+                    },
+                },
+            ]);
+        } else {
+            wire.push_turn_script(stop_script("fast answer"));
+        }
+        seen.lock()
+            .unwrap()
+            .insert(task.to_string(), Arc::clone(&wire));
+        let (handle, events) = common::spawn_engine(wire, common::EngineSpec::default());
+        Ok(PooledEngine { handle, events })
+    });
+    let h = harness_with(
+        "turn-deadline",
+        factory,
+        wires,
+        Limits {
+            max_tasks: 2,
+            turn_timeout: Duration::from_millis(200),
+            ..Limits::standard()
+        },
+    )
+    .await;
+
+    h.sa.notify("harness-rd", bell("slow", "dev", "will never finish"));
+    let first = tokio::time::timeout(Duration::from_secs(5), h.sa.recv_notify())
+        .await
+        .expect("the deadline must produce a result, not silence")
+        .unwrap();
+    assert!(
+        first.payload["result_ref"].is_string(),
+        "the timed-out turn still leaves an artifact to read: {}",
+        first.payload
+    );
+    assert_eq!(first.payload["turn_timeout"], true, "{}", first.payload);
+
+    let artifact = read_artifact(&h.artifacts, "harness-rd-slow-dev-iter1.json").await;
+    assert_eq!(artifact["turn_timeout"], true, "{artifact}");
+    assert_eq!(artifact["aborted"], true, "{artifact}");
+
+    // The slot is free: a second task is served by the same worker afterwards.
+    h.sa.notify("harness-rd", bell("fast", "dev", "quick one"));
+    let second = tokio::time::timeout(Duration::from_secs(5), h.sa.recv_notify())
+        .await
+        .expect("the worker must keep serving after a timed-out turn")
+        .unwrap();
+    assert_eq!(second.payload["task_id"], "fast");
+    assert!(
+        second.payload["result_ref"].is_string(),
+        "{}",
+        second.payload
+    );
+    let fast = read_artifact(&h.artifacts, "harness-rd-fast-dev-iter1.json").await;
+    assert_eq!(fast["result"], "fast answer");
+    h.pool.abort();
+}
+
+/// One task's engine-construction failure (disk full, unreadable role file) must
+/// not terminate the whole worker and take every other pipeline with it. The
+/// failing bell gets a visible error; the next task is still served.
+#[tokio::test]
+async fn a_failed_engine_start_fails_only_that_task() {
+    let wires: Wires = Arc::new(Mutex::new(HashMap::new()));
+    let seen = Arc::clone(&wires);
+    let factory: EngineFactory = Arc::new(move |task: &str| {
+        if task == "bad" {
+            anyhow::bail!("simulated engine start failure");
+        }
+        let wire = Arc::new(FauxWire::new());
+        wire.push_turn_script(stop_script(&format!("answer for {task}")));
+        seen.lock()
+            .unwrap()
+            .insert(task.to_string(), Arc::clone(&wire));
+        let (handle, events) = common::spawn_engine(wire, common::EngineSpec::default());
+        Ok(PooledEngine { handle, events })
+    });
+    let h = harness_with(
+        "engine-failure",
+        factory,
+        wires,
+        Limits {
+            max_tasks: 2,
+            ..Limits::standard()
+        },
+    )
+    .await;
+
+    h.sa.notify("harness-rd", bell("bad", "dev", "will not start"));
+    let failed = tokio::time::timeout(Duration::from_secs(5), h.sa.recv_notify())
+        .await
+        .expect("a failed engine start must answer with an error bell")
+        .unwrap();
+    assert_eq!(failed.payload["task_id"], "bad");
+    let reason = failed.payload["error"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("engine start failed"),
+        "the error says what failed: {reason}"
+    );
+    assert!(
+        failed.payload.get("result_ref").is_none(),
+        "a failed start is not a result"
+    );
+    assert!(
+        !h.pool.is_finished(),
+        "one bad task must not kill the worker"
+    );
+
+    h.sa.notify("harness-rd", bell("good", "dev", "should be served"));
+    let done = tokio::time::timeout(Duration::from_secs(5), h.sa.recv_notify())
+        .await
+        .expect("the worker must keep routing after a failed engine start")
+        .unwrap();
+    assert_eq!(done.payload["task_id"], "good");
+    assert!(done.payload["result_ref"].is_string(), "{}", done.payload);
     h.pool.abort();
 }

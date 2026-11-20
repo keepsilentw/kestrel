@@ -5,7 +5,7 @@
 //! - `prompt_items` = summary (latest compaction on head path) + kept region.
 
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -70,10 +70,17 @@ impl SessionStore {
         })
     }
 
-    /// Open an existing session file (resume).
+    /// Open an existing session file (resume). A tree whose corruption sits
+    /// before the last line is refused: resuming from a silently truncated
+    /// conversation also rebuilds a read-before-edit ledger that forgot files.
     pub fn open(path: &Path, idgen: Arc<dyn IdGen>, clock: Arc<dyn Clock>) -> anyhow::Result<Self> {
         let file = OpenOptions::new().append(true).open(path)?;
-        let head = { Self::load_path(path).last().and_then(|e| e.id().cloned()) };
+        repair_torn_tail(path)?;
+        let (entries, problem) = Self::scan_path(path);
+        if let Some(problem) = problem {
+            anyhow::bail!("refusing to open a corrupt session tree: {problem}");
+        }
+        let head = entries.last().and_then(|e| e.id().cloned());
         Ok(Self {
             file: Mutex::new(file),
             path: path.to_path_buf(),
@@ -179,25 +186,53 @@ impl SessionStore {
     }
 
     /// Load all entries; a torn last line is skipped (half-write tolerance).
+    /// A mid-file bad line is logged as corruption — it is not a torn tail.
     pub fn load(&self) -> Vec<Entry> {
-        Self::load_path(&self.path)
+        let (entries, problem) = Self::scan_path(&self.path);
+        if let Some(problem) = problem {
+            tracing::error!(
+                "session tree {problem} — the replay stops at the corrupt line and the \
+                 ledger rebuilt from it is incomplete"
+            );
+        }
+        entries
     }
 
-    fn load_path(path: &Path) -> Vec<Entry> {
-        let Ok(f) = File::open(path) else {
-            return vec![];
+    /// Scan one session file. `problem` is set only when an unparsable line has
+    /// non-empty lines after it: the crash-truncated tail is the one failure a
+    /// reader may absorb, and it is the only one that costs nothing.
+    fn scan_path(path: &Path) -> (Vec<Entry>, Option<String>) {
+        let Ok(bytes) = std::fs::read(path) else {
+            return (Vec::new(), None);
         };
+        let text = String::from_utf8_lossy(&bytes);
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect();
         let mut out = Vec::new();
-        for line in BufReader::new(f).lines().map_while(Result::ok) {
-            if line.trim().is_empty() {
-                continue;
-            }
-            match serde_json::from_str::<Entry>(&line) {
-                Ok(e) => out.push(e),
-                Err(_) => break, // torn tail: stop replay here
+        for (index, line) in lines.iter().enumerate() {
+            match serde_json::from_str::<Entry>(line) {
+                Ok(entry) => out.push(entry),
+                Err(error) => {
+                    let remaining = lines.len().saturating_sub(index + 1);
+                    if remaining == 0 {
+                        break; // torn tail: stop replay here
+                    }
+                    return (
+                        out,
+                        Some(format!(
+                            "{}: line {} is not a session entry ({error}); {} later line(s) \
+                             would be silently dropped",
+                            path.display(),
+                            index + 1,
+                            remaining
+                        )),
+                    );
+                }
             }
         }
-        out
+        (out, None)
     }
 
     /// Head -> root parent chain (chronological order).
@@ -336,6 +371,49 @@ impl SessionStore {
     }
 }
 
+/// A crash can leave an incomplete last line. Drop it or finish the missing
+/// separator BEFORE the next append: a torn tail that gets appended past becomes
+/// mid-file corruption, and `scan_path` now refuses to read that.
+fn repair_torn_tail(path: &Path) -> anyhow::Result<()> {
+    let bytes = std::fs::read(path)?;
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let newline_terminated = bytes.ends_with(b"\n");
+    let end = if newline_terminated {
+        bytes.len() - 1
+    } else {
+        bytes.len()
+    };
+    let last_start = bytes[..end]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    let last = &bytes[last_start..end];
+    if last.iter().all(|byte| byte.is_ascii_whitespace()) {
+        return Ok(());
+    }
+    if serde_json::from_slice::<Entry>(last).is_ok() {
+        if !newline_terminated {
+            let mut file = OpenOptions::new().append(true).open(path)?;
+            file.write_all(b"\n")?;
+            file.sync_all()?;
+        }
+        return Ok(());
+    }
+    let file = OpenOptions::new().write(true).open(path)?;
+    file.set_len(last_start as u64)?;
+    file.sync_all()?;
+    tracing::warn!(
+        "session tree {}: dropped an incomplete last line ({} byte(s)); a torn tail is \
+         not history",
+        path.display(),
+        bytes.len().saturating_sub(last_start)
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -407,6 +485,75 @@ mod tests {
         )
         .unwrap();
         assert_eq!(st2.load().len(), 2); // header + first message only
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A torn tail followed by a restart and an append must not become mid-file
+    /// corruption: `open` repairs the tail before the file grows again.
+    #[test]
+    fn a_restart_after_a_torn_tail_does_not_create_mid_file_corruption() {
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!("kestrel-torn2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let st = store_fixture(&dir);
+        st.append_item(MessageItem::user_text("a"), None);
+        let path = st.path().to_path_buf();
+        drop(st);
+        {
+            let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+            write!(file, "{{\"type\":\"message\",\"id\":\"id-9\"").unwrap();
+        }
+
+        let st2 = SessionStore::open(
+            &path,
+            Arc::new(SeqGen::new()),
+            Arc::new(FakeClock(AtomicI64::new(2_000))),
+        )
+        .unwrap();
+        assert_eq!(st2.load().len(), 2, "header + first message only");
+        st2.append_item(MessageItem::user_text("after the restart"), None);
+        drop(st2);
+
+        let st3 = SessionStore::open(
+            &path,
+            Arc::new(SeqGen::new()),
+            Arc::new(FakeClock(AtomicI64::new(3_000))),
+        )
+        .unwrap();
+        assert_eq!(st3.load().len(), 3, "the next append is still readable");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A corrupt line before the tail must refuse the resume: `load` used to
+    /// stop there and hand the model a shorter conversation plus a ledger that
+    /// forgot which files were read.
+    #[test]
+    fn mid_file_corruption_refuses_to_open() {
+        let dir = std::env::temp_dir().join(format!("kestrel-corrupt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let st = store_fixture(&dir);
+        st.append_item(MessageItem::user_text("one"), None);
+        st.append_item(MessageItem::user_text("two"), None);
+        let path = st.path().to_path_buf();
+        drop(st);
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+        assert_eq!(lines.len(), 3, "header + two entries");
+        lines[1] = "{ not an entry".to_string();
+        std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+
+        match SessionStore::open(
+            &path,
+            Arc::new(SeqGen::new()),
+            Arc::new(FakeClock(AtomicI64::new(2_000))),
+        ) {
+            Ok(_) => panic!("resuming from a corrupt tree would silently shorten history"),
+            Err(error) => assert!(
+                error.to_string().contains("corrupt session tree"),
+                "{error}"
+            ),
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 

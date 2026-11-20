@@ -89,6 +89,37 @@ pub enum Outbound {
         task: String,
         generation: u64,
     },
+    /// A worker task ended while the pump still owned its sender. That is never
+    /// a normal retirement (the pump drops the sender first), so the slot is
+    /// released and any bell that was in flight is failed out loud instead of
+    /// leaving the SA to wait for a result that cannot come.
+    WorkerExited {
+        task: String,
+        reason: String,
+    },
+}
+
+/// Sends one notice when a worker task leaves, including through a panic:
+/// `Drop` runs during unwinding, which is exactly the case where no code after
+/// the loop gets a chance to speak.
+struct WorkerExitNotice {
+    out: mpsc::UnboundedSender<Outbound>,
+    task: String,
+    finished: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for WorkerExitNotice {
+    fn drop(&mut self) {
+        let reason = if self.finished.load(std::sync::atomic::Ordering::SeqCst) {
+            "worker stopped"
+        } else {
+            "worker task ended without finishing (panic?)"
+        };
+        let _ = self.out.send(Outbound::WorkerExited {
+            task: self.task.clone(),
+            reason: reason.to_string(),
+        });
+    }
 }
 
 /// Routing decision. Kept as data so the policy is testable without a bus or
@@ -410,6 +441,11 @@ pub struct PoolConfig {
     /// Idle time after which a task's engine proposes retirement. 0 = never,
     /// which leaves the slot taken for the life of the process.
     pub task_idle_timeout: Duration,
+    /// Wall-clock ceiling for one turn (0 = none). On expiry the engine is
+    /// interrupted; if it does not wind down within `TURN_ABORT_GRACE` the
+    /// worker books the turn as failed and frees its slot, so one wedged
+    /// gateway or tool cannot pin a task forever.
+    pub turn_timeout: Duration,
 }
 
 /// An approval request that is still in flight: the frame itself (so a retry is
@@ -426,6 +462,9 @@ struct OpenApproval {
 const PRESSURE_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 const PRESSURE_IDLE_GRACE: Duration = Duration::from_secs(5);
 const APPROVAL_ROUTE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+/// How long an interrupted turn gets to emit its terminal event before the
+/// worker stops waiting and books the turn as failed itself.
+const TURN_ABORT_GRACE: Duration = Duration::from_secs(5);
 /// Resume below 80% of the ceiling. The gap between enter and resume is
 /// deliberate hysteresis: a worker hovering at the ceiling must not flap
 /// between accepting and rejecting tasks every sample.
@@ -443,7 +482,11 @@ pub async fn run_pool(
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Outbound>();
     let mut router = Router::new(cfg.max_tasks);
     let mut workers: HashMap<String, mpsc::UnboundedSender<TaskMsg>> = HashMap::new();
-    let mut joins: Vec<AbortOnDropHandle<()>> = Vec::new();
+    // A worker task plus its task id, so a panic at shutdown can name the task.
+    let mut joins: Vec<(String, AbortOnDropHandle<()>)> = Vec::new();
+    // The bell each task is currently serving (sender + payload). Used only to
+    // fail it out loud when its worker disappears before producing a result.
+    let mut inflight: HashMap<String, (String, Value)> = HashMap::new();
     if cfg.status_file.is_some() && cfg.status_interval.is_zero() {
         anyhow::bail!("worker status interval must be greater than zero");
     }
@@ -502,15 +545,43 @@ pub async fn run_pool(
                     match action {
                         Action::Reply { task, req } => {
                             let decision = decision_from_frame(&frame.payload);
-                            match workers.get(&task) {
-                                Some(tx) => {
-                                    let _ = tx.send(TaskMsg::Approval {
-                                        req,
+                            let delivered = match workers.get(&task) {
+                                Some(tx) => tx
+                                    .send(TaskMsg::Approval {
+                                        req: req.clone(),
                                         decision,
                                         by: frame.sender.clone(),
-                                    });
+                                    })
+                                    .is_ok(),
+                                None => false,
+                            };
+                            if !delivered {
+                                tracing::error!(
+                                    "pump: approval reply {req} for task {task} has no live worker"
+                                );
+                                workers.remove(&task);
+                                router.retire_task(&task);
+                                if let Some((sender, payload)) = inflight.remove(&task) {
+                                    client.notify(
+                                        &sender,
+                                        task_failure_payload(
+                                            &cfg,
+                                            &task,
+                                            &payload,
+                                            "the worker for this task exited before returning a result",
+                                        ),
+                                    );
                                 }
-                                None => tracing::warn!("approval reply for a dead task {task}"),
+                                client.notify(
+                                    &frame.sender,
+                                    approval_receipt_frame(
+                                        &cfg.session,
+                                        &req,
+                                        decision,
+                                        false,
+                                        "the task's worker is gone",
+                                    ),
+                                );
                             }
                         }
                         // 一份没有归属的批复（重复投递，或那颗请求已经关掉了）不能
@@ -545,38 +616,90 @@ pub async fn run_pool(
                         tracing::warn!("pump: {reason}");
                         client.notify(
                             &frame.sender,
-                            serde_json::json!({
-                                "role": cfg.session,
-                                "task_id": task,
-                                "stage": frame.payload["stage"],
-                                "iteration": frame.payload["iteration"],
-                                "error": reason,
-                            }),
+                            task_failure_payload(&cfg, &task, &frame.payload, &reason),
                         );
                     }
                     Action::Spawn(ref task) | Action::Deliver(ref task) => {
                         let task = task.clone();
                         if !workers.contains_key(&task) {
-                            let engine = factory(&task)
-                                .with_context(|| format!("start an engine for task {task}"))?;
-                            let (tx, inbox) = mpsc::unbounded_channel::<TaskMsg>();
-                            let worker = spawn_worker(
-                                Arc::clone(&cfg),
-                                out_tx.clone(),
-                                task.clone(),
-                                engine,
-                                inbox,
-                            );
-                            workers.insert(task.clone(), tx);
-                            joins.push(worker);
+                            // One task's disk/config failure must not take the
+                            // whole worker (and every other pipeline) down.
+                            match factory(&task) {
+                                Ok(engine) => {
+                                    let (tx, inbox) = mpsc::unbounded_channel::<TaskMsg>();
+                                    let worker = spawn_worker(
+                                        Arc::clone(&cfg),
+                                        out_tx.clone(),
+                                        task.clone(),
+                                        engine,
+                                        inbox,
+                                    );
+                                    workers.insert(task.clone(), tx);
+                                    joins.push((task.clone(), worker));
+                                }
+                                Err(error) => {
+                                    tracing::error!(
+                                        "pump: task {task}: cannot start an engine: {error:#}"
+                                    );
+                                    router.retire_task(&task);
+                                    client.notify(
+                                        &frame.sender,
+                                        task_failure_payload(
+                                            &cfg,
+                                            &task,
+                                            &frame.payload,
+                                            &format!("engine start failed: {error:#}"),
+                                        ),
+                                    );
+                                    continue;
+                                }
+                            }
                         }
-                        if let Some(tx) = workers.get(&task) {
-                            let generation = router.begin_bell(&task);
-                            let _ = tx.send(TaskMsg::Bell {
-                                sender: frame.sender.clone(),
-                                payload: frame.payload.clone(),
-                                generation,
-                            });
+                        let generation = router.begin_bell(&task);
+                        let delivered = match workers.get(&task) {
+                            Some(tx) => tx
+                                .send(TaskMsg::Bell {
+                                    sender: frame.sender.clone(),
+                                    payload: frame.payload.clone(),
+                                    generation,
+                                })
+                                .is_ok(),
+                            None => false,
+                        };
+                        if delivered {
+                            inflight.insert(
+                                task.clone(),
+                                (frame.sender.clone(), frame.payload.clone()),
+                            );
+                        } else {
+                            // The sender is dropped only by this pump, so a
+                            // failed send means the worker task is gone. Say so
+                            // on the bus instead of letting the bell evaporate.
+                            tracing::error!(
+                                "pump: task {task}: its worker is gone; the bell was not executed"
+                            );
+                            workers.remove(&task);
+                            router.retire_task(&task);
+                            if let Some((sender, payload)) = inflight.remove(&task) {
+                                client.notify(
+                                    &sender,
+                                    task_failure_payload(
+                                        &cfg,
+                                        &task,
+                                        &payload,
+                                        "the worker for this task exited before returning a result",
+                                    ),
+                                );
+                            }
+                            client.notify(
+                                &frame.sender,
+                                task_failure_payload(
+                                    &cfg,
+                                    &task,
+                                    &frame.payload,
+                                    "the worker for this task is gone; the bell was not executed",
+                                ),
+                            );
                         }
                     }
                     other => tracing::warn!("pump: unexpected bell routing {other:?}"),
@@ -589,7 +712,35 @@ pub async fn run_pool(
                     Some(Outbound::ApprovalClosed { req }) => router.close_request(&req),
                     Some(Outbound::ApprovalDeferred { req }) => router.on_approval_deferred(&req),
                     Some(Outbound::TurnFinished { task, generation }) => {
-                        let _ = router.on_turn_finished(&task, generation);
+                        if router.on_turn_finished(&task, generation) {
+                            inflight.remove(&task);
+                        }
+                    }
+                    Some(Outbound::WorkerExited { task, reason }) => {
+                        // `remove` returning None means this exit was requested
+                        // (retirement or shutdown) and has been accounted for.
+                        if workers.remove(&task).is_some() {
+                            router.retire_task(&task);
+                            if let Some((sender, payload)) = inflight.remove(&task) {
+                                client.notify(
+                                    &sender,
+                                    task_failure_payload(
+                                        &cfg,
+                                        &task,
+                                        &payload,
+                                        &format!(
+                                            "the worker for this task exited before returning \
+                                             a result ({reason})"
+                                        ),
+                                    ),
+                                );
+                            }
+                            tracing::error!(
+                                "pump: worker for task {task} exited unexpectedly ({reason}); \
+                                 its slot is free and the next bell starts a fresh engine"
+                            );
+                            joins.retain(|(_, join)| !join.is_finished());
+                        }
                     }
                     Some(Outbound::RetireRequested { task }) => {
                         // Dropping the sender IS the retirement: the worker's
@@ -609,7 +760,7 @@ pub async fn run_pool(
                             // this, a long-lived worker accumulates one entry per
                             // task it ever hosted — retirement would have freed
                             // the engine and kept the ledger.
-                            joins.retain(|join| !join.is_finished());
+                            joins.retain(|(_, join)| !join.is_finished());
                         }
                     }
                     None => {
@@ -638,7 +789,7 @@ pub async fn run_pool(
                             );
                         }
                     }
-                    joins.retain(|join| !join.is_finished());
+                    joins.retain(|(_, join)| !join.is_finished());
                 }
                 if cfg.abort_rss_bytes > 0
                     && let Some(current) = current_rss
@@ -701,10 +852,25 @@ pub async fn run_pool(
     // Dropping the senders ends each worker loop, which shuts its engine down.
     drop(workers);
     drop(reader);
-    for join in joins {
-        let _ = join.await;
+    for (task, join) in joins {
+        if let Err(error) = join.await {
+            tracing::error!("pump: worker for task {task} ended abnormally: {error}");
+        }
     }
     Ok(())
+}
+
+/// One task's failure turned into a visible error bell: the same shape the
+/// reject path uses, so the SA reads "this dispatch failed" instead of waiting
+/// for a result that will never arrive.
+fn task_failure_payload(cfg: &PoolConfig, task: &str, original: &Value, reason: &str) -> Value {
+    serde_json::json!({
+        "role": cfg.session,
+        "task_id": task,
+        "stage": original["stage"],
+        "iteration": original["iteration"],
+        "error": reason,
+    })
 }
 
 fn status_document(cfg: &PoolConfig, router: &Router) -> Value {
@@ -853,6 +1019,14 @@ fn spawn_worker(
     let PooledEngine { handle, mut events } = engine;
     // managed: joined when the pump stops (dropping the sender ends the loop)
     AbortOnDropHandle::new(tokio::spawn(async move {
+        // Runs on every exit path, including a panic: without it a dead worker
+        // is indistinguishable from a slow one until the SA's bell timeout.
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _exit = WorkerExitNotice {
+            out: out_tx.clone(),
+            task: task.clone(),
+            finished: Arc::clone(&finished),
+        };
         let mut pending: VecDeque<(String, Value, u64)> = VecDeque::new();
         // The retransmit clock lives outside the select: a timer future created
         // inside a `select!` arm is rebuilt on every iteration, and one that is
@@ -947,6 +1121,16 @@ fn spawn_worker(
             let mut approvals: Vec<Value> = Vec::new();
             let mut memory_abort_reason: Option<String> = None;
             let mut open: BTreeMap<String, OpenApproval> = BTreeMap::new();
+            // The deadline is an absolute instant: rebuilding a relative sleep
+            // inside `select!` on every iteration would never elapse.
+            let mut turn_deadline_at = if cfg.turn_timeout.is_zero() {
+                None
+            } else {
+                Some(tokio::time::Instant::now() + cfg.turn_timeout)
+            };
+            let mut hard_stop_at: Option<tokio::time::Instant> = None;
+            let mut turn_timed_out = false;
+            let far_future = || tokio::time::Instant::now() + Duration::from_secs(86_400);
             let stop_seen: Option<StopReason>;
             loop {
                 tokio::select! {
@@ -1265,6 +1449,53 @@ fn spawn_worker(
                             }
                         }
                     }
+                    // The turn ran past its wall-clock ceiling: ask the engine to
+                    // stop, then keep consuming events until it says TurnComplete.
+                    _ = tokio::time::sleep_until(turn_deadline_at.unwrap_or_else(&far_future)),
+                        if turn_deadline_at.is_some() =>
+                    {
+                        turn_deadline_at = None;
+                        turn_timed_out = true;
+                        hard_stop_at = Some(tokio::time::Instant::now() + TURN_ABORT_GRACE);
+                        tracing::warn!(
+                            "task {task}: turn exceeded {}s — interrupting the engine",
+                            cfg.turn_timeout.as_secs()
+                        );
+                        handle.interrupt();
+                    }
+                    // The engine did not wind down after the interrupt (a
+                    // blocking call that ignores cancellation). Stop waiting:
+                    // the turn is booked as failed and the slot is reusable.
+                    _ = tokio::time::sleep_until(hard_stop_at.unwrap_or_else(&far_future)),
+                        if hard_stop_at.is_some() =>
+                    {
+                        aborted = true;
+                        let reason = format!(
+                            "turn exceeded {}s and did not stop within {}s",
+                            cfg.turn_timeout.as_secs(),
+                            TURN_ABORT_GRACE.as_secs()
+                        );
+                        tracing::error!("task {task}: {reason}");
+                        result_text = format!("turn aborted: {reason}");
+                        // Same cleanup as a normal terminal event: an approval
+                        // nobody is waiting for must not stay routable, and the
+                        // approver gets a receipt saying it did not apply.
+                        for (req, waiting) in std::mem::take(&mut open) {
+                            let _ = out_tx.send(Outbound::ApprovalClosed { req: req.clone() });
+                            let _ = out_tx.send(Outbound::Notify {
+                                session: waiting.to,
+                                payload: approval_receipt_frame(
+                                    &cfg.session,
+                                    &req,
+                                    ApprovalDecision::Deny,
+                                    false,
+                                    "the turn was abandoned (deadline)",
+                                ),
+                            });
+                        }
+                        stop_seen = Some(StopReason::error(reason, false));
+                        break;
+                    }
                 }
             }
 
@@ -1290,6 +1521,7 @@ fn spawn_worker(
                 "usage": usage,
                 "approvals": approvals,
                 "memory_abort": memory_abort_reason,
+                "turn_timeout": turn_timed_out,
                 "ref": payload["ref"],
             });
             let body = serde_json::to_string_pretty(&artifact_json);
@@ -1306,6 +1538,7 @@ fn spawn_worker(
                             "stage": stage,
                             "iteration": iteration,
                             "usage": usage,
+                            "turn_timeout": turn_timed_out,
                             "result_ref": artifact.display().to_string(),
                         }),
                     });
@@ -1336,12 +1569,65 @@ fn spawn_worker(
             });
         }
         handle.shutdown().await;
+        finished.store(true, std::sync::atomic::Ordering::SeqCst);
     }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A worker that dies without finishing must leave a notice the pump can
+    /// turn into an error bell; a normal stop is distinguishable from a panic.
+    #[test]
+    fn worker_exit_notice_says_whether_it_finished() {
+        for (finished, expected) in [(false, "panic"), (true, "stopped")] {
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let flag = Arc::new(std::sync::atomic::AtomicBool::new(finished));
+            drop(WorkerExitNotice {
+                out: tx,
+                task: "t1".into(),
+                finished: flag,
+            });
+            match rx.try_recv().expect("a notice is sent on drop") {
+                Outbound::WorkerExited { task, reason } => {
+                    assert_eq!(task, "t1");
+                    assert!(reason.contains(expected), "{reason}");
+                }
+                _ => panic!("expected a worker exit notice"),
+            }
+        }
+    }
+
+    /// The failure bell carries the bell's coordinates, so the SA can match it to
+    /// the dispatch it is waiting on instead of guessing.
+    #[test]
+    fn failure_payload_keeps_the_bell_coordinates() {
+        let cfg = PoolConfig {
+            session: "harness-rd".into(),
+            role: "rd".into(),
+            artifacts_dir: std::env::temp_dir(),
+            approver: None,
+            max_tasks: 1,
+            max_parallel_tools: 4,
+            max_worker_tools: 8,
+            max_rss_bytes: 0,
+            abort_rss_bytes: 0,
+            exit_rss_bytes: 0,
+            task_idle_timeout: Duration::ZERO,
+            turn_timeout: Duration::ZERO,
+            approval_retry: Duration::from_secs(1),
+            status_file: None,
+            status_interval: Duration::from_secs(5),
+        };
+        let original = serde_json::json!({"stage": "dev", "iteration": 2});
+        let payload = task_failure_payload(&cfg, "t1", &original, "boom");
+        assert_eq!(payload["task_id"], "t1");
+        assert_eq!(payload["stage"], "dev");
+        assert_eq!(payload["iteration"], 2);
+        assert_eq!(payload["error"], "boom");
+        assert!(payload.get("result_ref").is_none());
+    }
 
     #[test]
     fn first_bell_spawns_and_later_ones_deliver() {
@@ -1628,6 +1914,7 @@ mod tests {
             abort_rss_bytes: 0,
             exit_rss_bytes: 0,
             task_idle_timeout: Duration::ZERO,
+            turn_timeout: Duration::ZERO,
             approval_retry: Duration::from_secs(1),
             status_file: None,
             status_interval: Duration::from_secs(5),

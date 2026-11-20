@@ -1104,3 +1104,63 @@ async fn edit_refuses_an_ambiguous_anchor() {
     );
     std::fs::remove_dir_all(&ws).ok();
 }
+
+/// A command may write unbounded bytes; the tool keeps a bounded head, drains
+/// the rest so the child cannot block on a full pipe, and says it truncated.
+/// Without this, one `yes` inflates the tool result, the session line and the
+/// next request, while the RSS guard can only react after the allocation.
+#[tokio::test]
+async fn bash_caps_captured_output_and_says_it_did() {
+    let root = std::env::temp_dir().join(format!("kestrel-bashcap-{}", std::process::id()));
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::create_dir_all(&root).unwrap();
+    let mut ctx = ctx_for(root.clone(), kestrel::tools::ApproveMode::HeadlessDeny);
+    ctx.engine = Arc::new(kestrel::permissions::PermissionEngine::new(PolicyTable {
+        default: Decision::Allow,
+        rules: vec![],
+        forbidden_prefixes: vec![],
+    }));
+    ctx.fs = kestrel::sandbox::FsPolicy {
+        writable_roots: vec![root.clone()],
+        ..Default::default()
+    };
+    let registry = ToolRegistry::new(vec![Arc::new(kestrel::tools::bash::Bash)]);
+
+    // 2 MB of `x`, a single stream: the cap is 1 MiB.
+    let r = one_call(
+        &registry,
+        &ctx,
+        "bash",
+        serde_json::json!({"command": "yes x | head -c 2000000"}),
+    )
+    .await;
+    let text = r.content_text();
+    assert!(
+        text.contains("[output truncated"),
+        "截断必须说出来，不能装成短日志: {}",
+        &text[text.len().saturating_sub(200)..]
+    );
+    assert!(
+        text.len() < 1024 * 1024 + 4096,
+        "the captured head must stay near the cap, got {} bytes",
+        text.len()
+    );
+    assert!(
+        text.starts_with('x'),
+        "the head of the output is what survives: {:?}",
+        &text[..32]
+    );
+
+    // A small output is untouched and carries no marker.
+    let r = one_call(
+        &registry,
+        &ctx,
+        "bash",
+        serde_json::json!({"command": "echo small"}),
+    )
+    .await;
+    assert_eq!(r.content_text(), "small\n");
+    assert!(!r.content_text().contains("truncated"));
+
+    std::fs::remove_dir_all(&root).ok();
+}

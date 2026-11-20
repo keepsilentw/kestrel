@@ -12,6 +12,53 @@ use crate::sandbox::denial::{self, ExitStatus};
 
 pub struct Bash;
 
+/// Per-stream ceiling on captured bytes. A command may write gigabytes; the
+/// kernel keeps the head, drains the rest without storing it (so the child never
+/// blocks on a full pipe), and says out loud that it truncated. This bounds what
+/// lands in the tool result, the session tree and the next request — the RSS
+/// guard can only react after the allocation, never prevent it.
+const MAX_CAPTURED_BYTES: usize = 1024 * 1024;
+
+/// Read at most `cap` bytes into memory while draining the pipe to EOF.
+/// Returns `(kept, total_written)`: `total_written > kept.len()` means truncated.
+async fn capture_capped<R>(mut pipe: R, cap: usize) -> (Vec<u8>, u64)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut kept = Vec::new();
+    let mut total: u64 = 0;
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        match pipe.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => {
+                total = total.saturating_add(n as u64);
+                let room = cap.saturating_sub(kept.len());
+                if room > 0 {
+                    kept.extend_from_slice(&buf[..n.min(room)]);
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    (kept, total)
+}
+
+/// Turn the captured head into the text the model sees, appending an explicit
+/// marker when bytes were dropped. A silent cut would read like a short log.
+fn capped_text(bytes: Vec<u8>, total: u64) -> String {
+    let truncated = total > bytes.len() as u64;
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if truncated {
+        text.push_str(&format!(
+            "\n[output truncated: kept the first {} of {} bytes]",
+            bytes.len(),
+            total
+        ));
+    }
+    text
+}
+
 #[async_trait]
 impl Tool for Bash {
     fn name(&self) -> &str {
@@ -145,18 +192,16 @@ impl Tool for Bash {
         let mut stdout_pipe = child.stdout.take();
         let mut stderr_pipe = child.stderr.take();
         let read_out = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
-            let mut buf = Vec::new();
-            if let Some(p) = stdout_pipe.as_mut() {
-                let _ = p.read_to_end(&mut buf).await;
+            match stdout_pipe.take() {
+                Some(pipe) => capture_capped(pipe, MAX_CAPTURED_BYTES).await,
+                None => (Vec::new(), 0),
             }
-            buf
         }));
         let read_err = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
-            let mut buf = Vec::new();
-            if let Some(p) = stderr_pipe.as_mut() {
-                let _ = p.read_to_end(&mut buf).await;
+            match stderr_pipe.take() {
+                Some(pipe) => capture_capped(pipe, MAX_CAPTURED_BYTES).await,
+                None => (Vec::new(), 0),
             }
-            buf
         }));
 
         let status = tokio::select! {
@@ -169,8 +214,10 @@ impl Tool for Bash {
             st = child.wait() => st,
         };
         let status = status.map_err(|e| ToolError::Io(e.to_string()))?;
-        let stdout = String::from_utf8_lossy(&read_out.await.unwrap_or_default()).into_owned();
-        let stderr = String::from_utf8_lossy(&read_err.await.unwrap_or_default()).into_owned();
+        let (stdout_bytes, stdout_total) = read_out.await.unwrap_or_default();
+        let (stderr_bytes, stderr_total) = read_err.await.unwrap_or_default();
+        let stdout = capped_text(stdout_bytes, stdout_total);
+        let stderr = capped_text(stderr_bytes, stderr_total);
 
         let exit = ExitStatus {
             code: status.code(),

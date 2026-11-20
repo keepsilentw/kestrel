@@ -20,6 +20,14 @@ fn spawn_engine(
     wire: Arc<FauxWire>,
     max_rounds: u32,
 ) -> (AgentHandle, tokio::sync::mpsc::UnboundedReceiver<Event>) {
+    spawn_engine_on(wire, max_rounds, Arc::new(NullTransport))
+}
+
+fn spawn_engine_on(
+    wire: Arc<FauxWire>,
+    max_rounds: u32,
+    transport: Arc<dyn kestrel::provider::wire::Transport>,
+) -> (AgentHandle, tokio::sync::mpsc::UnboundedReceiver<Event>) {
     let handle = AgentHandle::spawn(EngineConfig {
         provider: wire,
         model: kestrel::provider::wire::ModelMeta::minimal(
@@ -28,7 +36,7 @@ fn spawn_engine(
             "faux://unused",
         ),
         auth: ResolvedAuth::key("test"),
-        transport: Arc::new(NullTransport),
+        transport,
         system: "test system".into(),
         tools: vec![],
         max_rounds,
@@ -277,4 +285,44 @@ async fn steering_queues_into_next_round_prompt() {
         "steered item rendered with source tag into round-2 prompt: {items:?}"
     );
     handle.shutdown().await;
+}
+
+/// A gateway that accepts and never answers must not leave the turn hanging.
+/// The send is cancel-raced (design §4 invariant 1); before that, `interrupt`
+/// cancelled the token, the actor hard-aborted the turn task after 100ms, and
+/// no `TurnComplete` was emitted — the worker waited forever.
+struct NeverAnswers;
+
+impl kestrel::provider::wire::Transport for NeverAnswers {
+    fn send(
+        &self,
+        _spec: kestrel::provider::wire::RequestSpec,
+    ) -> futures::future::BoxFuture<
+        'static,
+        Result<kestrel::provider::wire::ByteStream, kestrel::provider::wire::WireError>,
+    > {
+        Box::pin(std::future::pending())
+    }
+}
+
+#[tokio::test]
+async fn cancelling_a_turn_blocked_on_the_gateway_ends_it_as_aborted() {
+    let wire = Arc::new(FauxWire::new());
+    let (handle, mut rx) = spawn_engine_on(wire, 8, Arc::new(NeverAnswers));
+    handle.turn(vec![MessageItem::user_text("hi")]);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    handle.interrupt();
+    let stop = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let ev = rx.recv().await.expect("turn must emit a terminal event");
+            match ev.msg {
+                EventMsg::TurnComplete { stop, .. } => return stop,
+                EventMsg::Fatal { .. } => return StopReason::error("fatal", false),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("a cancelled gateway wait must end the turn, not hang the worker");
+    assert_eq!(stop, StopReason::Aborted);
 }

@@ -401,15 +401,37 @@ pub trait Transport: Send + Sync + 'static {
     ) -> futures::future::BoxFuture<'static, Result<ByteStream, WireError>>;
 }
 
+/// A gateway that never answers must fail, not hang a worker turn. There is
+/// deliberately no total-request timeout: a 384K-output model can stream
+/// legitimately for a long time. The bounds are connection setup and idle
+/// reads (no bytes at all for `GATEWAY_IDLE_TIMEOUT`, including the wait for
+/// response headers).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const GATEWAY_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Real HTTP transport (reqwest, SSE response body as bytes).
 pub struct HttpTransport {
     client: reqwest::Client,
+    /// How long the send may wait for response headers before it is declared
+    /// stalled. Kept on the struct so tests can shrink it.
+    idle_timeout: Duration,
 }
 
 impl HttpTransport {
     pub fn new() -> Self {
+        Self::with_timeouts(CONNECT_TIMEOUT, GATEWAY_IDLE_TIMEOUT)
+    }
+
+    /// Build a transport with explicit bounds (tests use tiny values).
+    pub fn with_timeouts(connect: Duration, idle: Duration) -> Self {
+        let client = reqwest::Client::builder()
+            .connect_timeout(connect)
+            .read_timeout(idle)
+            .build()
+            .expect("build the HTTP client (default TLS backend)");
         Self {
-            client: reqwest::Client::new(),
+            client,
+            idle_timeout: idle,
         }
     }
 }
@@ -426,16 +448,23 @@ impl Transport for HttpTransport {
         spec: RequestSpec,
     ) -> futures::future::BoxFuture<'static, Result<ByteStream, WireError>> {
         let client = self.client.clone();
+        let idle = self.idle_timeout;
         Box::pin(async move {
             let mut req = client.post(&spec.url);
             for (k, v) in &spec.headers {
                 req = req.header(k, v);
             }
-            let resp = req
-                .json(&spec.body)
-                .send()
-                .await
-                .map_err(|e| WireError::Transport(e.to_string()))?;
+            // `read_timeout` bounds body reads; the wait for response headers
+            // needs its own clock or a silent gateway holds the turn open.
+            let resp = match tokio::time::timeout(idle, req.json(&spec.body).send()).await {
+                Ok(result) => result.map_err(|e| WireError::Transport(e.to_string()))?,
+                Err(_) => {
+                    return Err(WireError::Transport(format!(
+                        "gateway sent no response headers within {}s",
+                        idle.as_secs_f64()
+                    )));
+                }
+            };
             let status = resp.status();
             if !status.is_success() {
                 let retry_after_ms = resp
@@ -595,6 +624,37 @@ mod tests {
         let price = CostPerMTok::simple(1.0, 4.0);
         let worst = Usage::worst_case_cost(&price, 128_000, 8_192);
         assert!((worst - (0.128 + 0.032768)).abs() < 1e-9, "{worst}");
+    }
+
+    /// A gateway that accepts the connection and then goes silent used to hold
+    /// a worker turn forever: `reqwest` has no timeout by default and the retry
+    /// policy only sees errors that actually return. The idle bound is the fix.
+    #[tokio::test]
+    async fn a_gateway_that_never_answers_is_bounded_by_the_idle_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // fire-and-forget: test-only mock server, aborted below
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            // Accepted and held open, never answered.
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        });
+        let transport =
+            HttpTransport::with_timeouts(Duration::from_millis(200), Duration::from_millis(200));
+        let spec = RequestSpec {
+            url: format!("http://{addr}/v1/messages"),
+            headers: vec![],
+            body: serde_json::json!({ "model": "x" }),
+        };
+        let started = std::time::Instant::now();
+        let result = transport.send(spec).await;
+        assert!(result.is_err(), "a silent gateway must surface an error");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the idle bound fired late: {:?}",
+            started.elapsed()
+        );
+        server.abort();
     }
 
     /// An empty table is not a free pass: `is_declared` is what keeps the
