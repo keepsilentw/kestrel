@@ -391,6 +391,14 @@ pub fn bell_prompt(payload: &serde_json::Value) -> String {
     }
     let reference = &payload["ref"];
     if !reference.is_null() {
+        if let Some(focus) = reference["focus"]
+            .as_str()
+            .map(str::trim)
+            .filter(|focus| !focus.is_empty())
+        {
+            out.push_str("\nacceptance focus for this stage: ");
+            out.push_str(focus);
+        }
         out.push_str("\nref: ");
         out.push_str(&serde_json::to_string(reference).unwrap_or_default());
     }
@@ -464,7 +472,11 @@ mod tests {
             "iteration": 2,
             "task": "demo: 实现一个 LRU cache",
             "task_id": "t2",
-            "ref": { "artifacts": "/tmp/art", "worktree": "/tmp/kestrel-worktree" },
+            "ref": {
+                "artifacts": "/tmp/art",
+                "worktree": "/tmp/kestrel-worktree",
+                "focus": "verify eviction order under capacity pressure",
+            },
         }));
         assert!(
             text.starts_with("[QA STAGE: REVIEW]"),
@@ -480,6 +492,10 @@ mod tests {
         );
         assert!(text.contains("/tmp/kestrel-worktree"), "{text}");
         assert!(text.contains("/tmp/art"), "{text}");
+        assert!(
+            text.contains("acceptance focus for this stage: verify eviction order"),
+            "the model's per-stage focus must reach the worker: {text}"
+        );
     }
 
     #[test]

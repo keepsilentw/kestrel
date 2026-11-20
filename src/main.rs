@@ -325,6 +325,13 @@ struct DemoSaCmd {
     /// fallback stay in the kernel; an illegal choice is ignored.
     #[arg(long)]
     sa_routing: bool,
+
+    /// Let the SA plan the gate set (which of review/test run) and each gate's
+    /// acceptance focus. The executor still requires dev first, build last and
+    /// at least one verification gate; verdicts, evidence and budget are
+    /// untouched, and a plan that breaks the floor loses to the canonical four.
+    #[arg(long)]
+    sa_plan: bool,
 }
 
 #[derive(Args, Debug)]
@@ -663,6 +670,7 @@ async fn main() -> anyhow::Result<()> {
                 sa_role: d.sa_role,
                 sa_transitions: d.sa_transitions,
                 sa_routing: d.sa_routing,
+                sa_plan: d.sa_plan,
             })
             .await;
         }

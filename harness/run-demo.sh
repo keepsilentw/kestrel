@@ -204,6 +204,7 @@ SA_ARGS=()
 SA_TRANSITION_ARGS=()
 [ "${KESTREL_DEMO_SA_TRANSITIONS:-0}" != "1" ] || SA_TRANSITION_ARGS+=(--sa-transitions)
 [ "${KESTREL_DEMO_SA_ROUTING:-0}" != "1" ] || SA_TRANSITION_ARGS+=(--sa-routing)
+[ "${KESTREL_DEMO_SA_PLAN:-0}" != "1" ] || SA_TRANSITION_ARGS+=(--sa-plan)
 
 KESTREL_TEST_KILL_AFTER="${KESTREL_TEST_KILL_AFTER:-}" \
   "$BIN" demo-sa --bus-socket "$SOCKET" --task "${KESTREL_DEMO_TASK:-demo: 实现一个 LRU cache}" \

@@ -101,6 +101,10 @@ pub struct DemoSaArgs {
     /// 允许 SA 在确定性允许集内选择 advance / rework / redispatch / stop。
     /// 判定本身仍不可被覆盖；不允许的动作退回确定性路线。
     pub sa_routing: bool,
+    /// 让 SA 先规划**跑哪几关 + 每关验什么**。执行器保留硬地板：dev 必须第一、
+    /// build 必须最后、review/test 至少留一个；不满足的回复整份退回标准四关。
+    /// 判定、证据、预算与路由权都不变。
+    pub sa_plan: bool,
 }
 
 /// 一个 peer 后端的定价依据：SA 用它把 token 换成钱。
@@ -697,6 +701,165 @@ fn parse_sa_route(text: &str) -> (Option<SaRoute>, String) {
     (action, strip_markdown_fence(note.trim()))
 }
 
+/// Model-authored pipeline shape: which gates run and what each one checks.
+/// The executor keeps the hard floor (dev first, build last, at least one
+/// independent verification gate); a reply that breaks it is not partially
+/// accepted — the whole plan falls back to the canonical four gates.
+#[derive(Clone, Debug, PartialEq)]
+struct StagePlan {
+    stages: Vec<Stage>,
+    focus: BTreeMap<Stage, String>,
+    source: &'static str,
+    note: String,
+}
+
+impl StagePlan {
+    fn canonical() -> Self {
+        Self {
+            stages: vec![Stage::Dev, Stage::Review, Stage::Test, Stage::Build],
+            focus: BTreeMap::new(),
+            source: "deterministic",
+            note: "canonical gate set".into(),
+        }
+    }
+
+    fn next_after(&self, stage: Stage) -> Option<Stage> {
+        self.stages
+            .iter()
+            .position(|candidate| *candidate == stage)
+            .and_then(|position| self.stages.get(position + 1).copied())
+    }
+
+    fn describe(&self) -> String {
+        self.stages
+            .iter()
+            .map(|stage| stage_key(*stage))
+            .collect::<Vec<_>>()
+            .join(" -> ")
+    }
+
+    fn to_json(&self, task_id: &str, note: &str) -> serde_json::Value {
+        serde_json::json!({
+            "task_id": task_id,
+            "source": self.source,
+            "stages": self.stages.iter().map(|stage| {
+                serde_json::json!({
+                    "stage": stage_key(*stage),
+                    "focus": self.focus.get(stage),
+                })
+            }).collect::<Vec<_>>(),
+            "note": note,
+        })
+    }
+
+    /// Strict parse of the planning reply. Everything after the first violation
+    /// is rejected: a half-accepted plan is a second, undocumented policy.
+    fn from_reply(text: &str) -> anyhow::Result<Self> {
+        #[derive(serde::Deserialize)]
+        struct WirePlan {
+            stages: Vec<WireStage>,
+        }
+        #[derive(serde::Deserialize)]
+        struct WireStage {
+            stage: String,
+            #[serde(default)]
+            focus: String,
+        }
+
+        let body = strip_markdown_fence(text);
+        let wire: WirePlan =
+            serde_json::from_str(&body).context("plan reply is not the requested JSON object")?;
+        let mut stages = Vec::new();
+        let mut focus = BTreeMap::new();
+        for entry in wire.stages {
+            let stage = match entry.stage.trim().to_ascii_lowercase().as_str() {
+                "dev" => Stage::Dev,
+                "review" => Stage::Review,
+                "test" => Stage::Test,
+                "build" => Stage::Build,
+                other => anyhow::bail!("plan names an unknown stage {other:?}"),
+            };
+            if stages.contains(&stage) {
+                anyhow::bail!("plan names stage {} twice", stage_key(stage));
+            }
+            let text = entry.focus.trim().replace(['\n', '\r'], " ");
+            if !text.is_empty() {
+                focus.insert(stage, truncate_chars(&text, 160));
+            }
+            stages.push(stage);
+        }
+        validate_stage_plan(&stages)?;
+        Ok(Self {
+            stages,
+            focus,
+            source: "model",
+            note: String::new(),
+        })
+    }
+}
+
+fn stage_key(stage: Stage) -> &'static str {
+    match stage {
+        Stage::Dev => "dev",
+        Stage::Review => "review",
+        Stage::Test => "test",
+        Stage::Build => "build",
+        Stage::Spec => "spec",
+        Stage::Release => "release",
+    }
+}
+
+/// The executor's floor for a model-authored plan:
+/// - dev first, build last (a plan that skips the writer or the build is not a
+///   plan for this pipeline);
+/// - review and test are each optional, but at least one must remain: dropping
+///   every independent verification gate is quality removal, not coordination;
+/// - the surviving gates keep the canonical relative order, so the rework and
+///   evidence machinery never sees a shape it was not written for.
+fn validate_stage_plan(stages: &[Stage]) -> anyhow::Result<()> {
+    if stages.first() != Some(&Stage::Dev) {
+        anyhow::bail!("plan must start with dev");
+    }
+    if stages.last() != Some(&Stage::Build) {
+        anyhow::bail!("plan must end with build");
+    }
+    if !stages.contains(&Stage::Review) && !stages.contains(&Stage::Test) {
+        anyhow::bail!("plan drops every independent verification gate (review/test)");
+    }
+    let canonical = [Stage::Dev, Stage::Review, Stage::Test, Stage::Build];
+    let mut cursor = 0usize;
+    for stage in stages {
+        let Some(offset) = canonical[cursor..]
+            .iter()
+            .position(|candidate| candidate == stage)
+        else {
+            anyhow::bail!("plan breaks the dev -> review -> test -> build order");
+        };
+        cursor += offset + 1;
+    }
+    Ok(())
+}
+
+fn plan_prompt(task: &str, spec: &str) -> String {
+    format!(
+        "你在为一个固定的四关 pipeline 选择**跑哪几关**与**每关的验收重点**。\n\
+         只输出一个 JSON 对象，不要代码围栏，不要解释：\n\
+         {{\"stages\":[{{\"stage\":\"dev\",\"focus\":\"...\"}},\
+         {{\"stage\":\"review\",\"focus\":\"...\"}},\
+         {{\"stage\":\"test\",\"focus\":\"...\"}},\
+         {{\"stage\":\"build\",\"focus\":\"...\"}}]}}\n\
+         规则：\n\
+         - dev 必须第一个，build 必须最后一个；review 与 test 可各选一次、保持 \
+         review -> test 的先后，且至少保留一个（至少要有一关独立验证）。\n\
+         - 不允许新增、改名或重复 stage。\n\
+         - focus 写这一关要核对的 1-2 个具体点，不超过 160 字；不要重复任务原文，\
+         不要要求联网或安装依赖。\n\
+         - 这个计划不改变 PASS/FAIL、证据要求或预算：它只决定调度顺序与执行重点。\n\n\
+         任务：\n{task}\n\n\
+         Spec 摘要：\n{spec}\n"
+    )
+}
+
 fn transition_prompt(
     stage: Stage,
     iter: u64,
@@ -704,14 +867,15 @@ fn transition_prompt(
     spec_path: Option<&Path>,
     deterministic: SaRoute,
     allowed: &[SaRoute],
+    plan: &StagePlan,
 ) -> String {
-    let next = match stage {
-        Stage::Spec => "dev",
-        Stage::Dev => "review",
-        Stage::Review => "test",
-        Stage::Test => "build",
-        Stage::Build | Stage::Release => "(final stage; no next stage)",
-    };
+    // `--sa-plan` 可以跳过 review 或 test，所以下一关必须来自实际计划，不能再从
+    // 固定顺序里猜——§9.72③ 那次「Review 后错误地提示下一关 Build」就是猜出来的。
+    let next = plan
+        .next_after(stage)
+        .map(stage_key)
+        .unwrap_or("(final stage; no next stage)");
+    let order = plan.describe();
     let issues = if verdict.issues.is_empty() {
         "none".to_string()
     } else {
@@ -734,7 +898,7 @@ fn transition_prompt(
     format!(
         "只做 SA 过渡复核：不能改变 PASS/FAIL，但可以在允许集内选择路由，不输出 JSON。\n\
          当前 stage: {stage:?} iter{iter}\n\
-         固定顺序: dev -> review -> test -> build；当前 stage 之后是: {next}\n\
+         计划顺序: {order}；当前 stage 之后是: {next}\n\
          环境: 沙箱无网络，不能 pip/npm 安装依赖；Python 测试只用标准库 unittest，\n\
          不要建议 pytest。路由选择只在允许集内生效；执行提示是 advisory，stage 以 check 为准。\n\
          `estimate_rounds` 是规划估计，不是硬停损；不要仅因估计轮次到达就 stop。\n\
@@ -986,10 +1150,83 @@ async fn draft_spec(
     Ok(path)
 }
 
+/// One planning turn: the model chooses the gate set and each gate's focus.
+/// The reply is validated against the executor's floor; anything else (bad
+/// JSON, unknown stage, dropped build, no verifier) falls back to the canonical
+/// four gates instead of being half-accepted. The plan artifact is written even
+/// on fallback, so the run says which policy it actually used.
+async fn draft_plan(
+    args: &DemoSaArgs,
+    backend: &SaBackend,
+    journal: &Journal,
+    ledger: &PriceLedger,
+    unit: &str,
+    iteration: u64,
+    spec_path: Option<&Path>,
+) -> anyhow::Result<(StagePlan, PathBuf)> {
+    let spec = spec_path
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .map(|text| truncate_chars(&text, 1200))
+        .unwrap_or_else(|| "(Spec.md unavailable)".to_string());
+    let (mut plan, note) = match backend
+        .ask(
+            args,
+            SaTurn {
+                journal,
+                ledger,
+                unit,
+                iteration,
+                label: "plan",
+                prompt: plan_prompt(&args.task, &spec),
+            },
+        )
+        .await
+    {
+        Ok(text) => match StagePlan::from_reply(&text) {
+            Ok(plan) => (plan, String::new()),
+            Err(error) => {
+                println!(
+                    "[sa] plan: model reply rejected ({error:#}); keeping the canonical gate set"
+                );
+                (
+                    StagePlan::canonical(),
+                    format!("model reply rejected: {error:#}"),
+                )
+            }
+        },
+        Err(error) => {
+            println!("[sa] plan: planning turn failed ({error:#}); keeping the canonical gate set");
+            (
+                StagePlan::canonical(),
+                format!("planning turn failed: {error:#}"),
+            )
+        }
+    };
+    plan.note = note;
+    tokio::fs::create_dir_all(&args.artifacts)
+        .await
+        .with_context(|| format!("create artifacts dir {}", args.artifacts.display()))?;
+    let path = args.artifacts.join(format!(
+        "{}-PLAN.json",
+        crate::cli::task::slug(&args.task_id)
+    ));
+    let body = serde_json::to_string_pretty(&plan.to_json(&args.task_id, &plan.note))?;
+    tokio::fs::write(&path, format!("{body}\n"))
+        .await
+        .with_context(|| format!("write plan {}", path.display()))?;
+    println!(
+        "[sa] plan: {} (source={}, {})",
+        plan.describe(),
+        plan.source,
+        path.display()
+    );
+    Ok((plan, path))
+}
+
 /// dispatch → wait bell → reconcile（读盘为准）→ 推进/回派，直至 release。
 pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
-    if (args.sa_transitions || args.sa_routing) && args.sa_role.is_none() {
-        anyhow::bail!("--sa-transitions/--sa-routing require --sa-role");
+    if (args.sa_transitions || args.sa_routing || args.sa_plan) && args.sa_role.is_none() {
+        anyhow::bail!("--sa-transitions/--sa-routing/--sa-plan require --sa-role");
     }
     let journal = Journal::create(&args.journal)?;
     // 审批台账从 journal 播种：SA 重启后仍然认得「这个 req 我已经答过了」，
@@ -1025,7 +1262,6 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
         None => None,
     };
     let kill_after = std::env::var("KESTREL_TEST_KILL_AFTER").unwrap_or_default();
-    let stages = [Stage::Dev, Stage::Review, Stage::Test, Stage::Build];
     println!(
         "[sa] journal policy: live file bounded by {} record(s) / {} byte(s){}",
         args.rotate_after,
@@ -1098,10 +1334,31 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
         );
     }
 
+    // 模型规划（`--sa-plan`）：选跑哪几关、每关验什么。执行器的硬地板在校验里，
+    // 不合格的回复整份退回标准四关；没有这个 flag 时 plans 形状与之前完全一致。
+    let (plan, plan_path) = match (&sa_backend, args.sa_plan) {
+        (Some(backend), true) => {
+            sa_turns += 1;
+            let (plan, path) = draft_plan(
+                &args,
+                backend,
+                &journal,
+                &ledger,
+                &unit,
+                sa_turns,
+                spec_path.as_deref(),
+            )
+            .await?;
+            (plan, Some(path))
+        }
+        _ => (StagePlan::canonical(), None),
+    };
+    let stages = plan.stages.clone();
+
     // 走「索引 + 每关自己的 iter」而不是 `for stage`：验证没过时要把活儿退回写者、
     // 返工完再重新验证（§9.32④）。回跳之后各关的重试次数必须接着上次算——清零等于
     // 没有上限，一条永不满足的验收标准就能把 pipeline 转到预算停损为止。
-    let mut iters = [1u64; 4];
+    let mut iters = vec![1u64; stages.len()];
     let writer_idx = stages
         .iter()
         .position(|s| *s == Stage::Dev)
@@ -1264,6 +1521,13 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
                     }
                     if let Some(note) = &sa_handoff {
                         bell_ref["handoff"] = serde_json::json!(note);
+                    }
+                    if let Some(path) = &plan_path {
+                        bell_ref["plan"] = serde_json::json!(path);
+                        bell_ref["plan_source"] = serde_json::json!(plan.source);
+                    }
+                    if let Some(focus) = plan.focus.get(&stage) {
+                        bell_ref["focus"] = serde_json::json!(focus);
                     }
                     // 「上一关为什么没过」进铃的 ref：写者拿到的是可核对的失败原因
                     // （连同一个判定工件路径），不是「再试一次」这种措辞。
@@ -1507,6 +1771,7 @@ pub async fn run_demo_sa(args: DemoSaArgs) -> anyhow::Result<()> {
                                 spec_path.as_deref(),
                                 deterministic_route,
                                 &allowed_routes,
+                                &plan,
                             ),
                         },
                     )
@@ -2551,6 +2816,7 @@ mod tests {
             sa_role: None,
             sa_transitions: false,
             sa_routing: false,
+            sa_plan: false,
         };
         assert_eq!(args.peer_for(Stage::Dev), "harness-rd");
         assert_eq!(args.peer_for(Stage::Build), "harness-qa");
@@ -3000,8 +3266,17 @@ mod tests {
             vec![],
         );
         let (deterministic, allowed) = route_choices(&verdict, Stage::Review, 2);
-        let prompt = transition_prompt(Stage::Review, 2, &verdict, None, deterministic, &allowed);
+        let prompt = transition_prompt(
+            Stage::Review,
+            2,
+            &verdict,
+            None,
+            deterministic,
+            &allowed,
+            &StagePlan::canonical(),
+        );
         assert!(prompt.contains("Review iter2"));
+        assert!(prompt.contains("计划顺序: dev -> review -> test -> build"));
         assert!(prompt.contains("当前 stage 之后是: test"));
         assert!(prompt.contains("不要建议 pytest"));
         assert!(prompt.contains("estimate_rounds` 是规划估计，不是硬停损"));
@@ -3480,6 +3755,111 @@ mod tests {
         assert!(
             EvidenceSpec::from_json_file(&notjson).is_err(),
             "坏表不能当成没表"
+        );
+    }
+
+    #[test]
+    fn stage_plan_accepts_the_supported_shapes() {
+        let all = StagePlan::from_reply(
+            r#"{"stages":[
+                {"stage":"dev","focus":"implement get/put"},
+                {"stage":"review","focus":"check eviction order"},
+                {"stage":"test","focus":"run unittest"},
+                {"stage":"build","focus":"compile"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            all.stages,
+            vec![Stage::Dev, Stage::Review, Stage::Test, Stage::Build]
+        );
+        assert_eq!(all.source, "model");
+        assert_eq!(
+            all.focus.get(&Stage::Review).map(String::as_str),
+            Some("check eviction order")
+        );
+        assert_eq!(all.describe(), "dev -> review -> test -> build");
+
+        let review_only = StagePlan::from_reply(
+            r#"{"stages":[{"stage":"dev"},{"stage":"review"},{"stage":"build"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            review_only.stages,
+            vec![Stage::Dev, Stage::Review, Stage::Build]
+        );
+        assert_eq!(review_only.next_after(Stage::Dev), Some(Stage::Review));
+        assert_eq!(review_only.next_after(Stage::Build), None);
+
+        let test_only = StagePlan::from_reply(
+            r#"{"stages":[{"stage":"dev"},{"stage":"test"},{"stage":"build"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            test_only.stages,
+            vec![Stage::Dev, Stage::Test, Stage::Build]
+        );
+        assert_eq!(test_only.next_after(Stage::Dev), Some(Stage::Test));
+        assert!(test_only.focus.is_empty());
+    }
+
+    #[test]
+    fn stage_plan_rejects_shapes_that_break_the_floor() {
+        let cases = [
+            (
+                r#"{"stages":[{"stage":"review"},{"stage":"dev"},{"stage":"build"}]}"#,
+                "start with dev",
+            ),
+            (
+                r#"{"stages":[{"stage":"dev"},{"stage":"review"}]}"#,
+                "end with build",
+            ),
+            (
+                r#"{"stages":[{"stage":"dev"},{"stage":"build"}]}"#,
+                "verification gate",
+            ),
+            (
+                r#"{"stages":[{"stage":"dev"},{"stage":"test"},{"stage":"review"},{"stage":"build"}]}"#,
+                "order",
+            ),
+            (
+                r#"{"stages":[{"stage":"dev"},{"stage":"review"},{"stage":"review"},{"stage":"build"}]}"#,
+                "twice",
+            ),
+            (
+                r#"{"stages":[{"stage":"dev"},{"stage":"deploy"},{"stage":"build"}]}"#,
+                "unknown stage",
+            ),
+            ("not json at all", "json"),
+        ];
+        for (reply, needle) in cases {
+            let error = StagePlan::from_reply(reply).expect_err(reply);
+            assert!(
+                error.to_string().to_lowercase().contains(needle),
+                "{reply}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn stage_plan_truncates_and_flattens_focus() {
+        let long = "x".repeat(400);
+        let reply = format!(
+            r#"{{"stages":[{{"stage":"dev","focus":"{long}"}},
+                {{"stage":"test"}},{{"stage":"build"}}]}}"#
+        );
+        let plan = StagePlan::from_reply(&reply).unwrap();
+        let focus = plan.focus.get(&Stage::Dev).expect("focus kept");
+        assert!(focus.chars().count() <= 164, "{}", focus.chars().count());
+        assert!(focus.ends_with("..."), "{focus}");
+
+        let flattened = StagePlan::from_reply(
+            r#"{"stages":[{"stage":"dev","focus":"line one\nline two"},
+                {"stage":"test"},{"stage":"build"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            flattened.focus.get(&Stage::Dev).map(String::as_str),
+            Some("line one line two")
         );
     }
 }
