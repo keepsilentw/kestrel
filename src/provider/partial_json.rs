@@ -1,11 +1,14 @@
 //! Partial-JSON tolerant parser (地基件 3, 自写 per plan §3 决策).
 //!
-//! Tool-call args stream as deltas; the engine re-parses the accumulated
-//! prefix every delta (pi parseStreamingJson 语义). A prefix is generally
-//! INVALID JSON, so this parser repairs the tail: closes open strings and
-//! containers, completes `key:` with null, drops trailing commas, and drops
-//! dangling escapes / partial keywords. The last prefix of a full document
-//! must equal the full document.
+//! A truncated JSON prefix is generally invalid. This parser repairs the tail:
+//! closes open strings and containers, completes `key:` with null, drops
+//! trailing commas, and drops dangling escapes / partial keywords. The last
+//! prefix of a full document must equal the full document.
+//!
+//! 现状（2026-11-20）：引擎在流结束时用严格 JSON 解析工具参数
+//! （`core::turn::parse_args_or_null`），**并没有**逐 delta 调用本模块。它是为
+//! 「流式展示 / 截断残留」保留的、有测试的部件，不是已接线的热路径——这段文字
+//! 之前把它写成了后者。
 
 use serde_json::Value;
 

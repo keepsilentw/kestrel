@@ -408,6 +408,9 @@ pub trait Transport: Send + Sync + 'static {
 /// response headers).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const GATEWAY_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+/// Error bodies are diagnostics, not payloads: a gateway that answers 500 with
+/// a gigabyte must not turn one failed retry into an allocation spike.
+const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 
 /// True when a path segment is a version marker (`v1`, `v4`, ...). Both OpenAI
 /// wires use this to decide whether `base_url` already carries the version
@@ -416,6 +419,30 @@ pub(crate) fn is_version_segment(segment: &str) -> bool {
     segment
         .strip_prefix('v')
         .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// Read at most `MAX_ERROR_BODY_BYTES` of a failed response, saying so when the
+/// cap was hit. The full body is never needed to decide a retry.
+async fn read_error_body(resp: reqwest::Response) -> String {
+    let mut stream = resp.bytes_stream();
+    let mut out = Vec::new();
+    let mut truncated = false;
+    while let Some(chunk) = stream.next().await {
+        let Ok(chunk) = chunk else { break };
+        let room = MAX_ERROR_BODY_BYTES.saturating_sub(out.len());
+        if chunk.len() > room {
+            truncated = true;
+        }
+        out.extend_from_slice(&chunk[..chunk.len().min(room)]);
+        if truncated {
+            break;
+        }
+    }
+    let mut text = String::from_utf8_lossy(&out).into_owned();
+    if truncated {
+        text.push_str("\n[error body truncated]");
+    }
+    text
 }
 
 /// Real HTTP transport (reqwest, SSE response body as bytes).
@@ -493,7 +520,7 @@ impl Transport for HttpTransport {
                     .get("x-should-retry")
                     .and_then(|v| v.to_str().ok())
                     .map(|v| v == "true");
-                let body = resp.text().await.unwrap_or_default();
+                let body = read_error_body(resp).await;
                 return Err(WireError::BadResponse {
                     status: status.as_u16(),
                     body,
@@ -633,6 +660,49 @@ mod tests {
         let price = CostPerMTok::simple(1.0, 4.0);
         let worst = Usage::worst_case_cost(&price, 128_000, 8_192);
         assert!((worst - (0.128 + 0.032768)).abs() < 1e-9, "{worst}");
+    }
+
+    /// A huge error body must be capped, not buffered whole: the status and the
+    /// first bytes are enough to classify a retry, and the cut says it happened.
+    #[tokio::test]
+    async fn a_huge_error_body_is_capped_and_marked() {
+        use tokio::io::AsyncWriteExt as _;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // fire-and-forget: test-only mock server, closed when the test ends
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let body = vec![b'x'; 200_000];
+            let head = format!(
+                "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(head.as_bytes()).await.unwrap();
+            stream.write_all(&body).await.unwrap();
+            let _ = stream.shutdown().await;
+        });
+        let transport =
+            HttpTransport::with_timeouts(Duration::from_secs(1), Duration::from_secs(1));
+        let spec = RequestSpec {
+            url: format!("http://{addr}/v1/messages"),
+            headers: vec![],
+            body: serde_json::json!({}),
+        };
+        match transport.send(spec).await {
+            Err(WireError::BadResponse { body, .. }) => {
+                assert!(body.starts_with('x'), "{:?}", &body[..8]);
+                assert!(
+                    body.len() <= MAX_ERROR_BODY_BYTES + 32,
+                    "the error body was buffered whole: {} bytes",
+                    body.len()
+                );
+                assert!(body.contains("[error body truncated]"), "{body:.40}");
+            }
+            Err(other) => panic!("expected a bad response, got {other}"),
+            Ok(_) => panic!("the mock gateway answers 500"),
+        }
+        server.abort();
     }
 
     /// A gateway that accepts the connection and then goes silent used to hold
