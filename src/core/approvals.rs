@@ -263,7 +263,18 @@ impl ApprovalBoard {
             .lock()
             .unwrap()
             .retain(|_, request| request.expires_at >= now && approval_key(&request.detail) != key);
-        self.persist_best_effort("consume deferred request");
+        if let Err(error) = self.persist() {
+            // A one-use slot must not be consumed if its removal is not durable:
+            // after a restart the on-disk copy would hand the exact same call a
+            // second pass. Put it back in memory and refuse this consumption —
+            // the caller treats it as stale/deny, and the slot stays available.
+            tracing::error!(
+                "approval store failed while consuming a deferred request: {error}; \
+                 the slot stays unconsumed"
+            );
+            self.deferred.lock().unwrap().insert(key, slot);
+            return None;
+        }
         Some((slot.source_req, slot.decision))
     }
 
@@ -446,6 +457,51 @@ mod tests {
             expired.complete(&req, ApprovalDecision::AllowOnce),
             ApprovalCompletion::Stale
         );
+    }
+
+    /// If the removal cannot be made durable, the slot must not be consumed:
+    /// a restart would otherwise read the old file and approve the same exact
+    /// call a second time. The in-memory slot is restored and the call is denied.
+    #[test]
+    fn an_unwritable_store_never_consumes_a_one_use_slot() {
+        let dir =
+            std::env::temp_dir().join(format!("kestrel-approval-fail-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let blocker = dir.join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let store = blocker.join("slots.json");
+        let board = ApprovalBoard::with_store(store.clone()).unwrap();
+
+        let detail = serde_json::json!({"tool":"bash","args":{"command":"cargo test"}});
+        let req = "req-unwritable".to_string();
+        let _rx = board.open_with_detail(req.clone(), detail.clone());
+        assert!(board.suspend(&req));
+        assert_eq!(
+            board.complete(&req, ApprovalDecision::AllowOnce),
+            ApprovalCompletion::Deferred
+        );
+        assert_eq!(
+            board.take_deferred(&detail),
+            None,
+            "a slot whose removal cannot be persisted is not consumed"
+        );
+
+        // A duplicate reply must still not recreate or re-approve anything.
+        assert_eq!(
+            board.complete(&req, ApprovalDecision::AllowOnce),
+            ApprovalCompletion::Stale
+        );
+
+        // Once the store is writable, the same slot is still there — exactly once.
+        std::fs::remove_file(&blocker).unwrap();
+        std::fs::create_dir_all(&blocker).unwrap();
+        assert_eq!(
+            board.take_deferred(&detail),
+            Some((req, ApprovalDecision::AllowOnce))
+        );
+        assert_eq!(board.take_deferred(&detail), None, "one use, not two");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
