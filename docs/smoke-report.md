@@ -7,8 +7,8 @@
 
 ## 1. 自动化测试基线（cargo test）
 
-**Metrics** — src 52 files / 23775 lines · tests 9 files / 4291 lines · 313 tests (lib 245 + bin 6 + integration 62)
-**Integration** — core_loop 7 / discipline 2 / m1_tools 14 / m2_session 6 / m4_bus 17 / m5_pool 10 / sandbox_e2e 4 / wire_anthropic 2
+**Metrics** — src 52 files / 24052 lines · tests 9 files / 4379 lines · 316 tests (lib 247 + bin 6 + integration 63)
+**Integration** — core_loop 7 / discipline 2 / m1_tools 14 / m2_session 6 / m4_bus 17 / m5_pool 11 / sandbox_e2e 4 / wire_anthropic 2
 
 | 组 | 覆盖 |
 |---|---|
@@ -1555,3 +1555,32 @@ Parking 新增 8 MiB 总字节上限：
 
 边界：`complete` / `suspend` / `abandon` 仍是 best-effort 落盘；它们丢的是未来的便利，
 不是已经给出的许可。
+
+## 68. 2026-11-20 会话写失败与陈旧终态事件
+
+会话写入原来在 `SessionStore::write` 里 `expect`：ENOSPC 会 panic 当前回合，并毒化
+`Shared::commit` 持有的 `history_ids` 锁，之后每个回合继续 panic。现在写失败变成
+`Result`：`commit` 给未落盘条目记 `None` id 并返回错误，`run_turn` 发 `Fatal` +
+`TurnComplete(error)` 结束回合；锁不再被毒化。
+
+同一条路径暴露出第二个缺陷：回合在 `Fatal` 处停读，随后发出的 `TurnComplete` 留在事件
+队列里，下一回合会先读到它并用上一回合的错误结束。worker 现在按 turn id 过滤事件。
+
+| 场景 | 结果 |
+|---|---|
+| 注入一次会话写失败 | 回合以 `Fatal` 结束，原因含 `session tree write failed` |
+| 同一引擎的下一回合 | 正常提交并完成（无中毒锁） |
+| `Fatal` 后残留的 `TurnComplete` | 被 turn-id 过滤丢弃，不影响下一回合 |
+
+## 69. 2026-11-20 hub 停车字节数缓存
+
+`park_envelope` 原先每停一帧都遍历全表并重新序列化每个排队帧；8 MiB 上限内这是平方级
+开销。`BusHub` 现在维护 `parked_bytes_cached`，在 push / pop / prune / take 处同步更新，
+淘汰时只计算真正被丢的帧。
+
+| 断言 | 结果 |
+|---|---|
+| 连续停两帧后缓存 == 全表重算 | 相等 |
+| `take_parked` 后缓存 | 归零 |
+
+边界：缓存与 `parked` 表同锁更新；`persist_now` 不改变座位表，因此不需要额外同步。

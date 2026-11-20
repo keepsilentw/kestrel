@@ -33,8 +33,8 @@
 > Build iter1 超时后迟到铃被忽略，iter2 通过）；
 > supervisor 与状态文件同时启用，模拟子进程验证了 exit 1 / exit 70 的重启分支；
 > Linux 真机与真实 worker 的 RSS 压力阈值仍未实测。
-> **Metrics** — src 52 files / 23775 lines · tests 9 files / 4291 lines · 313 tests (lib 245 + bin 6 + integration 62)
-> **Integration** — core_loop 7 / discipline 2 / m1_tools 14 / m2_session 6 / m4_bus 17 / m5_pool 10 / sandbox_e2e 4 / wire_anthropic 2
+> **Metrics** — src 52 files / 24052 lines · tests 9 files / 4379 lines · 316 tests (lib 247 + bin 6 + integration 63)
+> **Integration** — core_loop 7 / discipline 2 / m1_tools 14 / m2_session 6 / m4_bus 17 / m5_pool 11 / sandbox_e2e 4 / wire_anthropic 2
 > 规模已过 plan 预算（10-13k）的上沿：多出来的部分几乎都花在「取消安全」与「对账」这两条纪律上。
 > 上面两行数字由 `tests/discipline.rs::metrics_lines_match_the_tree` 对照源码树重算校验——
 > 这些计数此前在三处文档里手抄过三次、漂移过三次（§9.19），现在它是闸门不是仪式。
@@ -930,6 +930,32 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
     持久化失败，再恢复可写，钉住「失败不消费、恢复后只消费一次、重复批复不重建槽位」。
     边界：这只覆盖消费这一步；`complete`/`suspend`/`abandon` 的落盘仍是 best-effort
     （失败会 log error），因为它们不改变「一次性」语义，丢的是未来的便利而不是已经给出的许可。
+
+78. **会话写失败不再 panic，陈旧终态事件不再劫持下一回合（2026-11-20）**：
+    ① `SessionStore::write` 原来 `expect`/`expect`：一次 ENOSPC 既 panic 当前回合，又因为
+       `Shared::commit` 持着 `history_ids` 锁而毒化它，之后每个回合都在 `lock().unwrap()`
+       上继续 panic——引擎对进程余生不可用。现在 `write` 返回 `Result`：`commit` 把它变成
+       「该条及之后的条目记 `None` id + 返回 Err」，`run_turn` 收到 Err 就发 `Fatal` +
+       `TurnComplete(error)` 并结束回合；`start_turn` 的提交失败只发 `Fatal`。内存与 ids
+       始终等长，压缩检查点不会拿到一个树里不存在的 `first_kept`。
+    ② 测试用**注入的一次写失败**（`#[cfg(test)] fail_next_write`，真实 ENOSPC 不可移植）：
+       `a_failed_session_write_is_fatal_but_not_terminal_for_the_engine` 断言 Fatal 带原因、
+       且下一回合仍能提交并完成（锁没被毒化）。
+    ③ 写失败路径还暴露了一个更早的 bug：回合在 `Fatal` 处停止读取，随后发出的
+       `TurnComplete` 留在队列里；下一回合会先读到它，立刻用上一回合的错误结束。worker 现在
+       按事件的 turn id 过滤（`TurnStarted` 开启新 id，其它事件的 id 不匹配就丢弃），
+       `a_stale_terminal_event_does_not_end_the_next_turn` 用「第一次 sample 传输失败、
+       第二次正常」的 transport 钉住它。
+    ④ 边界：失败后已写入磁盘的批内前缀保留、未写入的条目只活在内存（ids 为 `None`）；
+       引擎下一回合仍带这段内存历史，但重启/恢复时它不在树里。这是 ENOSPC 下的有损降级，
+       不是「树可以重建」的承诺。
+
+79. **hub 停车字节数改为增量缓存（2026-11-20）**：`park_envelope` 原先每停一帧都
+    `parked_bytes()` 全表遍历并重新 `serde_json::to_vec` 每个排队帧，最坏在 8 MiB 上限内
+    做一次全量重序列化——向离线 session 连发时是平方级。`BusHub` 现在持一个
+    `parked_bytes_cached`，在 push/pop/prune/take 四处同步更新；淘汰时只对真正被丢的帧
+    重新计算字节数。测试 `the_parked_byte_cache_matches_the_table_on_push_and_take` 断言
+    缓存与全表重算逐次相等，取空后归零。
 
 ## 10 二期清单
 
