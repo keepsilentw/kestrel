@@ -7,7 +7,7 @@
 
 ## 1. 自动化测试基线（cargo test）
 
-**Metrics** — src 52 files / 24129 lines · tests 9 files / 4469 lines · 318 tests (lib 248 + bin 6 + integration 64)
+**Metrics** — src 52 files / 24150 lines · tests 9 files / 4469 lines · 318 tests (lib 248 + bin 6 + integration 64)
 **Integration** — core_loop 8 / discipline 2 / m1_tools 14 / m2_session 6 / m4_bus 17 / m5_pool 11 / sandbox_e2e 4 / wire_anthropic 2
 
 | 组 | 覆盖 |
@@ -1640,3 +1640,12 @@ Parking 新增 8 MiB 总字节上限：
 版本地址的文本与工具回合都通过。
 
 边界：只测了 DeepSeek 一个实现；OpenAI 官方与其它 Responses 兼容网关未测。
+
+## 74. 2026-11-20 回合采样轮数显式化
+
+`-p` 与 `serve` 的 `max_rounds` 原先都硬编码 8；demo 的 dev iter1 多次以
+`round budget exhausted` 结束，无法从 flag 判断是预算不足还是模型没收敛。
+
+现在 `--max-rounds N` 在两个入口都可用（缺省 8，`0` 启动即拒绝）：`serve` 把它送进每个
+task 的 `EngineConfig`，`-p` 送进 `RunArgs`。调大放宽的是「回合内工具循环」，不放宽证据、
+判定或预算；最坏 token 成本随之上升，需与 `--max-cost` 一起看。

@@ -33,7 +33,7 @@
 > Build iter1 超时后迟到铃被忽略，iter2 通过）；
 > supervisor 与状态文件同时启用，模拟子进程验证了 exit 1 / exit 70 的重启分支；
 > Linux 真机与真实 worker 的 RSS 压力阈值仍未实测。
-> **Metrics** — src 52 files / 24129 lines · tests 9 files / 4469 lines · 318 tests (lib 248 + bin 6 + integration 64)
+> **Metrics** — src 52 files / 24150 lines · tests 9 files / 4469 lines · 318 tests (lib 248 + bin 6 + integration 64)
 > **Integration** — core_loop 8 / discipline 2 / m1_tools 14 / m2_session 6 / m4_bus 17 / m5_pool 11 / sandbox_e2e 4 / wire_anthropic 2
 > 规模已过 plan 预算（10-13k）的上沿：多出来的部分几乎都花在「取消安全」与「对账」这两条纪律上。
 > 上面两行数字由 `tests/discipline.rs::metrics_lines_match_the_tree` 对照源码树重算校验——
@@ -1003,6 +1003,14 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
     ——把缺陷写成期望，正是「fixture 全绿」不能替代真端点的原因。
     边界：只测了 DeepSeek 一个实现；OpenAI 官方与其它 Responses 兼容网关未测。`store:false`
     与不重放非 Responses 形状的 thinking blob 仍是 §9.24 的取舍。
+
+84. **回合采样轮数显式化（2026-11-20）**：`max_rounds` 在两个入口都是硬编码 8
+    （`-p` 与 `serve` 的引擎），而 demo 的 dev iter1 多次以 `round budget exhausted`
+    失败——那是「8 轮工具循环不够」还是「模型没收敛」，运营者无法从 flag 上回答。现在
+    `-p --max-rounds N` 与 `serve --max-rounds N`（缺省 8，`0` 在启动时拒绝）把它变成
+    显式策略；`serve` 侧进入每个 task 的 `EngineConfig`，`-p` 侧进入 `RunArgs`。
+    边界：调大只放宽「回合内循环」，不放宽证据、判定或预算；`max_rounds` 越大，一次
+    派发的最坏 token 成本越高（预留仍按最坏情况算），所以它和 `--max-cost` 要一起看。
 
 ## 10 二期清单
 
