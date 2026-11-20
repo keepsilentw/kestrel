@@ -7,7 +7,7 @@
 
 ## 1. 自动化测试基线（cargo test）
 
-**Metrics** — src 52 files / 24085 lines · tests 9 files / 4469 lines · 317 tests (lib 247 + bin 6 + integration 64)
+**Metrics** — src 52 files / 24129 lines · tests 9 files / 4469 lines · 318 tests (lib 248 + bin 6 + integration 64)
 **Integration** — core_loop 8 / discipline 2 / m1_tools 14 / m2_session 6 / m4_bus 17 / m5_pool 11 / sandbox_e2e 4 / wire_anthropic 2
 
 | 组 | 覆盖 |
@@ -1623,3 +1623,20 @@ Parking 新增 8 MiB 总字节上限：
 | 同一引擎下一回合 | 正常完成（`Stop`） |
 
 边界：std 锁可能已被毒化；后续回合会再次以 Fatal 失败。承诺是「可见」，不是「panic 安全」。
+
+## 73. 2026-11-20 openai-responses 真端点实测（DeepSeek）
+
+用临时 `KESTREL_HOME` 的 registry 指向 `https://api.deepseek.com/v1`，不动用户层配置：
+
+| 场景 | 结果 |
+|---|---|
+| 纯文本 | `RESP_OK`；usage 36 in / 23 out；`thinking_delta` 与 `text_delta` 分流正常 |
+| 工具回合 | `function_call` → bash `echo` → `function_call_output` → `DONE`；usage 1249 in / 45 out，cache read 512 |
+| 根地址 `https://api.deepseek.com` | 同样通过（`/v1/responses`） |
+| 版本地址 `.../v1` | **首次 404**：wire 无条件补 `/v1` 拼成 `/v1/v1/responses` |
+
+修复：`responses_url` 与 `chat_url` 同一套规则（完整路径原样、版本段只补 `/responses`、
+否则补 `/v1/responses`）；原先把 `/v1/v1/responses` 写成期望值的金身断言被改正。修复后
+版本地址的文本与工具回合都通过。
+
+边界：只测了 DeepSeek 一个实现；OpenAI 官方与其它 Responses 兼容网关未测。

@@ -2,7 +2,7 @@
 
 > 状态：M0-M4 已实现并通过测试；§10 二期已落地十三项 + 2026-11-04 走完的十格（§9.32–§9.41）——`ApproveMode::Bus`、
 > 「判定 = 工件 + 证据文件」、bus 重连重放（停车补投 + 客户端重连）、journal 快照/截断语义、
-> 多任务并行（task 命名空间 + 前缀寻址）、openai-responses wire（**真端点未实测**，§9.24）、
+> 多任务并行（task 命名空间 + 前缀寻址）、openai-responses wire（2026-11-20 DeepSeek 真端点实测，§9.83）、
 > journal 投影增量化与轮转触发（§9.25）、worker 池（一 task 一引擎一树，§9.26）、
 > 预算价格表（usd 按 token 结算，§9.27）、journal 轮转的默认策略（活文件有界，§9.28）、
 > 证据的类型化（按类型核对 + stage 要求齐全，§9.29）、审批批复的可靠投递（at-least-once + 幂等，§9.30）、批复回执与过期审批不谎报生效（§9.31）。
@@ -33,7 +33,7 @@
 > Build iter1 超时后迟到铃被忽略，iter2 通过）；
 > supervisor 与状态文件同时启用，模拟子进程验证了 exit 1 / exit 70 的重启分支；
 > Linux 真机与真实 worker 的 RSS 压力阈值仍未实测。
-> **Metrics** — src 52 files / 24085 lines · tests 9 files / 4469 lines · 317 tests (lib 247 + bin 6 + integration 64)
+> **Metrics** — src 52 files / 24129 lines · tests 9 files / 4469 lines · 318 tests (lib 248 + bin 6 + integration 64)
 > **Integration** — core_loop 8 / discipline 2 / m1_tools 14 / m2_session 6 / m4_bus 17 / m5_pool 11 / sandbox_e2e 4 / wire_anthropic 2
 > 规模已过 plan 预算（10-13k）的上沿：多出来的部分几乎都花在「取消安全」与「对账」这两条纪律上。
 > 上面两行数字由 `tests/discipline.rs::metrics_lines_match_the_tree` 对照源码树重算校验——
@@ -985,16 +985,36 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
     锁仍可能中毒，后续回合会以同样的 Fatal 形式再次失败——这里承诺的是「不再静默挂住」，
     不是「panic 安全」。
 
+83. **openai-responses 真端点实测（2026-11-20，DeepSeek）**：这条 wire 从 §9.24 起只有
+    fixture 背书。当天用 DeepSeek 的 `/v1/responses` 做了两轮实测（临时 `KESTREL_HOME`
+    里的 registry，不动用户层配置；key 仍是既有的 `!cmd` 引用）：
+    ① 纯文本：返回 `RESP_OK`，`turn_complete` 带 usage（36 in / 23 out），思考增量以
+    `thinking_delta` 出现、正文以 `text_delta` 收尾；
+    ② 工具回合：模型发起 `function_call`（bash `echo`），内核执行后以
+    `function_call_output` 回传，第二轮收敛为 `DONE`，usage `1249 in / 45 out，
+    cache read 512`——服务端自动缓存同样生效。
+    **实测同时暴露一个 URL 约定缺陷**：`responses_url` 原先无条件追加 `/v1/responses`，
+    于是最常见的 `base_url = "https://api.deepseek.com/v1"` 会变成
+    `/v1/v1/responses`（真端点 404），只有写根地址才碰巧能通。现在它与 `chat_url` 同一套
+    规则：完整 `/responses` 路径原样用；最后一段已是版本号（`v1`/`v4`…）只补
+    `/responses`；否则补 `/v1/responses`。修复后用 `base_url = ".../v1"` 复跑，文本与
+    工具回合都通过。测试 `responses_url_accepts_a_versioned_root_and_a_full_path` 钉住
+    四种拼法；原先那条把 `https://gw.example/v1/v1/responses` 当期望值的金身断言随之改正
+    ——把缺陷写成期望，正是「fixture 全绿」不能替代真端点的原因。
+    边界：只测了 DeepSeek 一个实现；OpenAI 官方与其它 Responses 兼容网关未测。`store:false`
+    与不重放非 Responses 形状的 thinking blob 仍是 §9.24 的取舍。
+
 ## 10 二期清单
 
 > 2026-11-13 更新：三期 RD/QA 在严格 `build_log` 下完成了真实端点联跑；构建日志由 SA
 > 确定性预检生成，不依赖 QA 模型主动运行命令，见 §9.58。2026-11-18 起
 > `demo-sa --sa-role` 已让 MiMo 起草 Spec 并进入账本（§9.71）；完整模型驱动协调器仍留在
-> 清单上，`openai-responses` 也尚无真端点实测。下文的“三期真端点联跑”仍保留为当时记录。
+> 清单上；`openai-responses` 已于 2026-11-20 在 DeepSeek 上完成真端点实测（§9.83）。
+> 下文的“三期真端点联跑”仍保留为当时记录。
 
-已落地（2026-10-28 起）：~~`ApproveMode::Bus`~~（授权表 + 超时 fail-closed + journal 审计，§9.20）、~~SA 判定升级到「工件 + 证据文件」~~（绝对路径存在性/非空核对，§9.20）、~~bus 重连重放~~（离线 session 停车补投 + 客户端自动重连；RPC 与「写入即死」的帧不重放，§9.21）、~~journal 快照/截断语义~~（检查点 + 归档段 + 崩溃安全轮转，§9.22）、~~多任务并行~~（task 命名空间三处同源 + 前缀寻址，§9.23）、~~openai-responses wire~~（第三条 v1 wire，金身 + fixture 验证，**真端点未实测**，§9.24）、~~journal 投影增量化与轮转触发~~（在线投影 = 全量重放 + 条数/字节双上限，§9.25）、~~一个引擎内真正并发地服务多个 task~~（改为「一 task 一引擎」的 worker 池，单活跃槽不动，§9.26）、~~`BudgetSpent` 的价格表~~（预留 → 结算两段式、按 token 换账单、无价退回名义值并报出来，§9.27；2026-11-03）、~~journal 轮转的**默认策略**~~（活文件 512 条 / 1 MiB 双上限、三态 CLI、生产与测试同一条 `rotate_at_boundary`，§9.28；2026-11-03）、~~证据的类型化~~（`file` / `test_log` / `diff` / `screenshot` 各自可在盘上反驳 + `--evidence-spec` 的 stage 要求，坏表硬失败，§9.29；2026-11-03）、~~审批批复的可靠投递~~（请求 at-least-once + 按 req 幂等 + 台账从 journal 播种，判定仍只一次，§9.30；2026-11-03）、~~批复到底有没有生效~~（回执 `approval_receipt` + `ApprovalAcked` 落账 + 到点撤摊，**没生效的批准不许记成生效**，§9.31；2026-11-03）。
+已落地（2026-10-28 起）：~~`ApproveMode::Bus`~~（授权表 + 超时 fail-closed + journal 审计，§9.20）、~~SA 判定升级到「工件 + 证据文件」~~（绝对路径存在性/非空核对，§9.20）、~~bus 重连重放~~（离线 session 停车补投 + 客户端自动重连；RPC 与「写入即死」的帧不重放，§9.21）、~~journal 快照/截断语义~~（检查点 + 归档段 + 崩溃安全轮转，§9.22）、~~多任务并行~~（task 命名空间三处同源 + 前缀寻址，§9.23）、~~openai-responses wire~~（第三条 v1 wire，金身 + fixture 验证；真端点见 §9.83，§9.24）、~~journal 投影增量化与轮转触发~~（在线投影 = 全量重放 + 条数/字节双上限，§9.25）、~~一个引擎内真正并发地服务多个 task~~（改为「一 task 一引擎」的 worker 池，单活跃槽不动，§9.26）、~~`BudgetSpent` 的价格表~~（预留 → 结算两段式、按 token 换账单、无价退回名义值并报出来，§9.27；2026-11-03）、~~journal 轮转的**默认策略**~~（活文件 512 条 / 1 MiB 双上限、三态 CLI、生产与测试同一条 `rotate_at_boundary`，§9.28；2026-11-03）、~~证据的类型化~~（`file` / `test_log` / `diff` / `screenshot` 各自可在盘上反驳 + `--evidence-spec` 的 stage 要求，坏表硬失败，§9.29；2026-11-03）、~~审批批复的可靠投递~~（请求 at-least-once + 按 req 幂等 + 台账从 journal 播种，判定仍只一次，§9.30；2026-11-03）、~~批复到底有没有生效~~（回执 `approval_receipt` + `ApprovalAcked` 落账 + 到点撤摊，**没生效的批准不许记成生效**，§9.31；2026-11-03）。
 
-仍在清单上（审批已落地 at-least-once 投递、回执、重启补投、24 小时跨回合单次槽位与跨 worker 重启恢复，见 §9.30 / §9.31 / §9.63 / §9.67）：tree-sitter-bash 命令解析、execpolicy DSL（Starlark）、Linux bubblewrap 真机验证与端口级网络策略（实现见 §9.66，当前仅静态覆盖）、TUI（行级 diff 形制，pi-tui 蓝本）、MCP 客户端、model-in-the-loop evals（含 openai-responses 的真端点实测，§9.24）、worker 池资源护栏的剩余部分（工具并发数由 `--max-parallel-tools` / `--max-worker-tools` 封顶，见 §9.46 / §9.48；内存准入/空闲回收、压力恢复、活动回合中断、进程自检硬退出与外部 supervisor 已落地，见 §9.53 / §9.59 / §9.60 / §9.64 / §9.65 / §9.68；真·多进程编排仍留给 harness 上层）。归档自动删除已明确为非目标，保留策略见 §9.69。
+仍在清单上（审批已落地 at-least-once 投递、回执、重启补投、24 小时跨回合单次槽位与跨 worker 重启恢复，见 §9.30 / §9.31 / §9.63 / §9.67）：tree-sitter-bash 命令解析、execpolicy DSL（Starlark）、Linux bubblewrap 真机验证与端口级网络策略（实现见 §9.66，当前仅静态覆盖）、TUI（行级 diff 形制，pi-tui 蓝本）、MCP 客户端、model-in-the-loop evals（Responses 已在 DeepSeek 实测，§9.83；评测框架本身未接）、worker 池资源护栏的剩余部分（工具并发数由 `--max-parallel-tools` / `--max-worker-tools` 封顶，见 §9.46 / §9.48；内存准入/空闲回收、压力恢复、活动回合中断、进程自检硬退出与外部 supervisor 已落地，见 §9.53 / §9.59 / §9.60 / §9.64 / §9.65 / §9.68；真·多进程编排仍留给 harness 上层）。归档自动删除已明确为非目标，保留策略见 §9.69。
 
 2026-11-04 联跑新添的两格同日落地（§9.33）：验证类 stage 的 FAIL 回跳给写者返工（带额度 `max_reworks`、带原因 `ref.rework`、每关 iter 跨回跳不清零），bash 用 `output_path` 参数交出可核对的 `test_log`（内核把 stdout/stderr 连 `exit: ExitStatus{...}` 一起写进那个文件）。下一格因此有了明确的落点：SA 只要去读那行 `exit:`，「形状」就能升级成「结论」——现在它还只证明「这份文件是测试汇总」。
 
