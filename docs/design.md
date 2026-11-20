@@ -33,7 +33,7 @@
 > Build iter1 超时后迟到铃被忽略，iter2 通过）；
 > supervisor 与状态文件同时启用，模拟子进程验证了 exit 1 / exit 70 的重启分支；
 > Linux 真机与真实 worker 的 RSS 压力阈值仍未实测。
-> **Metrics** — src 52 files / 23719 lines · tests 9 files / 4291 lines · 312 tests (lib 244 + bin 6 + integration 62)
+> **Metrics** — src 52 files / 23775 lines · tests 9 files / 4291 lines · 313 tests (lib 245 + bin 6 + integration 62)
 > **Integration** — core_loop 7 / discipline 2 / m1_tools 14 / m2_session 6 / m4_bus 17 / m5_pool 10 / sandbox_e2e 4 / wire_anthropic 2
 > 规模已过 plan 预算（10-13k）的上沿：多出来的部分几乎都花在「取消安全」与「对账」这两条纪律上。
 > 上面两行数字由 `tests/discipline.rs::metrics_lines_match_the_tree` 对照源码树重算校验——
@@ -920,6 +920,16 @@ faux provider 第一天进 trait（`WireFormat` 抽象 ByteStream + `render_requ
        的工具仍可能越过它（此时 pump 已释放 slot，迟到事件按新一轮处理）。工作全部通过
        fmt / clippy -D warnings / 全量测试；真实端点联跑本轮未重跑，因此这些改动是单测与
        组件级（m5 走真 UDS + faux wire）验证，不是又一次真网关实测。
+
+77. **单次审批槽位的消费必须落盘（2026-11-20）**：`take_deferred` 原来先从内存移除、再
+    `persist_best_effort`；落盘失败（ENOSPC/EPERM）时磁盘上槽位还在，重启后同一个
+    `tool+args` 会被再放行一次——「单次」只活在内存里，而审批的耐久性恰恰是它存在的理由
+    （§9.67④）。现在消费路径改为 fail-closed：先尝试把移除后的状态持久化，失败则把槽位
+    放回内存并返回 `None`（调用方按 stale/deny 处理），槽位等存储恢复后仍恰好可用一次。
+    测试 `an_unwritable_store_never_consumes_a_one_use_slot` 用「父路径是普通文件」构造
+    持久化失败，再恢复可写，钉住「失败不消费、恢复后只消费一次、重复批复不重建槽位」。
+    边界：这只覆盖消费这一步；`complete`/`suspend`/`abandon` 的落盘仍是 best-effort
+    （失败会 log error），因为它们不改变「一次性」语义，丢的是未来的便利而不是已经给出的许可。
 
 ## 10 二期清单
 

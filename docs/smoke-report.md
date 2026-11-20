@@ -7,7 +7,7 @@
 
 ## 1. 自动化测试基线（cargo test）
 
-**Metrics** — src 52 files / 23719 lines · tests 9 files / 4291 lines · 312 tests (lib 244 + bin 6 + integration 62)
+**Metrics** — src 52 files / 23775 lines · tests 9 files / 4291 lines · 313 tests (lib 245 + bin 6 + integration 62)
 **Integration** — core_loop 7 / discipline 2 / m1_tools 14 / m2_session 6 / m4_bus 17 / m5_pool 10 / sandbox_e2e 4 / wire_anthropic 2
 
 | 组 | 覆盖 |
@@ -1537,3 +1537,21 @@ Parking 新增 8 MiB 总字节上限：
 边界：worker 侧 5s 硬停假设引擎被 abort 后不再发事件；同步阻塞、永不让步的工具仍可能
 越过它（此时 pump 已释放 slot，迟到事件按新一轮处理）。`--turn-timeout-secs` 的缺省
 1 小时是「卡死」与「慢」的分界，不是任务节拍。
+
+## 67. 2026-11-20 单次审批槽位消费 fail-closed
+
+`take_deferred` 原先先移出内存槽位、再 best-effort 落盘。落盘失败时磁盘上的旧状态还在，
+重启后同一个精确 `tool+args` 会再被放行一次——单次语义只活在内存里。
+
+现在：先持久化「已移除」的状态；失败就把槽位放回内存并返回 `None`（按 stale/deny 处理），
+等存储恢复后该槽位仍然**恰好**可用一次。测试用「父路径是普通文件」制造 ENOTDIR：
+
+| 断言 | 结果 |
+|---|---|
+| 存储不可写时 `take_deferred` | `None`（不消费） |
+| 重复批复 | `Stale`（不重建槽位） |
+| 恢复可写后再取 | `Some(...)`，一次 |
+| 再取第二次 | `None` |
+
+边界：`complete` / `suspend` / `abandon` 仍是 best-effort 落盘；它们丢的是未来的便利，
+不是已经给出的许可。
